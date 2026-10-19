@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v
+PROJECT_SOURCES = project.v uart_rx.v uart_tx.v console.v regs.v
 
 ifneq ($(GATES),yes)
 
@@ -27,10 +27,18 @@ VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilo
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
 
+# lets test.py skip tests that only exercise timing tolerance
+export REFEREE_GL = 1
+
 endif
 
 # Allow sharing configuration between design and testbench via `include`:
 COMPILE_ARGS 		+= -I$(SRC_DIR)
+
+# NO_DUMP=1 skips the waveform dump (faster, used by `make pty`)
+ifeq ($(NO_DUMP),1)
+COMPILE_ARGS    += -DNO_DUMP
+endif
 
 # Include the testbench sources:
 VERILOG_SOURCES += $(PWD)/tb.v
@@ -41,3 +49,8 @@ COCOTB_TEST_MODULES = test
 
 # include cocotb's make rules to take care of the simulator setup
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# Connect the simulated chip's UART to a virtual serial port (see pty_bridge.py)
+.PHONY: pty
+pty:
+	$(MAKE) NO_DUMP=1 SIM_BUILD=sim_build/pty COCOTB_TEST_MODULES=pty_bridge COCOTB_RESULTS_FILE=pty_results.xml

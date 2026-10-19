@@ -1,0 +1,39 @@
+# Bad input gets "?" and changes nothing.
+
+# Unknown commands
+> x
+< ?
+> q 00
+< ?
+
+# Wrong number of numbers
+> r
+< ?
+> w 02
+< ?
+> r 01 02
+< ?
+> w 02 03 04
+< ?
+
+# Numbers are 1-2 hex digits
+> r 100
+< ?
+> r 0g
+< ?
+> w 02 1z
+< ?
+
+# A line must start with a command letter
+> 52
+< ?
+> !
+< ?
+
+# A rejected write leaves the register alone
+> w 02 99
+< ok
+> w 02 123
+< ?
+> r 02
+< 99

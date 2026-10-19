@@ -23,7 +23,12 @@ jobs:
         shell: bash
         run: pip install -r test/requirements.txt
 
-      - name: Run tests
+      - name: Run unit tests (UART receiver and transmitter)
+        run: |
+          cd test
+          pytest unit -v
+
+      - name: Run chip-level tests
         run: |
           cd test
           make clean
@@ -34,7 +39,9 @@ jobs:
       - name: Test Summary
         uses: test-summary/action@v2.4
         with:
-          paths: "test/results.xml"
+          paths: |
+            test/results.xml
+            test/unit/sim_build/*/results.xml
         if: always()
 
       - name: upload waveform and test results

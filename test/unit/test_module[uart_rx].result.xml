@@ -1,0 +1,14 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1792396283" />
+    <testcase name="rx_random_bytes_back_to_back" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="103" time="0.12929415702819824" sim_time_ns="833487.5" ratio_time="6446443.668898523" />
+    <testcase name="rx_default_divisor" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="115" time="0.19014835357666016" sim_time_ns="4190324.999" ratio_time="22037135.321871877" />
+    <testcase name="rx_odd_and_small_divisors" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="127" time="0.12821531295776367" sim_time_ns="1332324.9989999998" ratio_time="10391309.495449195" />
+    <testcase name="rx_baud_tolerance" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="139" time="0.48424506187438965" sim_time_ns="10059524.999" ratio_time="20773624.329925295" />
+    <testcase name="rx_tolerance_window" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="154" time="0.8675689697265625" sim_time_ns="19675999.998999998" ratio_time="22679464.9020255" />
+    <testcase name="rx_ignores_glitches" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="181" time="0.17119884490966797" sim_time_ns="4633799.998999998" ratio_time="27066771.399333883" />
+    <testcase name="rx_frame_error" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="206" time="0.0016794204711914062" sim_time_ns="10699.998999997973" ratio_time="6371244.8332889695" />
+    <testcase name="rx_break" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="220" time="0.0021827220916748047" sim_time_ns="24699.998999997973" ratio_time="11316144.6865852" />
+    <testcase name="rx_against_cocotbext_uart" classname="tb_uart_rx" file="/home/purge/Desktop/referee/test/unit/tb_uart_rx.py" lineno="236" time="0.05585789680480957" sim_time_ns="643274.998999998" ratio_time="11516276.762941236" />
+  </testsuite>
+</testsuites>

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs OSS CAD Suite's vvp so that cocotb can use this repo's .venv Python.
+# The suite's own wrapper points PYTHONHOME at the suite's Python, and its
+# loader stops the embedded Python from finding its standard library. Passing
+# the venv's full module path fixes both (cocotb's pytest runner does the same).
+OSS="${OSS_CAD_SUITE:-$HOME/tools/oss-cad-suite}"
+PYTHONPATH="$(python3 -c 'import sys; print(":".join(p for p in sys.path if p))')${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec "$OSS/lib/ld-linux-x86-64.so.2" --inhibit-cache --inhibit-rpath "" \
+  --library-path "$OSS/lib" "$OSS/libexec/vvp" "$@"

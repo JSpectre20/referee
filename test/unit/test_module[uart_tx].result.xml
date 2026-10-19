@@ -1,0 +1,10 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1792396285" />
+    <testcase name="tx_exact_timing_back_to_back" classname="tb_uart_tx" file="/home/purge/Desktop/referee/test/unit/tb_uart_tx.py" lineno="111" time="0.19211912155151367" sim_time_ns="4111412.5" ratio_time="21400329.476821963" />
+    <testcase name="tx_with_random_gaps" classname="tb_uart_tx" file="/home/purge/Desktop/referee/test/unit/tb_uart_tx.py" lineno="127" time="0.10375237464904785" sim_time_ns="147474.99899999984" ratio_time="1421413.2399267764" />
+    <testcase name="tx_idle_only_after_stop_bit" classname="tb_uart_tx" file="/home/purge/Desktop/referee/test/unit/tb_uart_tx.py" lineno="139" time="0.0005714893341064453" sim_time_ns="5024.998999999836" ratio_time="8792813.268959247" />
+    <testcase name="tx_quiet_at_last_stop_bit" classname="tb_uart_tx" file="/home/purge/Desktop/referee/test/unit/tb_uart_tx.py" lineno="156" time="0.0008196830749511719" sim_time_ns="9024.998999999836" ratio_time="11010351.775943954" />
+    <testcase name="tx_against_cocotbext_uart" classname="tb_uart_tx" file="/home/purge/Desktop/referee/test/unit/tb_uart_tx.py" lineno="173" time="0.03462338447570801" sim_time_ns="642224.9989999998" ratio_time="18548879.860389993" />
+  </testsuite>
+</testsuites>

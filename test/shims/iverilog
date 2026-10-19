@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# cocotb runs the vvp found next to iverilog, so iverilog must live here too
+# for shims/vvp to be used.
+exec "${OSS_CAD_SUITE:-$HOME/tools/oss-cad-suite}/bin/iverilog" "$@"

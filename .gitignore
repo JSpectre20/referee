@@ -11,3 +11,12 @@ test/sim_build
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
+.venv
+__pycache__/
+test/unit/sim_build
+test/sim.tty
+test/pty.log
+test/pty_results.xml
+formal/*_bmc
+formal/*_cover
+formal/*_prove

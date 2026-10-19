@@ -1,6 +1,29 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
 
-# Tiny Tapeout Verilog Project Template
+# Referee
+
+A programmable protocol emulator for the [Jane Street protocol emulator ASIC
+competition](https://blog.janestreet.com/protocol-emulator-asic-competition/),
+built on Tiny Tapeout (IHP 130 nm CMOS5L, 6x4 tiles, 40 MHz).
+
+The goal is a tiny CPU with instructions for reading pins, writing pins,
+counting cycles and hitting precise timing, so real protocols run as firmware.
+
+**Status:** stage 1, the UART debug console, is done and verified. See the
+[datasheet](docs/info.md) for commands and registers, and [test/README.md](test/README.md)
+for how it is checked (unit, chip-level, gate-level, formal, and end-to-end
+through a virtual serial port).
+
+| Path | Contents |
+|------|----------|
+| `src/` | RTL: `uart_rx.v`, `uart_tx.v`, `console.v`, `regs.v`, top in `project.v` |
+| `test/` | cocotb tests, shared transcripts, simulator-to-pty bridge |
+| `formal/` | SymbiYosys checks |
+| `host/` | host tool and library for the console (pyserial) |
+
+---
+
+## Tiny Tapeout template notes
 
 - [Read the documentation for project](docs/info.md)
 

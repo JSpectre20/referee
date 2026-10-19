@@ -1,0 +1,30 @@
+# Formal checks for the UART loopback (see uart_loopback.sv).
+#   sby -f uart_loopback.sby bmc      bounded check, 100 cycles (~2 min)
+#   sby -f uart_loopback.sby cover    reachability: 3 bytes back to back (~10 min)
+#
+# 100 cycles covers two full back-to-back bytes at divisor 4 and one full byte
+# at divisors 5 and 6. A run to 115 cycles also passed but takes ~13 min.
+# An unbounded proof (abc pdr) does not converge yet.
+[tasks]
+bmc
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 100
+cover: mode cover
+cover: depth 130
+
+[engines]
+bmc: abc bmc3
+cover: smtbmc yices
+
+[script]
+read_verilog -formal uart_rx.v uart_tx.v
+read_verilog -formal -sv uart_loopback.sv
+prep -top uart_loopback
+
+[files]
+../src/uart_rx.v
+../src/uart_tx.v
+uart_loopback.sv

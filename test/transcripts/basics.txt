@@ -1,0 +1,53 @@
+# Basic console behavior. Runs unchanged in simulation and on hardware
+# (python host/referee.py --port ... run test/transcripts/*.txt), so every
+# check here sets up its own state first.
+
+# Identity registers are constants
+> r 00
+< 52
+> r 01
+< 01
+
+# Scratch register
+> w 02 a5
+< ok
+> r 02
+< a5
+> w 02 5a
+< ok
+> r 02
+< 5a
+
+# Upper case, single digits and extra spaces are all fine
+> W 02 C3
+< ok
+> R 2
+< c3
+> w   2    7
+< ok
+> r 02
+< 07
+>   r 02
+< 07
+
+# An empty line just gives a new prompt
+>
+<
+
+# Unmapped addresses read as 00 and ignore writes
+> w 7f 12
+< ok
+> r 7f
+< 00
+
+# Read-only registers ignore writes
+> w 00 ff
+< ok
+> r 00
+< 52
+
+# Status bits are cleared by writing 1s
+> w 03 03
+< ok
+> r 03
+< 00

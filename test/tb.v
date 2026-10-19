@@ -1,29 +1,38 @@
 `default_nettype none
 `timescale 1ns / 1ps
 
-/* This testbench just instantiates the module and makes some convenient wires
-   that can be driven / tested by the cocotb test.py.
+/* Top-level testbench, used for both RTL and gate-level simulation.
+
+   - The 40 MHz clock is generated here rather than from cocotb: with Icarus,
+     a cocotb-driven clock is about 50x slower.
+   - ui_in[3] is the UART RX line (driven as `uart_rx`); the other ui_in
+     bits come from `ui_in_pins`. uo_out[4] is the UART TX line (`uart_tx`).
 */
 module tb ();
 
   // Dump the signals to a FST file. You can view it with gtkwave or surfer.
+`ifndef NO_DUMP
   initial begin
     $dumpfile("tb.fst");
     $dumpvars(0, tb);
     #1;
   end
+`endif
 
-  // Wire up the inputs and outputs:
-  reg clk;
+  reg clk = 1'b0;
+  always #12.5 clk = ~clk;
+
   reg rst_n;
   reg ena;
-  reg [7:0] ui_in;
+  reg [7:0] ui_in_pins;
+  reg uart_rx;
   reg [7:0] uio_in;
+  wire [7:0] ui_in = {ui_in_pins[7:4], uart_rx, ui_in_pins[2:0]};
   wire [7:0] uo_out;
   wire [7:0] uio_out;
   wire [7:0] uio_oe;
+  wire uart_tx = uo_out[4];
 
-  // Replace tt_um_example with your module name:
   tt_um_shreyansh_referee user_project (
       .ui_in  (ui_in),    // Dedicated inputs
       .uo_out (uo_out),   // Dedicated outputs

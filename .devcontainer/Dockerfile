@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/vscode/devcontainers/base:${VARIANT}
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PDK_ROOT=/home/vscode/ttsetup/pdk
-ENV PDK=ihp-sg13g2
+ENV PDK=ihp-sg13cmos5l
 ARG TT_SUPPORT_TOOLS_BRANCH=main
 
 RUN apt update
