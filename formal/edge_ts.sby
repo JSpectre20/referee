@@ -1,0 +1,42 @@
+# Formal checks for the edge-timestamp unit (src/edge_ts.v) with a sub-cycle
+# model of the outside world (edge_ts_formal.sv).
+#
+#   sby -f edge_ts.sby           every task
+#   sby -f edge_ts.sby prove     unbounded proof (k-induction), P = 4 ticks per cycle
+#   sby -f edge_ts.sby prove8    the same with P = 8, to show the result is not an
+#                                artefact of the phase resolution
+#   sby -f edge_ts.sby cover     every interesting case is reachable
+#   sby -f edge_ts.sby mutant    negative control: falling edges stamped one cycle
+#                                late. EXPECTED TO FAIL.
+[tasks]
+prove
+prove8
+cover
+mutant
+
+[options]
+prove: mode prove
+prove: depth 10
+prove8: mode prove
+prove8: depth 10
+cover: mode cover
+cover: depth 80
+mutant: mode prove
+mutant: depth 10
+mutant: expect fail
+
+[engines]
+smtbmc yices
+
+[script]
+prove:  read_verilog -formal edge_ts.v
+prove8: read_verilog -formal edge_ts.v
+cover:  read_verilog -formal edge_ts.v
+mutant: read_verilog -formal -DEDGE_TS_MUTANT_FALL_LATE edge_ts.v
+read_verilog -formal -sv edge_ts_formal.sv
+prove8: chparam -set PH_W 3 edge_ts_formal
+prep -top edge_ts_formal
+
+[files]
+../src/edge_ts.v
+edge_ts_formal.sv
