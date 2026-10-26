@@ -1,0 +1,62 @@
+# Formal checks for the UART (src/uart_tx.v, src/uart_rx.v).
+#
+#   sby -f uart.sby             every task
+#   sby -f uart.sby tx_prove    unbounded proof of the transmitter's frame contract
+#                               (properties in uart_tx.v under `ifdef FORMAL)
+#   sby -f uart.sby tx_cover    a full frame, back-to-back frames, start-while-busy
+#   sby -f uart.sby tx_mutant   negative control: stop bit one cycle short.
+#                               EXPECTED TO FAIL.
+#   sby -f uart.sby loopback    TX -> RX, bounded: every byte arrives unchanged,
+#                               in order, never a framing error, none lost
+#   sby -f uart.sby lb_cover    two bytes make it through the loopback
+#
+# Small CLKS_PER_BIT values keep the solver fast; the properties don't depend
+# on the value.
+[tasks]
+tx_prove
+tx_cover
+tx_mutant
+loopback
+lb_cover
+
+[options]
+tx_prove: mode prove
+tx_prove: depth 4
+tx_cover: mode cover
+tx_cover: depth 30
+tx_mutant: mode bmc
+tx_mutant: depth 36
+tx_mutant: expect fail
+loopback: mode bmc
+loopback: depth 140
+lb_cover: mode cover
+lb_cover: depth 140
+
+[engines]
+tx_prove: smtbmc yices
+tx_cover: smtbmc yices
+tx_mutant: smtbmc yices
+loopback: smtbmc yices
+lb_cover: smtbmc yices
+
+[script]
+tx_prove:  read_verilog -formal uart_tx.v
+tx_cover:  read_verilog -formal uart_tx.v
+tx_mutant: read_verilog -formal -DUART_TX_MUTANT_SHORT_STOP uart_tx.v
+tx_prove:  chparam -set CLKS_PER_BIT 3 uart_tx
+tx_cover:  chparam -set CLKS_PER_BIT 3 uart_tx
+tx_mutant: chparam -set CLKS_PER_BIT 3 uart_tx
+tx_prove:  prep -top uart_tx
+tx_cover:  prep -top uart_tx
+tx_mutant: prep -top uart_tx
+loopback:  read_verilog uart_tx.v uart_rx.v
+lb_cover:  read_verilog uart_tx.v uart_rx.v
+loopback:  read_verilog -formal -sv uart_loopback.sv
+lb_cover:  read_verilog -formal -sv uart_loopback.sv
+loopback:  prep -top uart_loopback
+lb_cover:  prep -top uart_loopback
+
+[files]
+../src/uart_tx.v
+../src/uart_rx.v
+uart_loopback.sv

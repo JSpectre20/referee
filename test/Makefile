@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v
+PROJECT_SOURCES = project.v uart_tx.v uart_rx.v host_port.v seq.v
 
 ifneq ($(GATES),yes)
 
@@ -27,6 +27,9 @@ VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilo
 
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
+
+# lets test.py skip tests that only check timing (same logic as RTL, much slower here)
+export REFEREE_GL = 1
 
 endif
 

@@ -23,3 +23,8 @@ test/edge_ts/sim_build
 test/edge_ts/*.result.xml
 formal/edge_ts/
 formal/edge_ts_*/
+
+# UART tests and formal runs
+test/uart/sim_build
+formal/uart_*/
+formal/uart/

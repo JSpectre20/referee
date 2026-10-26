@@ -1,0 +1,52 @@
+# UART (src/uart_tx.v, src/uart_rx.v): unit tests and SymbiYosys proofs.
+# The chip-level tests (host port + seq through the pins) run in test.yaml.
+name: uart
+
+on:
+  push:
+    paths:
+      - "src/uart_tx.v"
+      - "src/uart_rx.v"
+      - "test/uart/**"
+      - "formal/uart.sby"
+      - "formal/uart_loopback.sv"
+      - ".github/workflows/uart.yaml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install iverilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      - name: cocotb unit tests at 16 and 347 cycles per bit
+        run: cd test && timeout 900 pytest uart -v
+
+  formal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: TX proof, covers, loopback, and the negative control (must fail)
+        run: |
+          cd formal
+          sby -f uart.sby
+          # sby exits 0 for the mutant only because of `expect fail`;
+          # check each task's status explicitly so a silent change is caught.
+          grep -q '^PASS' uart_tx_prove/status
+          grep -q '^PASS' uart_tx_cover/status
+          grep -q '^FAIL' uart_tx_mutant/status
+          grep -q '^PASS' uart_loopback/status
+          grep -q '^PASS' uart_lb_cover/status
