@@ -17,3 +17,8 @@ test/seq/sim_build
 test/seq/*.result.xml
 formal/seq/
 formal/seq_*/
+
+# UART tests and formal runs
+test/uart/sim_build
+formal/uart_*/
+formal/uart/
