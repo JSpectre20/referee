@@ -12,6 +12,12 @@ test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
 
+# sequencer tests and formal runs
+test/seq/sim_build
+test/seq/*.result.xml
+formal/seq/
+formal/seq_*/
+
 # edge-timestamp unit tests and formal runs
 test/edge_ts/sim_build
 test/edge_ts/*.result.xml
