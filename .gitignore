@@ -32,3 +32,6 @@ formal/uart/
 # verdict formal runs
 formal/verdict/
 formal/verdict_*/
+
+# formal counterexamples kept as documented results
+!docs/results/*.vcd

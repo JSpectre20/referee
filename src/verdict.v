@@ -16,8 +16,10 @@
  *                  instrument's uncertainty of the bound)
  *
  * With U = the measurement uncertainty (U_FX, same fixed point as n_fx):
- *   minimum bound  PASS if m - U >= n      VIOLATION if m + U <  n  (<= n if SHARP)
- *   maximum bound  PASS if m + U <= n      VIOLATION if m - U >  n  (>= n if SHARP)
+ *   minimum bound  PASS if m - U >= n      VIOLATION if m + U <= n  (< n if SHARP = 0)
+ *   maximum bound  PASS if m + U <= n      VIOLATION if m - U >= n  (> n if SHARP = 0)
+ *   The sharper VIOLATION test (default) is sound because the measurement
+ *   error is strictly below U = 2 cycles (at most 1 + 2/K cycles in the proof).
  *
  * formal/verdict.sby proves this rule sound on top of src/edge_ts.v, with
  * external edges at any sub-cycle time and either outcome of a sample taken
@@ -36,7 +38,7 @@ module verdict #(
     parameter integer FRAC_W = 4,               // fractional bits of n_fx and U_FX
     parameter integer N_W    = M_W + FRAC_W,    // width of n_fx (unsigned)
     parameter integer U_FX   = 2 << FRAC_W,     // uncertainty: 2 cycles
-    parameter integer SHARP  = 0                // 1: VIOLATION also when m+U == n (min) / m-U == n (max)
+    parameter integer SHARP  = 1                // 1: VIOLATION also when m+U == n (min) / m-U == n (max); proved sound
 ) (
     input  wire signed [M_W-1:0] m,        // measured interval, cycles
     input  wire        [N_W-1:0] n_fx,     // bound, cycles in fixed point

@@ -39,7 +39,7 @@ module verdict_formal #(
     parameter integer K_W   = 2,  // K = 4 ticks per chip cycle
     parameter integer TS_W  = 6,  // timestamp width (small: exercises wrap-around)
     parameter integer U_CYC = 2,  // the uncertainty under test, in cycles
-    parameter integer SHARP = 0   // verdict rule variant (see src/verdict.v)
+    parameter integer SHARP = 0   // verdict rule variant (see src/verdict.v); sharp4/8 set 1
 ) ();
   localparam integer K = 1 << K_W;
   localparam integer TW = TS_W + K_W + 1;  // tick counters (one bit spare)
@@ -79,7 +79,7 @@ module verdict_formal #(
   generate
     for (i = 0; i < 2; i = i + 1) begin : g_pin
       wire chg = (tp[i] != tp1[i]);
-      always @($global_clock) age[i] <= chg ? 8'd1 : (&age[i] ? age[i] : age[i] + 1'b1);
+      always @($global_clock) age[i] <= !rst_n ? 8'hff : chg ? 8'd1 : (&age[i] ? age[i] : age[i] + 1'b1);
       // Changes only out of reset (after edge_ts's 3-cycle warm-up) and at
       // least H ticks apart.
       always @(*) if (chg) assume (rst_n && since_rst >= 6 * K && age[i] >= H);
@@ -188,6 +188,66 @@ module verdict_formal #(
       if (!max_cross && pass_x) assert (t_cross >= nx);
       if (max_cross && viol_x) assert (t_cross > nx);
       if (max_cross && pass_x) assert (t_cross <= nx);
+    end
+  end
+
+
+  // ---------------------------------------------------------------------------
+  // Inductive strengthening. None of these is an assumption: each is proved
+  // like the main assertions, so they cannot make the proof unsound; they only
+  // tell the solver how the pipeline relates to the ghost history.
+  //   D = (start of the report cycle, in ticks) - (tick of the true change):
+  //   the per-edge report latency, K+2 .. 2K+4 ticks (the +3 is the model's
+  //   look-ahead delay). Interval error = difference of two Ds <= K+2 < 2K.
+  // ---------------------------------------------------------------------------
+  localparam integer DMIN = K + 2, DMAX = 2 * K + 4;
+  localparam integer GW = TS_W + K_W;  // chip time in ticks: {now, ph}
+  wire [GW-1:0] gt = {now, ph};
+  wire [GW-1:0] cyc_t = {now, {K_W{1'b0}}};  // start of the current cycle
+  wire [GW-1:0] chg0_t = gt - age[0];  // tick of pin 0's last true change
+  wire [GW-1:0] chg1_t = gt - age[1];
+  wire [GW-1:0] d0 = cyc_t - chg0_t, d1 = cyc_t - chg1_t;
+  wire [GW-1:0] r0_t = gt - since_r0[GW-1:0];  // tick of pin 0's last true rise
+  wire [GW-1:0] dr0 = {rise_ts[0+:TS_W], {K_W{1'b0}}} - r0_t;
+  wire armed = (f_warm == 2'd3);
+
+  reg g_valid = 1'b0;  // false only in the very first tick
+  always @($global_clock) g_valid <= 1'b1;
+
+  always @($global_clock) begin
+    if (g_valid) assert (clk == (ph == 0));
+    if (rst_n) begin
+      if (since_rst >= 4 * K) assert (armed);
+      if (!armed) assert (age[0] == 8'hff && age[1] == 8'hff);
+      // delay line
+      for (int j = 0; j < 2; j++) begin
+        if (age[j] == 1) assert (tp2[j] != tp1[j]);
+        if (age[j] == 2) assert (tp2[j] == tp1[j] && tp3[j] != tp2[j]);
+        if (age[j] >= 3) assert (tp3[j] == tp2[j] && tp2[j] == tp1[j]);
+        if (age[j] >= K + 3) assert (din[j] == tp1[j]);
+        if (age[j] >= 4 * K + 2 && armed) assert (f_s1[j] == tp1[j] && f_s2[j] == tp1[j] && f_s3[j] == tp1[j]);
+      end
+      // a report comes D ticks after its change
+      if (rise[0] || fall[0]) assert (age[0] != 8'hff && d0 >= DMIN && d0 <= DMAX);
+      if (rise[1] || fall[1]) assert (age[1] != 8'hff && d1 >= DMIN && d1 <= DMAX);
+      if (age[0] != 8'hff && age[0] < DMIN) assert (f_s3[0] != tp1[0] && !rise[0] && !fall[0]);
+      if (age[1] != 8'hff && age[1] < DMIN) assert (f_s3[1] != tp1[1] && !rise[1] && !fall[1]);
+      if (age[0] != 8'hff && f_s3[0] != tp1[0]) assert (age[0] <= DMAX + K);
+      if (age[1] != 8'hff && f_s3[1] != tp1[1]) assert (age[1] <= DMAX + K);
+      // pending flags
+      if (pend_r0) assert (tp1[0] && f_s3[0] == 1'b0 && age[0] != 8'hff && age[0] <= DMAX + 1);
+      if (pend_f0) assert (!tp1[0] && f_s3[0] == 1'b1 && age[0] != 8'hff && age[0] <= DMAX + 1);
+      if (pend_r1) assert (tp1[1] && f_s3[1] == 1'b0 && age[1] != 8'hff && age[1] <= DMAX + 1);
+      if (tp1[0] && age[0] <= DMIN) assert (pend_r0);
+      if (!tp1[0] && age[0] <= DMIN) assert (pend_f0);
+      if (tp1[1] && age[1] <= DMIN) assert (pend_r1);
+      // ghost intervals in terms of the ages
+      if (tp1[0] && age[0] != 8'hff) assert (since_r0 == age[0]);
+      if (!tp1[0] && age[0] != 8'hff && since_r0 != SAT) assert (t_pulse == since_r0 - age[0]);
+      if (cross_ok && tp1[1] && age[1] != 8'hff && since_r0 != SAT) assert (since_r0 >= age[1] && t_cross == since_r0 - age[1]);
+      // the latched rise timestamp of pin 0 vs its true rise
+      if (seen_r0 && !pend_r0 && !rise[0] && since_r0 < LIMIT) assert (dr0 >= DMIN && dr0 <= DMAX);
+      if (seen_r0) assert (since_r0 != 0);
     end
   end
 

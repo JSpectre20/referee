@@ -1,0 +1,32 @@
+# Verdict soundness (src/verdict.v on src/edge_ts.v): SymbiYosys at tick resolution.
+name: verdict
+
+on:
+  push:
+    paths:
+      - "src/verdict.v"
+      - "src/edge_ts.v"
+      - "formal/verdict.sby"
+      - "formal/verdict_formal.sv"
+      - ".github/workflows/verdict.yaml"
+  workflow_dispatch:
+
+jobs:
+  formal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Soundness proofs, covers, and the u = 1 negative control (must fail)
+        run: |
+          cd formal
+          sby -f verdict.sby
+          # sby exits 0 for u1 only because of `expect fail`;
+          # check each task's status explicitly so a silent change is caught.
+          for t in bmc4 prove4 prove8 cover4 sharp4 sharp8; do
+            grep -q '^PASS' verdict_$t/status || { echo "verdict_$t: $(cat verdict_$t/status)"; exit 1; }
+          done
+          grep -q '^FAIL' verdict_u1/status
