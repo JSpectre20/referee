@@ -11,3 +11,9 @@ test/sim_build
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
+
+# edge-timestamp unit tests and formal runs
+test/edge_ts/sim_build
+test/edge_ts/*.result.xml
+formal/edge_ts/
+formal/edge_ts_*/

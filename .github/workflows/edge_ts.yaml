@@ -1,0 +1,50 @@
+# Edge-timestamp unit (src/edge_ts.v): cocotb tests and SymbiYosys proofs.
+# Kept separate from test.yaml so the template's workflow stays untouched.
+name: edge_ts
+
+on:
+  push:
+    paths:
+      - "src/edge_ts.v"
+      - "test/edge_ts/**"
+      - "formal/edge_ts.sby"
+      - "formal/edge_ts_formal.sv"
+      - ".github/workflows/edge_ts.yaml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install iverilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      - name: cocotb tests (random sub-cycle edges vs true time)
+        run: cd test && timeout 600 pytest edge_ts -v
+
+  formal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Prove (P=4 and P=8), cover, and the negative control (must fail)
+        run: |
+          cd formal
+          sby -f edge_ts.sby
+          # sby exits 0 for the mutant only because of `expect fail`;
+          # check each task's status explicitly so a silent change is caught.
+          grep -q '^PASS' edge_ts_prove/status
+          grep -q '^PASS' edge_ts_prove8/status
+          grep -q '^PASS' edge_ts_cover/status
+          grep -q '^FAIL' edge_ts_mutant/status
