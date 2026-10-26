@@ -1,0 +1,60 @@
+# Verdict soundness: src/verdict.v on top of src/edge_ts.v, against the true
+# interval at sub-cycle (tick) resolution. Harness: verdict_formal.sv.
+#
+#   bmc4              bounded cross-check, 96 ticks (24 cycles), K = 4, u = 2
+#   prove4 / prove8   unbounded proof (k-induction), K = 4 / 8 ticks per cycle, u = 2
+#   cover4            every verdict reachable; INDETERMINATE on both sides of the
+#                     bound; measurement error above one cycle reachable
+#   u1                negative control: u = 1. EXPECTED TO FAIL; the
+#                     counterexample is kept in docs/results/.
+#   sharp4 / sharp8   the sharper rule (VIOLATION also when m+u == N), u = 2
+[tasks]
+bmc4
+prove4
+prove8
+cover4
+u1
+sharp4
+sharp8
+
+[options]
+multiclock on
+bmc4: mode bmc
+bmc4: depth 96
+prove4: mode prove
+prove4: depth 40
+prove8: mode prove
+prove8: depth 80
+cover4: mode cover
+cover4: depth 120
+u1: mode bmc
+u1: depth 120
+u1: expect fail
+sharp4: mode prove
+sharp4: depth 40
+sharp8: mode prove
+sharp8: depth 80
+
+[engines]
+prove4: smtbmc yices
+prove8: smtbmc yices
+sharp4: smtbmc yices
+sharp8: smtbmc yices
+bmc4: smtbmc yices
+cover4: smtbmc yices
+u1: smtbmc yices
+
+[script]
+read_verilog -formal -DFORMAL edge_ts.v
+read_verilog -formal verdict.v
+read_verilog -formal -sv verdict_formal.sv
+prove8: chparam -set K_W 3 verdict_formal
+u1:     chparam -set U_CYC 1 verdict_formal
+sharp4: chparam -set SHARP 1 verdict_formal
+sharp8: chparam -set SHARP 1 -set K_W 3 verdict_formal
+prep -top verdict_formal
+
+[files]
+../src/edge_ts.v
+../src/verdict.v
+verdict_formal.sv
