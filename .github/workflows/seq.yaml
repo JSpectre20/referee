@@ -1,0 +1,53 @@
+# Sequencer (src/seq.v): cocotb tests and SymbiYosys proofs.
+# Kept separate from test.yaml so the template's workflow stays untouched.
+name: seq
+
+on:
+  push:
+    paths:
+      - "src/seq.v"
+      - "tools/seqasm.py"
+      - "firmware/seq/**"
+      - "test/seq/**"
+      - "formal/seq.sby"
+      - ".github/workflows/seq.yaml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install iverilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt cocotbext-uart==0.1.4
+
+      - name: Assembler self-check
+        run: python3 tools/seqasm.py firmware/seq/uart_tx.s --timing
+
+      - name: cocotb tests (UART decode + lockstep with the Python model)
+        run: cd test && pytest seq -v
+
+  formal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Prove, cover, and the negative control (must fail)
+        run: |
+          cd formal
+          sby -f seq.sby
+          # sby exits 0 for the mutant only because of `expect fail`;
+          # check each task's status explicitly so a silent change is caught.
+          grep -q '^PASS' seq_prove/status
+          grep -q '^PASS' seq_cover/status
+          grep -q '^FAIL' seq_mutant/status
