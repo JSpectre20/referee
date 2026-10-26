@@ -28,3 +28,7 @@ formal/edge_ts_*/
 test/uart/sim_build
 formal/uart_*/
 formal/uart/
+
+# verdict formal runs
+formal/verdict/
+formal/verdict_*/
