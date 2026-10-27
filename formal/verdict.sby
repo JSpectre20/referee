@@ -8,8 +8,12 @@
 #   u1                negative control: u = 1. EXPECTED TO FAIL; the
 #                     counterexample is kept in docs/results/.
 #   sharp4 / sharp8   the sharper rule (VIOLATION also when m+u == N), u = 2
+#   glitch            negative control: levels may last a single tick (no hold
+#                     precondition). EXPECTED TO FAIL: a pulse can vanish between
+#                     two samples. Counterexample in docs/results/.
 [tasks]
 bmc4
+glitch
 prove4
 prove8
 cover4
@@ -19,6 +23,9 @@ sharp8
 
 [options]
 multiclock on
+glitch: mode bmc
+glitch: depth 80
+glitch: expect fail
 bmc4: mode bmc
 bmc4: depth 96
 prove4: mode prove
@@ -36,6 +43,7 @@ sharp8: mode prove
 sharp8: depth 80
 
 [engines]
+glitch: smtbmc yices
 prove4: smtbmc yices
 prove8: smtbmc yices
 sharp4: smtbmc yices
@@ -47,9 +55,17 @@ u1: smtbmc yices
 [script]
 read_verilog -formal -DFORMAL edge_ts.v
 read_verilog -formal verdict.v
-read_verilog -formal -sv verdict_formal.sv
+glitch: read_verilog -formal -sv -DNO_INVARIANTS verdict_formal.sv
+bmc4:   read_verilog -formal -sv verdict_formal.sv
+prove4: read_verilog -formal -sv verdict_formal.sv
+prove8: read_verilog -formal -sv verdict_formal.sv
+cover4: read_verilog -formal -sv verdict_formal.sv
+u1:     read_verilog -formal -sv verdict_formal.sv
+sharp4: read_verilog -formal -sv verdict_formal.sv
+sharp8: read_verilog -formal -sv verdict_formal.sv
 prove8: chparam -set K_W 3 verdict_formal
 u1:     chparam -set U_CYC 1 verdict_formal
+glitch: chparam -set HOLD 1 verdict_formal
 sharp4: chparam -set SHARP 1 verdict_formal
 sharp8: chparam -set SHARP 1 -set K_W 3 verdict_formal
 prep -top verdict_formal
