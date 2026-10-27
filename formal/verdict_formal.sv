@@ -39,13 +39,16 @@ module verdict_formal #(
     parameter integer K_W   = 2,  // K = 4 ticks per chip cycle
     parameter integer TS_W  = 6,  // timestamp width (small: exercises wrap-around)
     parameter integer U_CYC = 2,  // the uncertainty under test, in cycles
-    parameter integer SHARP = 0   // verdict rule variant (see src/verdict.v); sharp4/8 set 1
+    parameter integer SHARP = 0,  // verdict rule variant (see src/verdict.v); sharp4/8 set 1
+    parameter integer HOLD  = 0   // minimum ticks per level; 0 = the edge_ts precondition (4K+2)
 ) ();
   localparam integer K = 1 << K_W;
   localparam integer TW = TS_W + K_W + 1;  // tick counters (one bit spare)
   localparam integer N_W = TS_W + K_W;  // bound width, ticks
-  localparam integer H = 4 * K + 2;  // minimum ticks between changes of one pin
-  localparam integer LIMIT = (1 << (TS_W - 2)) * K;  // judge intervals shorter than this
+  localparam integer H = (HOLD != 0) ? HOLD : 4 * K + 2;  // minimum ticks between changes of one pin
+  localparam [TS_W-1:0] QUARTER = {2'b01, {(TS_W - 2) {1'b0}}};
+  // No assumption bounds the length of an interval: a timestamp older than
+  // QUARTER cycles is flagged stale by edge_ts, which forces INDETERMINATE.
   localparam [TW-1:0] SAT = {TW{1'b1}};
 
   // ---------------------------------------------------------------------------
@@ -99,7 +102,7 @@ module verdict_formal #(
   // ---------------------------------------------------------------------------
   // Design under test
   // ---------------------------------------------------------------------------
-  wire [1:0] rise, fall, level, toggled;
+  wire [1:0] rise, fall, level, toggled, rise_stale, fall_stale, missed;
   wire [2*TS_W-1:0] rise_ts, fall_ts;
   wire [1:0] f_warm;
   wire [1:0] f_s1, f_s2, f_s3;
@@ -109,6 +112,7 @@ module verdict_formal #(
       .clk(clk), .rst_n(rst_n), .pins(din), .now(now), .clear(2'b00),
       .level(level), .rise(rise), .fall(fall),
       .rise_ts(rise_ts), .fall_ts(fall_ts), .toggled(toggled),
+      .rise_stale(rise_stale), .fall_stale(fall_stale), .missed(missed),
       .f_warm(f_warm), .f_s1(f_s1), .f_s2(f_s2), .f_s3(f_s3)
   );
 
@@ -155,21 +159,26 @@ module verdict_formal #(
   (* anyconst *) reg [N_W-1:0] n_pulse, n_cross;
   (* anyconst *) reg max_pulse, max_cross;
   wire pass_p, viol_p, pass_x, viol_x;
+  // The flags the hardware offers: a stale reference timestamp or a pin
+  // flagged `missed` makes the verdict INDETERMINATE. (Pin 0's rise reported
+  // this very cycle is fresh: its timestamp is `now`.)
+  wire inv_p = rise_stale[0] | missed[0];
+  wire inv_x = (rise[0] ? 1'b0 : rise_stale[0]) | missed[0] | missed[1];
 
   verdict #(
       .M_W(TS_W), .FRAC_W(K_W), .N_W(N_W), .U_FX(U_CYC * K), .SHARP(SHARP)
   ) v_pulse (
-      .m(m_pulse), .n_fx(n_pulse), .is_max(max_pulse), .pass(pass_p), .violation(viol_p)
+      .m(m_pulse), .n_fx(n_pulse), .is_max(max_pulse), .invalid(inv_p), .pass(pass_p), .violation(viol_p)
   );
   verdict #(
       .M_W(TS_W), .FRAC_W(K_W), .N_W(N_W), .U_FX(U_CYC * K), .SHARP(SHARP)
   ) v_cross (
-      .m(m_cross), .n_fx(n_cross), .is_max(max_cross), .pass(pass_x), .violation(viol_x)
+      .m(m_cross), .n_fx(n_cross), .is_max(max_cross), .invalid(inv_x), .pass(pass_x), .violation(viol_x)
   );
 
-  wire judge_p = rst_n && fall[0] && seen_r0 && !pend_r0 && (t_pulse < LIMIT);
+  wire judge_p = rst_n && fall[0] && !pend_r0;
   // (pin 0's rise must have been reported already, or be reported this cycle)
-  wire judge_x = rst_n && rise[1] && cross_ok && (seen_r0 || rise[0]) && (!pend_r0 || rise[0]) && (t_cross < LIMIT);
+  wire judge_x = rst_n && rise[1] && cross_ok && (!pend_r0 || rise[0]);
   wire [TW-1:0] np = {{(TW - N_W) {1'b0}}, n_pulse};
   wire [TW-1:0] nx = {{(TW - N_W) {1'b0}}, n_cross};
 
@@ -192,6 +201,7 @@ module verdict_formal #(
   end
 
 
+`ifndef NO_INVARIANTS
   // ---------------------------------------------------------------------------
   // Inductive strengthening. None of these is an assumption: each is proved
   // like the main assertions, so they cannot make the proof unsound; they only
@@ -246,10 +256,14 @@ module verdict_formal #(
       if (!tp1[0] && age[0] != 8'hff && since_r0 != SAT) assert (t_pulse == since_r0 - age[0]);
       if (cross_ok && tp1[1] && age[1] != 8'hff && since_r0 != SAT) assert (since_r0 >= age[1] && t_cross == since_r0 - age[1]);
       // the latched rise timestamp of pin 0 vs its true rise
-      if (seen_r0 && !pend_r0 && !rise[0] && since_r0 < LIMIT) assert (dr0 >= DMIN && dr0 <= DMAX);
+      // (since_r0 is bounded first, so that dr0, computed modulo 2**GW ticks, can't alias)
+      if (!rise_stale[0] && !pend_r0 && !rise[0]) assert (since_r0 <= (QUARTER + 1) * K + DMAX && dr0 >= DMIN && dr0 <= DMAX);
+      if (!rise_stale[0]) assert (seen_r0 && (now - rise_ts[0+:TS_W]) <= QUARTER);
       if (seen_r0) assert (since_r0 != 0);
     end
   end
+
+`endif
 
   // ---------------------------------------------------------------------------
   // Covers: every verdict is reachable, INDETERMINATE on both sides of the
@@ -268,6 +282,7 @@ module verdict_formal #(
       cover (max_pulse && indet_p && t_pulse > np);
       cover (err_p > K);  // measured more than one cycle long
       cover (err_p < -K);  // measured more than one cycle short
+      cover (rise_stale[0] && !pass_p && !viol_p);  // a long pulse: flagged stale, INDETERMINATE
     end
     if (judge_x) begin
       cover (pass_x);
