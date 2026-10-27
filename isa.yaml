@@ -1,0 +1,108 @@
+# Referee engine ISA, v0.1 (DRAFT for review).
+#
+# Single source of truth. In step 2 a generator (tools/isagen.py) produces from
+# this file: the opcode include for the RTL (src/isa_defs.vh), the assembler,
+# the cycle-level reference model, and the instruction table in
+# docs/isa-timing.md. Nothing else may define an opcode, a field or a cycle cost.
+#
+# Conventions
+#   - Words are 16 bits. Bits [15:11] are the opcode; [10:0] hold the operands.
+#   - Field ranges are [msb, lsb] within the word; unused bits must be 0
+#     (the assembler guarantees it, the hardware ignores them).
+#   - `cycles` is the issue cost when the instruction does not wait.
+#     `waits: true` marks the only instructions that can stall (by design).
+#   - `pad_latency` (outputs) / input latency: see docs/isa-timing.md.
+
+isa: referee-engine
+version: "0.1-draft"
+word_bits: 16
+opcode_bits: [15, 11]
+
+clock:
+  target_hz: 60000000   # STA target; demo board: RP2 sysclk 120 MHz / 2, 50% duty
+  fallback_hz: 40000000 # sysclk 120 MHz / 3 (33% duty: check minimum pulse width in STA)
+
+machine:
+  pc_bits: 6               # 64-word program memory, flip-flops, written only while halted
+  program_words: 64
+  registers:
+    X:   {bits: 16, doc: "general; first timestamp for JUDGE"}
+    Y:   {bits: 16, doc: "general; second timestamp for JUDGE"}
+    SR:  {bits: 16, doc: "shift register (SHO/SHI/PULL/PUSH)"}
+    RC:  {bits: 8,  doc: "repeat counter for LOOP"}
+    DL:  {bits: 16, doc: "deadline, compared with NOW by signed difference"}
+  flags:
+    T:  "last WAITP ended by its deadline (1) or by the pin event (0)"
+    C:  "last bit sampled by SHI or TSTP"
+    FX: "flags of the timestamp in X (stale or missed), set by TSGET"
+    FY: "flags of the timestamp in Y"
+  now: {bits: 16, doc: "free-running cycle counter shared with edge_ts; read-only"}
+
+pins:
+  outputs:   # SET / SHO pin numbers
+    count: 8
+    map: "uio[0..7]"
+    modes: [input, push_pull, open_drain]   # per pin, host-written while halted
+  inputs:    # WAITP / TSTP / SHI pin numbers (synchronized, 2 flops)
+    count: 16
+    map: {0-7: "uio_in[0..7]", 8-15: "ui_in[0..7]"}
+  judge_channels:   # edge_ts channels for TSGET; input-only pads: cannot disturb the bus
+    count: 4
+    map: "ui_in[4..7]"   # ui_in[3] is the host UART RX
+
+fifos:
+  IN:      {width: 8,  depth: 4, dir: host_to_engine, engine_side: PULL (blocks while empty)}
+  OUT:     {width: 8,  depth: 4, dir: engine_to_host, engine_side: PUSH (never blocks; drop + sticky overflow)}
+  VERDICT: {width: 16, depth: 4, dir: engine_to_host, engine_side: JUDGE (never blocks; drop + sticky overflow)}
+
+bounds_table:
+  entries: 16
+  entry: {n_fx: {bits: 20, frac_bits: 4, doc: "bound in cycles, fixed point"}, is_max: {bits: 1}}
+  written_by: host, while halted
+
+fields:
+  p:   {bits: [2, 0],  doc: "output pin 0..7"}
+  q:   {bits: [3, 0],  doc: "input pin 0..15"}
+  v:   {bits: [4, 4],  doc: "level 0/1"}
+  msb: {bits: [4, 4],  doc: "1: MSB first (shift left), 0: LSB first (shift right)"}
+  hi:  {bits: [8, 8],  doc: "1: SR[15:8], 0: SR[7:0]"}
+  n:   {bits: [10, 0], doc: "unsigned cycles 0..2047"}
+  a:   {bits: [5, 0],  doc: "program address 0..63"}
+  imm: {bits: [7, 0],  doc: "8-bit immediate"}
+  r:   {bits: [5, 5],  doc: "0: X, 1: Y"}
+  ch:  {bits: [1, 0],  doc: "judge channel 0..3"}
+  e:   {bits: [2, 2],  doc: "0: rising edge, 1: falling edge"}
+  b:   {bits: [3, 0],  doc: "bounds-table entry 0..15"}
+
+instructions:
+  - {name: NOP,   opcode: 0x00, syntax: "nop",              cycles: 1, semantics: "nothing"}
+  - {name: HALT,  opcode: 0x01, syntax: "halt",             cycles: 1, semantics: "stop; pc stays; host sees halted (pins keep their level)"}
+  - {name: SET,   opcode: 0x02, syntax: "set p, v",         cycles: 1, pad_latency: 1,
+     semantics: "pin p <- v. Push-pull: drive v. Open-drain: v=0 drives low, v=1 releases (oe=0)."}
+  - {name: SHO,   opcode: 0x03, syntax: "sho p[, msb]",     cycles: 1, pad_latency: 1,
+     semantics: "pin p <- msb ? SR[15] : SR[0]; SR shifts out that bit, refilling with 1"}
+  - {name: SHI,   opcode: 0x04, syntax: "shi q[, msb]",     cycles: 1,
+     semantics: "C <- in[q]; SR <- msb ? {SR[14:0], in[q]} : {in[q], SR[15:1]}"}
+  - {name: TSTP,  opcode: 0x05, syntax: "tstp q",           cycles: 1, semantics: "C <- in[q]"}
+  - {name: MARK,  opcode: 0x06, syntax: "mark",             cycles: 1, semantics: "DL <- NOW (the cycle MARK issues)"}
+  - {name: DL,    opcode: 0x07, syntax: "dl n",             cycles: 1, semantics: "DL <- DL + n (sets a deadline without waiting; e.g. a WAITP timeout)"}
+  - {name: WAITD, opcode: 0x08, syntax: "waitd n",          cycles: 1, waits: true,
+     semantics: "DL <- DL + n; the next instruction issues at max(t+1, DL) where t is this issue cycle"}
+  - {name: WAITP, opcode: 0x09, syntax: "waitp q, v",       cycles: 1, waits: true,
+     semantics: "stall until in[q] == v (T <- 0) or NOW - DL >= 0 (T <- 1); if both in the same cycle the pin event wins (T <- 0); DL is not changed"}
+  - {name: JMP,   opcode: 0x0A, syntax: "jmp a",            cycles: 1, semantics: "pc <- a"}
+  - {name: JT,    opcode: 0x0B, syntax: "jt a",             cycles: 1, semantics: "if T: pc <- a"}
+  - {name: JNT,   opcode: 0x0C, syntax: "jnt a",            cycles: 1, semantics: "if !T: pc <- a"}
+  - {name: JC,    opcode: 0x0D, syntax: "jc a",             cycles: 1, semantics: "if C: pc <- a"}
+  - {name: JNC,   opcode: 0x0E, syntax: "jnc a",            cycles: 1, semantics: "if !C: pc <- a"}
+  - {name: LOOP,  opcode: 0x0F, syntax: "loop a",           cycles: 1, semantics: "if RC != 0: RC <- RC - 1, pc <- a; else fall through"}
+  - {name: LDRC,  opcode: 0x10, syntax: "ldrc imm",         cycles: 1, semantics: "RC <- imm"}
+  - {name: LDSR,  opcode: 0x11, syntax: "ldsr imm[, hi]",   cycles: 1, semantics: "SR[7:0] (or SR[15:8] if hi) <- imm"}
+  - {name: PULL,  opcode: 0x12, syntax: "pull[ hi]",        cycles: 1, waits: true,
+     semantics: "SR[7:0] (or SR[15:8]) <- IN FIFO; stalls while IN is empty (host-paced: restart timing with MARK after it)"}
+  - {name: PUSH,  opcode: 0x13, syntax: "push[ hi]",        cycles: 1,
+     semantics: "OUT FIFO <- SR[7:0] (or SR[15:8]); never stalls; if full the byte is dropped and OUT_OVF is set (sticky)"}
+  - {name: TSGET, opcode: 0x14, syntax: "tsget r, ch, e",   cycles: 1,
+     semantics: "r <- edge_ts timestamp of channel ch, edge e; F(r) <- stale | missed of that timestamp. If the edge is being reported this very cycle, r <- NOW."}
+  - {name: JUDGE, opcode: 0x15, syntax: "judge b",          cycles: 1,
+     semantics: "m <- Y - X (signed); v <- verdict(m, bounds[b], invalid = FX | FY); VERDICT FIFO <- {v[1:0], FX, FY, b[3:0], m[7:0] saturated}; never stalls; drop + VERDICT_OVF (sticky) if full"}
