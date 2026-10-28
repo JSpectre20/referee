@@ -1,4 +1,4 @@
-# Referee engine: ISA and timing model (v0.3 DRAFT, for review)
+# Referee engine: ISA and timing model (v0.3, approved 28 Oct; spec diffs since are listed in §0b)
 
 `isa.yaml` is the single source of truth: opcodes, fields, cycle costs, state, image formats.
 In step 2 a generator produces from it the RTL opcode include, the assembler, the reference model,
@@ -17,6 +17,14 @@ as numbers, and keeps the **assumption ledger** (§11).
 | 6. TSGET `last` | `e` is 2 bits: rise / fall / last. §5.3 rewritten: one TSGET + one JUDGE per SCL rise. | §3.6, §5.3 |
 | 7. Smaller items | Long WAITDs split by the assembler; 16-bit timestamp range in the ledger; HALT releases open-drain pins; the UART TX keeps its byte on a CTS timeout; proof plan as lemma + combinational theorem; RC has no nesting; one snapshot + trigger per engine. | §3.4, §5.1, §9, §11 |
 | **Found while revising** | **Ordering gap:** a snapshot taken in the trigger's own report cycle can miss an edge that truly came *before* the trigger. Per-edge report latency varies by up to 1 + 2/K cycles, so a near-simultaneous earlier edge can be latched one cycle later, and JUDGE could then say a false PASS. The merged verdict proof only judges cross intervals once the earlier edge "has been reported", which is a harness condition, not hardware. **Fix:** take the snapshot one cycle after the trigger's report, and flag edges latched in that two-cycle window as order-ambiguous (**ORD**, forcing INDETERMINATE). | §3.6, A16 |
+
+## 0b. Spec diffs after approval (in the engine-v0 PR)
+
+| Diff | Why |
+| --- | --- |
+| ORD window is cycles **r - 1, r, r + 1** (was r, r + 1) | Review of v0.3: report latencies differ by < 2 cycles in *either* direction, so an edge latched at r - 1 may truly come after the trigger. Edges latched at r - 2 or earlier are certainly before it; taking the snapshot at r + 1 already guarantees no earlier edge is missed. |
+| §5.4 budget ≤ 11 cycles (183 ns) | 2 + 1/K (visibility) + 1 (`waitp` ends) + 6 instructions + 1 (pad) ≈ 10.25 cycles |
+| Opcodes 0x18..0x1B reserved for the v1 bitstream unit | LFSR CRC/parity tapping SHO/SHI bits, bit stuffing, NRZI (ledger A18) |
 
 ## 1. Decisions, with evidence
 
@@ -99,14 +107,16 @@ as numbers, and keeps the **assumption ledger** (§11).
 - When the trigger edge is reported (report cycle r) and **S = 0**:
   - at the end of cycle **r + 1**, the snapshot ← every channel's {rise_ts, fall_ts,
     last-edge, stale and missed flags} as latched then;
-  - per edge, **ORD** = "latched in cycle r or r + 1";
+  - per edge, **ORD** = "latched in cycle r - 1, r or r + 1";
   - epoch ← epoch + 1, S ← 1.
 - **Why one cycle later, and why ORD:**
-  - Two edges' report latencies differ by less than 1 + 2/K < 2 cycles. So an edge that truly
-    came *before* the trigger edge is latched by the end of cycle r + 1, and the snapshot
-    contains it.
-  - An edge latched in cycles r or r + 1 may have come just before *or* just after the trigger
-    edge. Its order is unknowable, so it is flagged ORD and any verdict using it is
+  - Two edges' report latencies differ by less than 1 + 2/K < 2 cycles, **in either direction**.
+    - An edge that truly came *before* the trigger is latched by the end of cycle r + 1, so the
+      snapshot contains it.
+    - An edge that truly came *after* the trigger can be latched as early as cycle r - 1.
+    - Only edges latched at r - 2 or earlier are certainly before it.
+  - So an edge latched in cycles r - 1, r or r + 1 may have come just before *or* just after the
+    trigger edge. Its order is unknowable, so it is flagged ORD and any verdict using it is
     INDETERMINATE.
   - The header still reports ORD, so near-coincident edges can be counted. For I2C, an SDA
     edge within ~2 cycles of an SCL rise breaks a rule whichever order it came in.
@@ -138,7 +148,9 @@ as numbers, and keeps the **assumption ledger** (§11).
 ## 4. Instruction set
 
 Generated from `isa.yaml` in step 2; hand-written here for review. Opcode in [15:11]; 24 used,
-8 free.
+4 reserved, 4 free.
+
+Opcodes 0x18..0x1B are reserved for the v1 bitstream unit; 0x1C..0x1F are free.
 
 | Opcode | Syntax | Cycles | Effect |
 | --- | --- | --- | --- |
@@ -256,10 +268,11 @@ ack:    set  1, 0            ; ACK: pull SDA low
 - The 8th SCL fall becomes visible ≤ 2 + 1/K cycles after it happens.
 - `waitp` ends the next cycle; then loop, cmp, jc, cmp, jnc, set are 6 instructions, and the pad
   changes one cycle after `set`.
-- So SDA is low **≤ 10 cycles = 167 ns after SCL falls** (250 ns at 40 MHz).
+- Budget: 2 + 1/K + 1 + 6 + 1 ≈ 10.25, so SDA is low **≤ 11 cycles = 183 ns after SCL falls**
+  (275 ns at 40 MHz).
 - Fast-mode guarantees SCL low ≥ 1.3 µs and needs tSU;DAT = 100 ns before the 9th rise:
-  1.3 µs - 0.167 µs - 0.1 µs = **1.03 µs margin**.
-- Fast-mode Plus (0.5 µs low, 50 ns setup): **283 ns margin**.
+  1.3 µs - 0.183 µs - 0.1 µs = **1.02 µs margin**.
+- Fast-mode Plus (0.5 µs low, 50 ns setup): **267 ns margin**.
 - SDA changes only after the fall has been seen, so the hold time (≥ 0) is met. No host round
   trip is involved.
 
@@ -351,7 +364,8 @@ At 115200 baud (the power-up default) the drain gives ~5,000 slots/s, which is e
 - For any accepted snapshot and any two of its edges without ORD and F, |(ts_Y - ts_X) -
   (t_Y - t_X)| < 2 cycles, where t is the true edge time.
 - Every edge that truly came before the trigger edge is in the snapshot.
-- ORD is set exactly on the edges latched in the trigger's report cycle and the next.
+- ORD is set exactly on the edges latched in cycles r - 1 .. r + 1 (r = the trigger's report
+  cycle), and any edge latched at r - 2 or earlier truly came before the trigger.
 
 This removes the harness condition used by the merged cross-interval proof (A16).
 
@@ -406,4 +420,5 @@ This holds for any K, because bounds are in 1/16 cycle and the lemma is in cycle
 | A14 | A judged interval is at most 16,384 cycles (16-bit timestamps): **273 µs at 60 MHz** (410 µs at 40) | JUDGE | **Flagged** (stale) beyond it. Per-bit UART checks fit at 9600 baud (104 µs per bit); a whole 9600-baud frame (1.04 ms) doesn't. 16 bits kept for v0; widening later is an ISA change |
 | A15 | One LOOP counter, no nesting | firmware | Design limit for v0; the assembler reports nested-loop attempts |
 | A16 | The earlier edge of a judged pair is latched before the pair is judged | cross intervals | Was a **harness condition** in the merged verdict proof. Now **enforced** by the one-cycle snapshot delay; ambiguous order **flagged** (ORD) |
+| A18 | No parity or CRC in v0 (no ALU) | UART 8E1/8O1, CAN, USB, any CRC | **Design limit**: until the v1 bitstream unit (opcodes 0x18..0x1B reserved: LFSR CRC/parity on SHO/SHI bits, bit stuffing, NRZI), the host supplies the parity bit (e.g. as the 9th bit of a 16-bit IN pair) |
 | A17 | Two engines never drive one pin | outputs | **Enforced** by the image format (one owner per pin; claims ⊆ owned, checked at RUN) and at run time (PIN_FAULT) |
