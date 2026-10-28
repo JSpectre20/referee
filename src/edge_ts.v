@@ -40,6 +40,22 @@
  *
  *   If `clear[i]` and an edge on pin i arrive in the same cycle, the edge
  *   wins: `toggled[i]` stays set.
+ *
+ * Flags (a verdict built on a flagged timestamp is forced to INDETERMINATE)
+ * ---------------------------------------------------------------------------
+ *   rise_stale[i] / fall_stale[i]: set out of reset (no edge latched yet) and
+ *     when the latched timestamp turns QUARTER = 2**(TS_W-2) cycles old;
+ *     cleared when a new edge is latched. Timestamps wrap at 2**TS_W, so an
+ *     older timestamp could alias; with the flag, any interval measured from
+ *     a non-stale timestamp is at most QUARTER cycles and can't alias. The
+ *     age `now - ts` grows by exactly 1 per cycle, so an equality compare
+ *     catches the QUARTER crossing with no wrap ambiguity.
+ *   missed[i]: sticky (cleared by `clear[i]`). Set when two transitions are
+ *     in pin i's synchronizer at once, i.e. a level lasted about one sample
+ *     period. A level shorter than one sample period can vanish between two
+ *     samples and no sampled circuit can see that; this flag is the warning
+ *     that the pin is toggling at that limit. (Within the 4-cycle-hold
+ *     precondition it never sets.)
  */
 
 `default_nettype none
@@ -59,7 +75,10 @@ module edge_ts #(
     output wire [     N-1:0] fall,      // pulse: falling edge reported this cycle
     output reg  [N*TS_W-1:0] rise_ts,   // pin i at [i*TS_W +: TS_W]
     output reg  [N*TS_W-1:0] fall_ts,
-    output reg  [     N-1:0] toggled
+    output reg  [     N-1:0] toggled,
+    output reg  [     N-1:0] rise_stale,  // rise_ts[i] is not a usable reference (see below)
+    output reg  [     N-1:0] fall_stale,
+    output reg  [     N-1:0] missed       // sticky: edges on pin i may have been missed
 `ifdef FORMAL
     // Internal state, visible only to the formal harness (inductive invariants).
     ,
@@ -69,6 +88,8 @@ module edge_ts #(
     output wire [     N-1:0] f_s3
 `endif
 );
+
+  localparam [TS_W-1:0] QUARTER = {2'b01, {(TS_W - 2) {1'b0}}};  // 2**(TS_W-2)
 
   // Two-flop synchronizer (s1, s2), plus s3 = s2 one cycle ago for edge detection.
   // s1 is the only flop that ever sees an asynchronous input; nothing else
@@ -114,6 +135,9 @@ module edge_ts #(
           rise_ts[i*TS_W+:TS_W] <= {TS_W{1'b0}};
           fall_ts[i*TS_W+:TS_W] <= {TS_W{1'b0}};
           toggled[i]            <= 1'b0;
+          rise_stale[i]         <= 1'b1;  // nothing latched yet
+          fall_stale[i]         <= 1'b1;
+          missed[i]             <= 1'b0;
         end else begin
           if (rise[i]) rise_ts[i*TS_W+:TS_W] <= now;
 `ifdef EDGE_TS_MUTANT_FALL_LATE
@@ -125,6 +149,15 @@ module edge_ts #(
 `endif
           // A new edge wins over a clear in the same cycle.
           toggled[i] <= (toggled[i] & ~clear[i]) | rise[i] | fall[i];
+
+          // Staleness: cleared by a new latch, set at the QUARTER crossing.
+          if (rise[i]) rise_stale[i] <= 1'b0;
+          else if (now - rise_ts[i*TS_W+:TS_W] == QUARTER) rise_stale[i] <= 1'b1;
+          if (fall[i]) fall_stale[i] <= 1'b0;
+          else if (now - fall_ts[i*TS_W+:TS_W] == QUARTER) fall_stale[i] <= 1'b1;
+
+          // Two transitions in the synchronizer at once (s1 != s2 != s3).
+          missed[i] <= (missed[i] & ~clear[i]) | (armed & (s1[i] ^ s2[i]) & (s2[i] ^ s3[i]));
         end
       end
     end

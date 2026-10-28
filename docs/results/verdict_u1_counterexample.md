@@ -10,19 +10,20 @@ arbitrary value, so the cycle numbers below are those in this trace.
 
 | | Pin 0 (rises first) | Pin 1 (rises second) |
 | --- | --- | --- |
-| True rise (free input) | cycle 12, tick 1 | cycle 13, tick 2 |
-| Physical edge (3-tick model delay, same for both pins) | cycle 13, tick 0: exactly at the clock edge | cycle 14, tick 1: one tick after a clock edge |
-| Sampled by the first synchronizer flop at the edge starting cycle 13 | old level (allowed: change within one tick of the edge) | n/a |
-| Sampled at the edge starting cycle 14 | new level | new level (allowed: change within one tick of the edge) |
-| Reported by `edge_ts` | cycle 15 | cycle 15 |
+| True rise (free input) | cycle 62, tick 1 | cycle 63, tick 2 |
+| Physical edge (3-tick model delay, same for both pins) | cycle 63, tick 0: exactly at the clock edge | cycle 0, tick 1: one tick after a clock edge (the 6-bit cycle counter has just wrapped) |
+| Sampled by the first synchronizer flop at the edge starting cycle 63 | old level (allowed: change within one tick of the edge) | n/a |
+| Sampled at the edge starting cycle 0 | new level | new level (allowed: change within one tick of the edge) |
+| Reported by `edge_ts` | cycle 1 | cycle 1 |
 
 - **True interval** T = 5 ticks = 1.25 cycles.
-- **Measured interval** m = 15 - 15 = 0 cycles.
-- **Bound** (free choice of the solver): a minimum of N = 5 ticks = 1.25 cycles.
-  The true interval *meets* it (5 >= 5).
-- **Verdict with u = 1:** m + u = 0 + 1 cycle = 4 ticks < N = 5 ticks, so the rule says
-  **VIOLATION**, which is wrong (the failed assertion is `!max_cross && viol_x -> t_cross < n_cross` in
-  `formal/verdict_formal.sv`).
+- **Measured interval** m = 1 - 1 = 0 cycles.
+- **Bound** (free choice of the solver): a maximum of N = 4 ticks = 1 cycle.
+  The true interval *breaks* it (5 > 4).
+- **Verdict with u = 1:** m + u = 0 + 1 cycle = 4 ticks <= N = 4 ticks, so the rule says
+  **PASS**, which is wrong. (The failed assertion is `max_cross && pass_x -> t_cross <= n_cross`
+  in `formal/verdict_formal.sv`.) An earlier version of the harness produced the mirror image:
+  a minimum bound wrongly judged VIOLATION.
 
 ## Why
 

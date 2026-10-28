@@ -43,6 +43,7 @@ module verdict #(
     input  wire signed [M_W-1:0] m,        // measured interval, cycles
     input  wire        [N_W-1:0] n_fx,     // bound, cycles in fixed point
     input  wire                  is_max,   // 0: minimum bound, 1: maximum bound
+    input  wire                  invalid,  // stale timestamp or `missed` pin: force INDETERMINATE
     output wire                  pass,
     output wire                  violation  // neither: INDETERMINATE
 );
@@ -62,8 +63,8 @@ module verdict #(
   wire max_pass = (hi <= n);
   wire max_viol = (SHARP != 0) ? (lo >= n) : (lo > n);
 
-  assign pass      = is_max ? max_pass : min_pass;
-  assign violation = is_max ? max_viol : min_viol;
+  assign pass      = !invalid && (is_max ? max_pass : min_pass);
+  assign violation = !invalid && (is_max ? max_viol : min_viol);
 
 endmodule
 

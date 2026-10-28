@@ -20,7 +20,7 @@ jobs:
 
       - uses: YosysHQ/setup-oss-cad-suite@v3
 
-      - name: Soundness proofs, covers, and the u = 1 negative control (must fail)
+      - name: Soundness proofs, covers, and the negative controls u1 and glitch (must fail)
         run: |
           cd formal
           sby -f verdict.sby
@@ -30,3 +30,4 @@ jobs:
             grep -q '^PASS' verdict_$t/status || { echo "verdict_$t: $(cat verdict_$t/status)"; exit 1; }
           done
           grep -q '^FAIL' verdict_u1/status
+          grep -q '^FAIL' verdict_glitch/status
