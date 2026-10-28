@@ -70,7 +70,9 @@ class Lockstep:
                 rtl.pop(k)
                 want.pop(k)
         diff = {k: (rtl[k], want[k]) for k in want if rtl[k] != want[k]}
-        assert not diff, f"cycle {self.cycle} (now {md.now}): RTL != model: {diff}; recent: {[x for x in self.log if x[1] != ["latch"] and x[1] not in (["gw"], ["ew"])][-8:]}"
+        if diff:  # (built outside the f-string: Python 3.11 in CI has no nested quotes in f-strings)
+            recent = [x for x in self.log if x[1] not in (["latch"], ["gw"], ["ew"])][-8:]
+            raise AssertionError(f"cycle {self.cycle} (now {md.now}): RTL != model: {diff}; recent: {recent}")
 
     async def tick(self, ui=None, uio=None, ops=(), read_shadow=False):
         """One cycle: compare, drive inputs and host strobes, step the model."""

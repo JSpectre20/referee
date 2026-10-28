@@ -37,6 +37,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # avoid the anonymous API rate limit
 
       - name: Prove (P=4 and P=8), cover, and the negative control (must fail)
         run: |
