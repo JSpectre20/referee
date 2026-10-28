@@ -17,7 +17,8 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "CLOCK_PERIOD": 20,
+  "//": "sta-60mhz side branch: 16.6 ns (60.2 MHz) to find out early whether 60 MHz closes (engine v0 CP6).",
+  "CLOCK_PERIOD": 16.6,
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,
