@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 import cocotb
-from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, Timer
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, SimTimeoutError, Timer, with_timeout
 from cocotb.utils import get_sim_time
 from cocotbext.uart import UartSink, UartSource
 
@@ -169,7 +169,14 @@ async def power_up_baud_matches_clock(dut):
     # The reply to identify starts 06 = start bit, then bits 0, 1, 1, ...: the start bit's
     # falling edge to the next rising edge is exactly 2 bit periods.
     await h.src.write(host.pkt_id())
-    await FallingEdge(dut.host_tx)
+    # A divisor built for another clock never decodes the 115200 packet, so the chip never
+    # replies: bound the wait (the packet takes ~350 us; allow 2 ms) and fail with the reason,
+    # rather than hang until CI's job timeout.
+    try:
+        await with_timeout(FallingEdge(dut.host_tx), 2, "ms")
+    except SimTimeoutError:
+        assert False, (f"no reply at {BAUD} baud within 2 ms: the power-up divisor does not match "
+                       f"info.yaml's clock ({CLOCK_HZ} Hz needs {round(CLOCK_HZ / BAUD)} cycles/bit)")
     t_fall = get_sim_time("ps")
     await RisingEdge(dut.host_tx)
     div = (get_sim_time("ps") - t_fall) / period_ps / 2
