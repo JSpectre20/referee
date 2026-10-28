@@ -1,4 +1,4 @@
-# Referee engine ISA, v0.2 (DRAFT for review; revised after review of v0.1).
+# Referee engine ISA, v0.3 (DRAFT for review; revised after reviews of v0.1 and v0.2).
 #
 # Single source of truth. In step 2 a generator (tools/isagen.py) produces from
 # this file: the opcode include for the RTL (src/isa_defs.vh), the assembler,
@@ -14,7 +14,7 @@
 #   - Timing contract and assumption ledger: docs/isa-timing.md.
 
 isa: referee-engine
-version: "0.2-draft"
+version: "0.3-draft"
 word_bits: 16
 opcode_bits: [15, 11]
 
@@ -22,77 +22,111 @@ clock:
   target_hz: 60000000    # STA target; demo board: RP2 sysclk 120 MHz / 2, 50% duty
   fallback_hz: 40000000  # 120 MHz / 3 (33% duty: STA must check minimum pulse width)
   # Contracts are written in ns; the assembler converts them with the clock the
-  # image is built for (--clock-hz / .clock_hz). See bounds_table.
+  # image is built for (.clock_hz / --clock-hz). See bounds_table.
 
-machine:
-  engines: 1               # v0. Two engines planned; decided at the 8 Nov gate from the area ledger.
+engines:
+  v0: 1
+  planned: 2             # decided at the 8 Nov gate from the area ledger
+  shared: "one edge_ts (4 channels), one host port, the global config"
+  per_engine: "program, bounds, registers, flags, FIFOs, snapshot + trigger, stats, lost-trigger counter"
+
+machine:                 # per engine
   pc_bits: 6
-  program_words: 64        # flip-flops; written only while halted, enforced inside the engine
+  program_words: 64      # flip-flops; written only while that engine is halted, enforced inside the engine
   registers:
-    X:   {bits: 16, doc: "general; first timestamp for JUDGE"}
-    Y:   {bits: 16, doc: "general; second timestamp for JUDGE"}
-    SR:  {bits: 16, doc: "shift register (SHO/SHI/PULL/PUSH/LDSR)"}
-    RC:  {bits: 8,  doc: "repeat counter for LOOP"}
+    X:   {bits: 16, doc: "general; first timestamp for JUDGE (+ 2-bit epoch tag EX, flag FX)"}
+    Y:   {bits: 16, doc: "general; second timestamp for JUDGE (+ EY, FY)"}
+    SR:  {bits: 16, doc: "shift register (SHO/SHI/PULL/PUSH/LDSR/CMP)"}
+    RC:  {bits: 8,  doc: "repeat counter for LOOP; one level, no nesting in v0"}
     DL:  {bits: 16, doc: "SCHEDULE deadline. Changed only by MARK and WAITD."}
     TO:  {bits: 16, doc: "TIMEOUT deadline for WAITP/WAITS. Changed only by TMO and TMON."}
-  flags:            # all testable with BR
+  flags:                 # all testable with BR
     T:  "1 if the last WAITP/WAITS ended by its timeout, 0 if by its event"
-    C:  "last bit sampled by SHI or TSTP"
+    C:  "last bit sampled by SHI or TSTP, or the result of CMP"
     E:  "1 if the last PULL found the IN FIFO empty (SR unchanged)"
     S:  "a snapshot is pending (taken, not yet released by REL)"
-  timestamp_flags:
-    FX: "X's timestamp is unusable: stale | missed | no snapshot | snapshot overrun"
+  timestamp_tags:        # copied by TSGET
+    FX: "X's timestamp is unusable: stale | missed | no valid snapshot yet"
+    OX: "X's edge is order-ambiguous with the trigger (latched in the trigger's report cycle or the next)"
+    EX: "2-bit epoch of the snapshot X came from"
     FY: "same for Y"
-  sticky_status:    # host-visible; cleared by the host status read or by a new RUN
+    OY: "same for Y"
+    EY: "same for Y"
+  counters:
+    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was pending; saturating; host-readable; host-clearable only"}
+  sticky_status:         # host-visible; cleared by the host status read or a new RUN
     OUT_OVF:     "PUSH found OUT full; byte dropped"
     VERDICT_OVF: "JUDGE found VERDICT full; entry dropped"
     IN_UNDERRUN: "a PULL found IN empty"
-    SNAP_OVR:    "a trigger arrived while a snapshot was pending; JUDGE forces INDETERMINATE while set"
-    CRC_FAIL:    "the last RUN was refused: image checksum mismatch"
+    PIN_FAULT:   "SET/SHO addressed a pin this engine doesn't own (no effect)"
+    CRC_FAIL:    "the last RUN was refused: checksum or pin-claim check failed"
   now: {bits: 16, doc: "free-running cycle counter shared with edge_ts; read-only"}
 
 pins:
-  outputs:   # SET / SHO pin numbers
-    count: 8
-    map: "uio[0..7]"
-    modes: [input, push_pull, open_drain]   # per pin, host-written while halted, part of the image
-  inputs:    # WAITP / TSTP / SHI pin numbers, all through 2-flop synchronizers
+  outputs:               # SET / SHO pin numbers (p, 4 bits)
+    count: 15
+    map: {0-7: "uio[0..7]", 8-14: "uo_out[0,1,2,3,5,6,7]", 15: reserved}
+    note: "uo_out[4] is the host UART TX (Tiny Tapeout UART pinout), so it is never an engine output"
+    modes: {uio: [input, push_pull, open_drain], uo_out: [push_pull]}
+    ownership: "global config: owner engine (or none) and mode per output pin; SET/SHO to an unowned pin has no effect and sets PIN_FAULT"
+  inputs:                # WAITP / TSTP / SHI pin numbers (q, 4 bits), all through 2-flop synchronizers
     count: 16
     map: {0-7: "uio_in[0..7]", 8-11: "ui_in[0..3]", 12-15: "judge channels 0..3 (after the mux)"}
   judge_channels:
     count: 4
     default_source: "ui_in[4..7]"        # input-only pads: cannot disturb the bus
-    mux: "per channel: ui_in[4+ch] (default) or uio_in[0..7]; host-written while halted, part of the image"
+    mux: "per channel: ui_in[4+ch] (default) or uio_in[0..7]; global config"
     non_intrusive: "true only when all four channels select ui_in; reported as NI in every verdict"
     waitp: "required: inputs 12..15 are the channels, the same synchronized signal edge_ts sees"
-  stretch_out_of_v0: [10BASE-T]
+  out_of_v0: [10BASE-T]
 
-edge_ts_snapshot:   # atomic timestamps (in edge_ts)
-  trigger: "configured by TRIG ch, e (default: disabled)"
-  on_trigger: "if !S: snapshot <- every channel's {rise_ts, fall_ts, rise_stale, fall_stale, missed} as latched at the end of the trigger's report cycle; S <- 1. If S: snapshot unchanged, SNAP_OVR <- 1."
+edge_ts_snapshot:        # one edge_ts; one snapshot + trigger per engine
+  tracks_last_edge: "per channel, which of rise/fall was latched last (for TSGET e = last)"
+  trigger: "per engine, set by TRIG ch, e (default: disabled)"
+  on_trigger: >-
+    if !S: ONE CYCLE AFTER the trigger's report cycle, snapshot <- every channel's {rise_ts, fall_ts,
+    last_edge, rise_stale, fall_stale, missed} as latched then, plus per edge an ORD bit = "latched in
+    the trigger's report cycle or the next" (order relative to the trigger is ambiguous: the per-edge
+    report latency varies by up to 1 + 2/K cycles); epoch <- epoch + 1; S <- 1; valid <- 1.
+    The one-cycle delay guarantees every edge that truly happened before the trigger edge is in the
+    snapshot, so no earlier edge can be missed (that would allow a false PASS).
+    If S: snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
+    lost_since_verdict <- 1. A lost trigger does NOT force INDETERMINATE.
   read_by: TSGET
   released_by: REL
-  formal: "after an accepted trigger, snapshot == edge_ts latched state; snapshot constant while S"
+  formal: "after an accepted trigger, snapshot == edge_ts latched state one cycle after the trigger's report; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in the two-cycle window; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S"
 
-fifos:
+fifos:                   # per engine
   IN:      {width: 8,  depth: 4, dir: host_to_engine, engine_side: "PULL: never stalls; empty -> E <- 1, SR unchanged, IN_UNDERRUN"}
   OUT:     {width: 8,  depth: 4, dir: engine_to_host, engine_side: "PUSH: never stalls; full -> drop, OUT_OVF"}
   VERDICT: {width: 16, depth: 8, dir: engine_to_host, engine_side: "JUDGE: never stalls; 1 slot, or 2 with raw; full -> drop all, VERDICT_OVF"}
 
-verdict_entry:      # VERDICT FIFO slot 1 (header); slot 2 only with `raw`
+verdict_entry:           # VERDICT FIFO slot 1 (header); slot 2 only with `raw`
   header:
     "15:14": "verdict: 00 INDETERMINATE, 01 PASS, 10 VIOLATION"
     "13": FX
     "12": FY
-    "11": SNAP_OVR
-    "10": "NI: non-intrusive (all judge channels on ui_in)"
-    "9":  "R: a raw slot follows"
-    "8":  "0"
+    "11": "TAG: X and Y came from different snapshots (EX != EY)"
+    "10": "L: a trigger was lost since the previous JUDGE"
+    "9":  "NI: non-intrusive (all judge channels on ui_in)"
+    "8":  "R: a raw slot follows"
     "7:4": "bound index b"
-    "3:0": "m saturated to -8..+7 cycles (coarse; use raw for the exact value)"
+    "3":  "ORD: an edge was order-ambiguous with the trigger (OX | OY)"
+    "2:0": "m saturated to -4..+3 cycles (coarse; use raw for the exact value)"
   raw: "slot 2: m[15:0], the measured interval in cycles, signed"
 
-bounds_table:
+stats:                   # per engine, bound slots b = 0..3, updated by every JUDGE b (any push mode)
+  slots: 4
+  per_slot:
+    n_pass:  {bits: 16, saturating: true}
+    n_viol:  {bits: 16, saturating: true}
+    n_indet: {bits: 16, saturating: true}
+    m_min:   {bits: 16, signed: true, doc: "over judgments that were not invalid"}
+    m_max:   {bits: 16, signed: true, doc: "same"}
+  reserved_for_later: {sum_m: 32, sum_m2: 48}   # vernier statistics; address space reserved now
+  host: "latch one slot into a shadow (atomic), then read it byte by byte; clear per slot"
+
+bounds_table:            # per engine
   entries: 16
   entry:
     n_lo:    {bits: 20, frac_bits: 4, doc: "bound in cycles, rounded DOWN to 1/16 cycle"}
@@ -100,40 +134,66 @@ bounds_table:
     is_max:  {bits: 1}
   source: "assembler: .bound b, min|max, <time> with the image's clock (.clock_hz)"
   rule: "PASS tests against the rounded-up bound, VIOLATION against the rounded-down one: sound for any clock"
-  written_by: "host, while halted; part of the image"
 
-loader:
-  image_words: 98   # program 64 + bounds 16 x 2 + pin modes 1 + channel mux 1
-  checksum: "CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over the 98 image words, in order"
-  run: "RUN starts a check: the engine reads the 98 words (98 cycles) and starts only if the CRC equals the host's expected value; otherwise stays halted and sets CRC_FAIL"
-  readback: "every image word and the computed CRC, while halted"
-  writes_only_while_halted: "enforced in the engine (write enables gated by !running), not only by the host port"
+images:
+  global:
+    words: 8
+    layout:
+      0:   "magic 0x5246 ('RF') "
+      1:   "format version (3) | engine count"
+      2-5: "output pins 0..14 (+1 reserved): 4 bits each = {owner[1:0] (0 none, 1 engine 0, 2 engine 1), mode[1:0]}"
+      6:   "judge channel mux: 4 bits per channel (0 = ui_in default, 1..8 = uio_in[0..7])"
+      7:   "reserved (0)"
+    crc: "CRC-16/CCITT-FALSE over words 0..7"
+    written: "only while ALL engines are halted"
+  per_engine:
+    words: 97
+    layout:
+      0-63:  "program"
+      64-95: "bounds 0..15, 2 words each: n_lo[19:4]; {n_lo[3:0], inexact, is_max, 10 zeros}"
+      96:    "claimed output pins: 15-bit mask (bit 15 = 0), computed by the assembler from SET/SHO"
+    crc: "CRC-16/CCITT-FALSE over words 0..96"
+    written: "only while that engine is halted"
+  run_checks: >-
+    RUN(e) reads the global image and engine e's image through the engines' read ports
+    (8 + 97 = 105 cycles), and starts only if both CRCs match the host's expected values AND
+    every pin engine e claims is owned by e in the global config (so two engines can never
+    drive one pin). Otherwise e stays halted and CRC_FAIL is set.
+  readback: "every word of every image and the computed CRCs, while halted"
+  writes_only_while_halted: "enforced in hardware (write enables gated), not only by the host port"
+
+host_uart:
+  default_baud: 115200   # at power-up, so any terminal or the demo board can connect
+  fast: "a host command sets the divisor (applied after its reply): 1, 2 or 3 Mbaud at 60 MHz = 60, 30, 20 cycles per bit"
+  drain: "a bulk read returns up to 8 VERDICT slots in one reply (count + 2 bytes per slot)"
 
 fields:
-  p:   {bits: [2, 0],  doc: "output pin 0..7"}
-  q:   {bits: [3, 0],  doc: "input pin 0..15"}
-  v:   {bits: [4, 4],  doc: "level 0/1"}
-  msb: {bits: [4, 4],  doc: "1: MSB first (shift left), 0: LSB first (shift right)"}
-  raw: {bits: [4, 4],  doc: "JUDGE: also push the full m"}
-  hi:  {bits: [8, 8],  doc: "1: SR[15:8], 0: SR[7:0]"}
-  n:   {bits: [10, 0], doc: "unsigned cycles 0..2047 (the assembler also accepts ns/us literals)"}
-  t:   {bits: [9, 0],  doc: "timeout count 0..1023, in units of 1 or 16 cycles (x16)"}
-  x16: {bits: [10, 10], doc: "1: t counts 16-cycle units (timeouts up to 16368 cycles)"}
-  a:   {bits: [5, 0],  doc: "program address 0..63"}
-  c:   {bits: [8, 6],  doc: "branch condition: 0 T, 1 !T, 2 C, 3 !C, 4 E, 5 !E, 6 S, 7 !S"}
-  imm: {bits: [7, 0],  doc: "8-bit immediate"}
-  r:   {bits: [5, 5],  doc: "0: X, 1: Y"}
-  ch:  {bits: [1, 0],  doc: "judge channel 0..3"}
-  e:   {bits: [2, 2],  doc: "0: rising edge, 1: falling edge"}
-  b:   {bits: [3, 0],  doc: "bounds-table entry 0..15"}
+  p:    {bits: [3, 0],  doc: "output pin 0..14 (see pins.outputs)"}
+  q:    {bits: [3, 0],  doc: "input pin 0..15"}
+  v:    {bits: [4, 4],  doc: "level 0/1"}
+  msb:  {bits: [4, 4],  doc: "1: MSB first (shift left), 0: LSB first (shift right)"}
+  raw:  {bits: [4, 4],  doc: "JUDGE: also push the exact m"}
+  push: {bits: [6, 5],  doc: "JUDGE push mode: 0 all, 1 nonpass, 2 none (stats only)"}
+  hi:   {bits: [8, 8],  doc: "1: SR[15:8], 0: SR[7:0]"}
+  n:    {bits: [10, 0], doc: "unsigned cycles 0..2047; the assembler splits longer waits"}
+  t:    {bits: [9, 0],  doc: "timeout count 0..1023, in units of 1 or 16 cycles (x16)"}
+  x16:  {bits: [10, 10], doc: "1: t counts 16-cycle units (timeouts up to 16368 cycles)"}
+  a:    {bits: [5, 0],  doc: "program address 0..63"}
+  c:    {bits: [8, 6],  doc: "branch condition: 0 T, 1 !T, 2 C, 3 !C, 4 E, 5 !E, 6 S, 7 !S"}
+  imm:  {bits: [7, 0],  doc: "8-bit immediate"}
+  r:    {bits: [5, 5],  doc: "0: X, 1: Y"}
+  ch:   {bits: [1, 0],  doc: "judge channel 0..3"}
+  e:    {bits: [3, 2],  doc: "0: rising edge, 1: falling edge, 2: last edge (whichever was latched later), 3: reserved"}
+  b:    {bits: [3, 0],  doc: "bounds-table entry 0..15 (stats for 0..3)"}
 
 instructions:
   - {name: NOP,   opcode: 0x00, syntax: "nop",            cycles: 1, semantics: "nothing"}
-  - {name: HALT,  opcode: 0x01, syntax: "halt",           cycles: 1, semantics: "stop; pins keep their level"}
+  - {name: HALT,  opcode: 0x01, syntax: "halt",           cycles: 1,
+     semantics: "stop. Push-pull pins keep their level; open-drain pins are RELEASED (a held-low SDA would hang the bus)."}
   - {name: SET,   opcode: 0x02, syntax: "set p, v",       cycles: 1, pad_latency: 1,
-     semantics: "pin p <- v. Push-pull: drive v. Open-drain: v=0 drives low, v=1 releases."}
+     semantics: "pin p <- v if this engine owns p (else no effect, PIN_FAULT). Push-pull: drive v. Open-drain: v=0 drives low, v=1 releases."}
   - {name: SHO,   opcode: 0x03, syntax: "sho p[, msb]",   cycles: 1, pad_latency: 1,
-     semantics: "pin p <- msb ? SR[15] : SR[0]; SR shifts that bit out, refilling with 1"}
+     semantics: "pin p <- msb ? SR[15] : SR[0] (ownership as SET); SR shifts that bit out, refilling with 1"}
   - {name: SHI,   opcode: 0x04, syntax: "shi q[, msb]",   cycles: 1,
      semantics: "C <- in[q]; SR <- msb ? {SR[14:0], in[q]} : {in[q], SR[15:1]}"}
   - {name: TSTP,  opcode: 0x05, syntax: "tstp q",         cycles: 1, semantics: "C <- in[q]"}
@@ -155,10 +215,11 @@ instructions:
      semantics: "if IN non-empty: SR byte <- IN, E <- 0; else E <- 1, SR unchanged, IN_UNDERRUN <- 1. Never stalls."}
   - {name: PUSH,  opcode: 0x11, syntax: "push[ hi]",      cycles: 1,
      semantics: "OUT <- SR byte; never stalls; full -> drop, OUT_OVF <- 1"}
-  - {name: TRIG,  opcode: 0x12, syntax: "trig ch, e",     cycles: 1, semantics: "snapshot trigger <- channel ch, edge e (enabled)"}
-  - {name: REL,   opcode: 0x13, syntax: "rel",            cycles: 1, semantics: "S <- 0 (release the snapshot; the next trigger may overwrite it)"}
+  - {name: TRIG,  opcode: 0x12, syntax: "trig ch, e",     cycles: 1, semantics: "this engine's snapshot trigger <- channel ch, edge e (rise or fall)"}
+  - {name: REL,   opcode: 0x13, syntax: "rel",            cycles: 1, semantics: "S <- 0 (release the snapshot; the next trigger may replace it)"}
   - {name: TSGET, opcode: 0x14, syntax: "tsget r, ch, e", cycles: 1,
-     semantics: "r <- snapshot timestamp of channel ch, edge e; F(r) <- its stale | missed | !S | SNAP_OVR"}
-  - {name: JUDGE, opcode: 0x15, syntax: "judge b[, raw]", cycles: 1,
-     semantics: "m <- Y - X; v <- verdict(m, bounds[b], invalid = FX | FY | SNAP_OVR); push header (and m if raw), all or nothing"}
+     semantics: "r <- snapshot timestamp of channel ch, edge e (rise, fall or last); F(r) <- its stale | missed | !valid; O(r) <- its ORD bit; E(r) <- snapshot epoch"}
+  - {name: JUDGE, opcode: 0x15, syntax: "judge b[, raw][, push]", cycles: 1,
+     semantics: "m <- Y - X; v <- verdict(m, bounds[b], invalid = FX | FY | OX | OY | (EX != EY)); update stats[b] if b < 4; push per mode (all / nonpass / none), header (+ m if raw), all or nothing; clear lost_since_verdict"}
   - {name: TMON,  opcode: 0x16, syntax: "tmon t[, x16]",  cycles: 1, semantics: "TO <- NOW + t * (x16 ? 16 : 1) (timeout relative to now, e.g. after an input-paced wait)"}
+  - {name: CMP,   opcode: 0x17, syntax: "cmp imm[, hi]",  cycles: 1, semantics: "C <- (SR[7:0] (or SR[15:8]) == imm)"}
