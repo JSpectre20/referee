@@ -1,184 +1,316 @@
-# Referee engine: ISA and timing model (v0.1 DRAFT, for review)
+# Referee engine: ISA and timing model (v0.2 DRAFT, for review)
 
-`isa.yaml` is the single source of truth: opcodes, fields, cycle costs. In step 2 a generator
-produces the RTL opcode include, the assembler, the reference model, and the table in this
-document from it. This file explains the decisions and states the timing contract as numbers.
-The engine grows out of `seq` (four instructions) and adds deadlines, input waits with
-timeouts, branches, FIFOs, and the referee instructions TSGET and JUDGE.
+`isa.yaml` is the single source of truth: opcodes, fields, cycle costs, state. In step 2 a
+generator produces the RTL opcode include, the assembler, the reference model, and the
+instruction table below from it. This document explains the decisions, states the timing
+contract as numbers, and keeps the **assumption ledger** (section 10). The engine grows out of
+`seq` and adds deadlines, waits with timeouts, branches, FIFOs, atomic timestamp snapshots,
+and the referee instructions TSGET and JUDGE.
 
-## 1. Decisions (proposed in the brief), with evidence
+## 0. Changes since v0.1 (review of 27 Oct)
 
-| # | Decision | Verdict | Evidence / change |
-| --- | --- | --- | --- |
-| 1 | STA target 60 MHz, 40 MHz fallback | **Agree** | The demo board's firmware picks an RP2 system clock that's a multiple of the project clock, allowed up to twice it (`clock_project_PWM`, `max_rp2040_freq = freqHz*2`). 60 MHz = 120 MHz / 2, exact, 50% duty. 40 MHz = 120/3, exact but 33% duty, so STA must check the minimum pulse width at 40 MHz. The current chip has +10.7 ns setup slack at a 20 ns constraint (gds of `1ecdc36`), so 16.7 ns is plausible. Risk: CMOS5L pads are uncharacterized; the TT pad limit quoted so far is ~66 MHz. |
-| 2 | Every instruction exactly 1 cycle, incl. taken branches and LOOP | **Agree**, made precise | All non-waiting instructions cost 1 cycle; taken and untaken branches both cost 1. This works because the program memory is flip-flops read combinationally, so the next PC is known in the same cycle. Only WAITD, WAITP and PULL stall, by definition (section 3). |
-| 3 | 64x16 flop program memory per engine, written only while halted | **Agree** | ~1,024 flops ≈ 50-53 µm² each (PLAN; Abagel measured 49 µm²) ≈ 55k µm² plus read mux. Today's whole chip is 82k µm² = 9.1% of 6x4, so one engine fits easily. SRAM would put the macro's ~6.3 ns clock-to-output (Abagel, slow corner) inside the 1-cycle branch path at 16.7 ns, so no SRAM for programs. |
-| 4 | Loaded "through the UART console" | **Adjusted** | Through the binary host port on `main` (`src/host_port.v`), extended with commands for program words, the bounds table, pin modes and the FIFOs (section 6). The teammate's text console isn't on `main`; it can sit on top later. |
-| 5 | Registers X, Y, SR, repeat counter, deadline | **Agree**, widths set | X, Y 16-bit (they hold timestamps); SR 16-bit (SPI 16, I2C 9 bits incl. ACK); RC 8-bit; DL 16-bit. Plus flags T, C and the timestamp flags FX, FY. |
-| 6 | MARK / WAITD n, signed compare, half-range rule in the assembler | **Agree**, plus `DL n` | `DL n` advances the deadline without waiting. WAITP needs it to set a timeout without spending it. Immediates are 11 bits (≤ 2047 cycles; a 115200-baud bit is 521 at 60 MHz). Longer waits chain DLs; the assembler enforces the half-range rule (section 3.4). |
-| 7 | WAITP pin, level with a deadline timeout; pin event wins a tie | **Agree** | Sets flag T. Branch on it with JT/JNT. |
-| 8 | SET pins, fixed 1-cycle OUT-to-pad latency | **Agree** | Per-pin mode (input / push-pull / open-drain) set by the host while halted. In open-drain mode `set p, 1` releases the line (oe = 0). |
-| 9 | Shift one bit out or in through a pin | **Agree** | SHO / SHI, with an LSB-first or MSB-first bit. SHI also sets C. |
-| 10 | TX/RX FIFOs | **Agree** | IN (host→engine) and OUT (engine→host), 4 x 8 bits. PULL blocks while IN is empty; PUSH never blocks (drop + sticky overflow), so a full FIFO can't change program timing. |
-| 11 | TSGET and JUDGE with a bounds table and a verdict FIFO | **Agree**, split made explicit | `tsget X, ch, e` and `tsget Y, ch, e` load two timestamps (and their stale/missed flags); `judge b` computes m = Y - X with the proved verdict unit against bounds[b] and pushes {verdict, flags, b, m} to the VERDICT FIFO (never blocks, sticky overflow). The split makes "JUDGE passes the right timestamps" a register-transfer property that formal can check. |
-| 12 | Judging on ui_in pins only | **Agree**, pins fixed | Judge channels = ui_in[4..7] (4 edge_ts channels). ui_in[3] is the host UART RX. ui_in pads are input-only, so judging can't disturb the bus, by construction. |
-| 13 | HALT | **Agree** | The engine stops, pins keep their level, the host sees "halted". |
-| - | **Added:** conditional branches and pin test | needed | Protocols decide things (I2C ACK/NACK, clock-stretch timeouts, SPI target CS). So: JT/JNT (timeout flag), JC/JNC (sampled bit) and TSTP (sample a pin into C). LOOP covers counted loops. |
-| - | **Added:** NOP, LDRC, LDSR | needed | Loading the counter and the shift register from immediates. |
+| Review item | Resolution | Where |
+| --- | --- | --- |
+| 1. Atomic timestamps | edge_ts takes a **snapshot** of every channel on a trigger edge set by `trig`. TSGET reads the snapshot. A trigger while a snapshot is pending keeps the old one and sets sticky SNAP_OVR, which forces INDETERMINATE. `waits` / `rel` added. Formal: snapshot = edge_ts state at the trigger. | §3.6, §5.3 |
+| 2. Deadline rules | **Two registers.** DL (schedule) changes only by MARK and WAITD. TO (timeout) changes only by TMO / TMON. Waits change neither. `dl n` removed. Drift-free UART TX with a timeout shown. | §3.4, §5.1 |
+| 3. PULL on empty | **Non-blocking**: E flag + branch, sticky IN_UNDERRUN for the host. Justified in §3.5; ledger A7. | §3.5, §10 |
+| 4. Bounds table | The assembler fills it from **ns** with the image's clock frequency. Rounding is sound on both sides (floor + inexact bit). | §6 |
+| 5. Loader | CRC-16 over the 98-word image is checked by the engine before it starts; refused on mismatch. Full readback. Writes only while halted, enforced **inside the engine**. | §7 |
+| 6. §8 answers | Two engines planned (decided at the gate). Four channels on ui_in[4..7], each muxable to a uio pin; NI flag in every verdict. 10BASE-T out of v0. WAITP on channels required. | §1, §9 |
+| 7. Raw m | `judge b, raw` also pushes the exact m (second FIFO slot). | §3.7 |
+| Also | Four conditional branches merged into one `br c, a` with 8 conditions (T, C, E, S and their negations). | §4 |
+
+## 1. Decisions, with evidence
+
+| Decision | Status | Evidence / note |
+| --- | --- | --- |
+| STA at 60 MHz, 40 MHz fallback | Agreed | Demo-board firmware (`clock_project_PWM`) uses an RP2 system clock that's a multiple of the project clock, up to twice it: 60 MHz = 120 MHz / 2 at 50% duty. 40 MHz = 120 / 3, 33% duty, so STA must check the minimum pulse width there. The current chip has +10.7 ns setup slack at 20 ns. At 60 MHz, u = 2 cycles = 33 ns. |
+| Every non-waiting instruction takes 1 cycle, incl. taken branches and LOOP | Agreed | Flip-flop program memory is read combinationally, so the next PC is known in the same cycle. Only WAITD, WAITP and WAITS stall. PULL no longer does (§3.5). |
+| 64x16 flop program memory per engine | Agreed | ~1,024 flops at ~50 µm² ≈ 55k µm² plus mux. The chip today is 82k µm² = 9.1% of 6x4. An SRAM macro's ~6.3 ns clock-to-output would sit inside the 1-cycle branch path. |
+| Loader | Adjusted | The binary host port on `main`, extended (§7). The teammate's text console isn't on `main`. |
+| Engines | Planned 2, v0 has 1 | Second engine (another 64-word memory, ~55k µm²) decided at the 8 Nov gate from the area ledger. |
+| Judge channels | Agreed | 4 channels, default ui_in[4..7] (ui_in[3] is the host UART RX). Each has a source mux: ui_in[4+ch] or uio_in[0..7], for future active modes. **Non-intrusive only when all four select ui_in**; every verdict carries the NI bit so the claim is checkable per verdict. |
+| WAITP on judge pins | Required | Inputs 12..15 *are* the channels after the mux: the same synchronized signal edge_ts sees, so the engine and the timestamps agree on when an edge happened. |
+| 10BASE-T | Out of v0 | A Manchester half-bit is 3 cycles at 60 MHz; firmware can't keep up (needs the PLAN's hardware serializer). |
 
 ## 2. Machine state
 
-| State | Bits | Notes |
+| State | Bits | Changed by |
 | --- | --- | --- |
-| PC | 6 | 64 words |
-| X, Y | 16 each | general; timestamps for JUDGE |
-| SR | 16 | shift register |
-| RC | 8 | LOOP counter |
-| DL | 16 | deadline |
-| T, C, FX, FY | 1 each | flags |
-| NOW | 16 | free-running cycle counter, shared with edge_ts; read-only |
-| Pin modes | 8 x 2 | host-written while halted |
-| Bounds table | 16 x 21 | n_fx (cycles, 4 fractional bits) + is_max; host-written while halted |
-| FIFOs | IN 4x8, OUT 4x8, VERDICT 4x16 | |
+| PC | 6 | issue, branches, RUN (→ 0) |
+| X, Y | 16 each | TSGET (and future ALU ops) |
+| SR | 16 | SHO, SHI, LDSR, PULL |
+| RC | 8 | LDRC, LOOP |
+| DL (schedule deadline) | 16 | **MARK, WAITD only** |
+| TO (timeout deadline) | 16 | **TMO, TMON only** |
+| Flags T, C, E, S | 1 each | WAITP/WAITS (T); SHI/TSTP (C); PULL (E); snapshot logic, REL (S) |
+| FX, FY | 1 each | TSGET |
+| Sticky status: OUT_OVF, VERDICT_OVF, IN_UNDERRUN, SNAP_OVR, CRC_FAIL | 1 each | set by hardware; cleared by the host status read or a new RUN |
+| NOW | 16 | +1 every cycle (shared with edge_ts) |
+| Image: program 64 words, bounds 16 entries, pin modes, channel mux | 98 words | host, **only while halted** |
 
-## 3. Timing contract (all numbers in cycles of the engine clock)
+## 3. Timing contract (cycles of the engine clock)
 
 ### 3.1 Issue
 - An instruction **issues** in the cycle it executes. Straight-line code issues one per cycle.
-- Every instruction costs **exactly 1 cycle** unless it waits (WAITD, WAITP, PULL).
-- **Branches** (JMP, JT, JNT, JC, JNC, LOOP), taken or not: 1 cycle, no penalty.
-- **Start:** the first cycle the engine is running issues the instruction at address 0.
-  Halting (HALT or host) cancels any wait. Pins keep their level.
-- **Program memory and configuration** (pin modes, bounds table) are written only while
-  halted; writes while running are refused (NAK) and ignored.
+- Every instruction costs **exactly 1 cycle** except WAITD, WAITP and WAITS, which stall by
+  definition. Branches (JMP, BR, LOOP), taken or not, cost 1 cycle.
+- RUN starts with the image check (§7). If it passes, address 0 issues exactly
+  **C_START = 99 cycles** after RUN is accepted (98 check cycles + 1). HALT, or a host halt,
+  cancels any wait; pins keep their level.
 
 ### 3.2 Outputs
-- A SET or SHO issued in cycle t changes its pad from **cycle t+1**: exactly one cycle, for
-  every pin and mode. Pads change at no other time and never glitch (registered outputs).
+- SET / SHO issued in cycle t change the pad from **cycle t+1**, for every pin and mode. Pads
+  change at no other time and never glitch.
 
 ### 3.3 Inputs
-- Every input passes a 2-flop synchronizer. An external edge at real time t is visible to
-  WAITP / TSTP / SHI from a cycle between t+1 and t+3. The exact window comes from the
-  edge_ts proof: 1 - 1/K .. 2 + 1/K cycles after the edge to the start of the reporting cycle.
-- Edge timestamps (TSGET) carry the proved uncertainty: an interval between two external edges
-  is measured to within 2 cycles (`docs/verdict.md`), which is the u used by JUDGE.
+- Every input passes a 2-flop synchronizer. An external edge at time t becomes visible to
+  WAITP / TSTP / SHI between 1 - 1/K and 2 + 1/K cycles later, the same window edge_ts is
+  proved to have (`docs/verdict.md`).
 
-### 3.4 Deadlines
-- MARK: DL ← NOW, at the cycle MARK issues.
-- `waitd n` issued at t: DL ← DL + n; the next instruction issues at **max(t + 1, DL)**. So a
-  loop `mark; ...; waitd P; ...; jmp` paces itself at exactly P cycles per iteration, whatever
-  the body costs (as long as it costs < P): no drift.
-- `dl n`: DL ← DL + n, 1 cycle, no wait.
-- `waitp q, v` issued at t: stalls until in[q] == v or NOW - DL ≥ 0, compared by **signed
-  difference** (an already-passed deadline fires at once). It ends the cycle after the
-  condition is seen; if the condition is true at t, it costs 1 cycle. If both happen in the same
-  cycle, **the pin event wins** (T ← 0). DL is unchanged.
-- **Half-range rule:** with a 16-bit DL, a deadline is valid only while DL - NOW < 2^15. The
-  assembler tracks every path's DL advance between waits and rejects programs that could
-  exceed 2^14 (a conservative static bound).
+### 3.4 Deadlines: two registers, nothing implicit
+- **DL, the schedule.** `mark`: DL ← NOW. `waitd n` issued at t: DL ← DL + n; the next
+  instruction issues at **max(t + 1, DL)**. Nothing else writes DL.
+- **TO, the timeout.** `tmo t`: TO ← DL + t (relative to the schedule, so it's as deterministic
+  as the schedule). `tmon t`: TO ← NOW + t (relative to now, for use after an input-paced
+  wait). Nothing else writes TO.
+  - t is 0..1023 cycles, or 0..1023 × 16 cycles with the `x16` bit: up to 16,368 cycles
+    (273 µs at 60 MHz).
+  - The assembler takes a time and rounds timeouts **up** to the next step, so they never fire
+    early. Longer timeouts are loops (`ldrc k; again: tmon …; waitp …; jnt got; loop again`).
+- **Waits:** `waitp q, v` / `waits` stall until their event (T ← 0) or **NOW - TO ≥ 0** by
+  signed difference (T ← 1); if both happen in the same cycle the **event wins**. They end the
+  cycle after the condition is seen (1 cycle if it already holds) and change neither DL nor TO.
+- **Re-anchoring is explicit:** after an input-paced wait, firmware that wants to time from the
+  event issues `mark`. Until then, DL still describes the old schedule.
+- **Half-range rule:** DL and TO are valid while DL - NOW and TO - NOW are below 2^15. The
+  assembler tracks every path and rejects programs that could exceed 2^14 (a conservative
+  static bound).
 
-### 3.5 FIFOs and JUDGE
-- PUSH and JUDGE never stall; a full FIFO drops the entry and sets a sticky overflow bit.
-  Their timing is the same whether or not the FIFO is full.
-- PULL stalls while IN is empty. Its timing is host-paced, so contracts restart at the next MARK.
-- `tsget r, ch, e` returns the latched timestamp of that edge. If the edge is being reported in
-  the same cycle, it returns NOW (the value edge_ts is latching). F(r) ← stale | missed.
-- `judge b`: verdict(m = Y - X, bounds[b], invalid = FX | FY), using the proved rule (u = 2,
-  sharp VIOLATION). It pushes {verdict[1:0], FX, FY, b[3:0], m[7:0] saturated}.
+### 3.5 FIFOs
+- **PULL never stalls.** If IN has a byte: SR byte ← it, E ← 0. If empty: E ← 1, SR unchanged,
+  sticky IN_UNDERRUN ← 1. Firmware branches on E.
+- **Why non-blocking, not blocking at frame boundaries:**
+  1. Every instruction except the three waits keeps a fixed cost, so the "1-cycle issue"
+     property holds for every instruction and static timing stays complete.
+  2. A blocking PULL makes program timing depend on the host (MicroPython latency is in
+     milliseconds). Inside a frame that corrupts the frame; at a boundary it needs a hardware
+     notion of "frame" the ISA doesn't have.
+  3. The firmware states the boundary policy itself, deterministically: at a frame start,
+     `pull; je idle`, where `idle` is a WAITD-paced poll loop.
+  4. Underrun stays observable: E for the firmware, IN_UNDERRUN for the host.
+- **PUSH never stalls:** full → byte dropped, OUT_OVF.
+- **JUDGE never stalls:** full → entry dropped (both slots if raw), VERDICT_OVF.
+
+### 3.6 Snapshots (atomic timestamps)
+- `trig ch, e` arms the trigger on channel ch, edge e (1 cycle).
+- When that edge is reported (the cycle edge_ts latches it):
+  - If S = 0: snapshot ← every channel's {rise_ts, fall_ts, rise_stale, fall_stale, missed}
+    **as latched at the end of that cycle**, and S ← 1. Channels reporting an edge in the same
+    cycle contribute NOW.
+  - If S = 1: the snapshot is **kept** (the firmware is still reading it), and sticky
+    SNAP_OVR ← 1.
+- `tsget r, ch, e` reads the snapshot, never the live latches, so all timestamps used by one
+  verdict come from one instant. F(r) ← stale | missed | !S | SNAP_OVR.
+- `rel` releases the snapshot (S ← 0). `waits` waits for the next one, with timeout TO.
+- While SNAP_OVR is set, every JUDGE is INDETERMINATE: a trigger was lost, so the firmware may be
+  pairing edges from different instants.
+
+### 3.7 JUDGE
+- `judge b[, raw]`: m ← Y - X (signed); verdict(m, bounds[b], invalid = FX | FY | SNAP_OVR)
+  with the proved rule (u = 2 cycles, sharp VIOLATION, two-sided rounding of §6).
+- Pushes a header slot {verdict, FX, FY, SNAP_OVR, NI, R, b, m saturated to 4 bits}. With
+  `raw`, R = 1 and a second slot carries the exact m[15:0], for the vernier work. Both slots go
+  in or neither does.
 
 ## 4. Instruction set
 
-Generated from `isa.yaml` in step 2; hand-written here for review.
+Generated from `isa.yaml` in step 2; hand-written here for review. Opcode in [15:11].
 
 | Opcode | Syntax | Cycles | Effect |
 | --- | --- | --- | --- |
-| 0x00 | `nop` | 1 | nothing |
-| 0x01 | `halt` | 1 | stop; pins keep their level |
+| 0x00 | `nop` | 1 | - |
+| 0x01 | `halt` | 1 | stop |
 | 0x02 | `set p, v` | 1 | output pin p ← v (pad at t+1); open-drain: 1 releases |
-| 0x03 | `sho p[, msb]` | 1 | pin p ← SR[0] (or SR[15]); SR shifts, refills with 1 |
+| 0x03 | `sho p[, msb]` | 1 | pin p ← SR[0] or SR[15]; SR shifts, refills with 1 |
 | 0x04 | `shi q[, msb]` | 1 | C ← in[q]; SR shifts it in |
 | 0x05 | `tstp q` | 1 | C ← in[q] |
 | 0x06 | `mark` | 1 | DL ← NOW |
-| 0x07 | `dl n` | 1 | DL ← DL + n |
+| 0x07 | `tmo t[, x16]` | 1 | TO ← DL + t (× 16 with x16) |
 | 0x08 | `waitd n` | ≥ 1 | DL ← DL + n; next issues at max(t+1, DL) |
-| 0x09 | `waitp q, v` | ≥ 1 | until in[q] == v (T ← 0) or deadline (T ← 1); event wins a tie |
-| 0x0A | `jmp a` | 1 | pc ← a |
-| 0x0B / 0x0C | `jt a` / `jnt a` | 1 | branch if T / !T |
-| 0x0D / 0x0E | `jc a` / `jnc a` | 1 | branch if C / !C |
-| 0x0F | `loop a` | 1 | if RC != 0: RC--, pc ← a |
-| 0x10 | `ldrc imm` | 1 | RC ← imm |
-| 0x11 | `ldsr imm[, hi]` | 1 | SR low (or high) byte ← imm |
-| 0x12 | `pull[ hi]` | ≥ 1 | SR byte ← IN FIFO (stalls while empty) |
-| 0x13 | `push[ hi]` | 1 | OUT FIFO ← SR byte (never stalls) |
-| 0x14 | `tsget r, ch, e` | 1 | X or Y ← timestamp of judge channel ch, rising/falling |
-| 0x15 | `judge b` | 1 | VERDICT FIFO ← verdict(Y - X, bounds[b]) |
+| 0x09 | `waitp q, v` | ≥ 1 | until in[q] == v (T ← 0) or TO (T ← 1); event wins a tie |
+| 0x0A | `waits` | ≥ 1 | until a snapshot is pending (T ← 0) or TO (T ← 1) |
+| 0x0B | `jmp a` | 1 | pc ← a |
+| 0x0C | `br c, a` | 1 | if c ∈ {T, !T, C, !C, E, !E, S, !S}: pc ← a (aliases `jt` … `jns`) |
+| 0x0D | `loop a` | 1 | if RC != 0: RC--, pc ← a |
+| 0x0E | `ldrc imm` | 1 | RC ← imm |
+| 0x0F | `ldsr imm[, hi]` | 1 | SR byte ← imm |
+| 0x10 | `pull[ hi]` | 1 | SR byte ← IN, E ← 0; or E ← 1 if empty |
+| 0x11 | `push[ hi]` | 1 | OUT ← SR byte (dropped if full) |
+| 0x12 | `trig ch, e` | 1 | snapshot trigger ← channel ch, edge e |
+| 0x13 | `rel` | 1 | S ← 0 |
+| 0x14 | `tsget r, ch, e` | 1 | X or Y ← snapshot timestamp; F(r) ← its flags |
+| 0x15 | `judge b[, raw]` | 1 | VERDICT ← verdict(Y - X, bounds[b]) (+ raw m) |
+| 0x16 | `tmon t[, x16]` | 1 | TO ← NOW + t (× 16 with x16) |
 
-Encoding: opcode in [15:11], operands in [10:0]; fields as in `isa.yaml`.
+The assembler accepts time literals for `n` (`waitd 8.68us`). It converts them with the image's
+clock, rounding to the nearest cycle, and reports the realized value and its error.
 
-## 5. Two programs, to check that the ISA is enough
+## 5. Programs that check the ISA
 
-**UART TX, 8N1, any number of bytes, no drift** (60 MHz, 115200 baud: 521 cycles per bit):
+### 5.1 UART TX with flow control and a timeout, still drift-free
+115200 baud at 60 MHz: `.equ BIT 521` (8.68 µs; 0.03% slow).
 ```
-start:  pull                 ; SR[7:0] <- next byte (waits for the host)
-        mark                 ; timing restarts here
-        set 0, 0             ; start bit, pad at +1
-        waitd 521
-        ldrc 7               ; 8 data bits
-bit:    sho 0                ; LSB first
-        waitd 521
+start:  pull                 ; non-blocking
+        je   idle            ; nothing to send
+        tmon 250us           ; CTS timeout (assembler: 15008 cycles = 938 x 16)
+        waitp 8, 0           ; wait for CTS (ui_in[0]) low ...
+        jt   cts_timeout     ; ... or give up
+        mark                 ; <- the frame's schedule starts here: DL = t0
+        set  0, 0            ; start bit: pad at t0 + 2
+        waitd BIT
+        ldrc 7
+bit:    sho  0
+        waitd BIT
         loop bit
-        set 0, 1             ; stop bit
-        waitd 521
-        jmp start
+        set  0, 1            ; stop bit
+        waitd BIT
+        jmp  start
+idle:   mark                 ; nothing to send: poll every 10 us
+        waitd 600            ; (re-anchoring is fine here: no frame is in flight)
+        jmp  start
 ```
-Every bit edge lands exactly 521 cycles after the previous one, because WAITD is relative to
-the deadline, not to "now". Static timing is complete: each path's cycle count is known.
+**Why it stays drift-free.** DL is written only by `mark` and `waitd`, and `tmon`/`waitp`
+touch only TO and T. So inside a frame, DL = t0 + k·BIT exactly, and the pad changes at
+t0 + 2 + k·BIT for k = 0..9, whatever the timeout code did before `mark` and however long
+CTS took. With one shared register, `tmon` would have moved the schedule's anchor; that is why
+there are two.
 
-**Referee: I2C setup time on ui_in[4] (SDA) and ui_in[5] (SCL)**, judged against bounds[0]
-(minimum 100 ns = 6 cycles at 60 MHz):
+### 5.2 Schedule-relative timeout (half-duplex reply window)
 ```
-wait:   waitp 13, 1          ; in[13] = ui_in[5] = SCL high (no deadline set: dl a large n first)
-        tsget X, 0, 0        ; SDA's last rising edge  (channel 0 = ui_in[4])
-        tsget Y, 1, 0        ; SCL's rising edge        (channel 1 = ui_in[5])
-        judge 0              ; verdict FIFO <- PASS / VIOLATION / INDETERMINATE + flags
-        waitp 13, 0
-        jmp wait
+        ...                  ; last stop bit sent: DL = end of the stop bit
+        tmo  10*BIT          ; reply within 10 bit times of the stop bit (assembler: 326 x 16 = 5216)
+        waitp 9, 0           ; peer's start bit on ui_in[1]
+        jt   no_reply
+        mark                 ; re-anchor on the peer's start bit (explicit)
 ```
-(Falling SDA edges need a second TSGET/JUDGE pair with e = 1; that is the firmware's choice.)
+`tmo` is relative to DL, so the window is fixed relative to the transmitted frame, not to
+whenever `tmo` happened to issue.
 
-## 6. Host port additions (binary, over the existing UART)
+### 5.3 Referee: I2C setup time with an atomic snapshot
+Channels: 0 = SDA (ui_in[4]), 1 = SCL (ui_in[5]). Bound 0 = minimum 100 ns (Fast-mode tSU;DAT).
+```
+.clock_hz 60e6
+.bound 0, min, 100ns         ; assembler: 6.0 cycles, exact
+        trig 1, 0            ; snapshot on every SCL rising edge
+loop:   tmon 250us
+        waits                ; next SCL rise (or 250 us without one)
+        jt   bus_idle
+        tsget X, 0, 0        ; SDA's last rise   } both from the
+        tsget Y, 1, 0        ; this SCL rise     } same snapshot
+        judge 0, raw
+        tsget X, 0, 1        ; SDA's last fall
+        judge 0, raw
+        rel
+        jmp  loop
+bus_idle: ...
+```
+(Firmware picks the latest SDA edge of either polarity; a stale or missed edge on either pin
+forces INDETERMINATE automatically.)
 
-New 4-byte commands, in the format of `src/host_port.v`. Each is ACK/NAK'd; writes are refused
-while running.
+## 6. Bounds from ns: sound at any clock
+- The image is assembled for a clock: `.clock_hz 60e6` or `--clock-hz`. A bound is written in
+  time: `.bound b, min|max, 600ns`.
+- The assembler computes N = t · f in cycles and stores **n_lo = N rounded down** to 1/16 cycle,
+  plus `inexact` = 1 if that rounding lost anything (then n_hi = n_lo + 1/16).
+- The verdict tests each side against the bound that keeps it sound:
+
+| Bound | PASS if | VIOLATION if |
+| --- | --- | --- |
+| minimum | m - u ≥ n_hi | m + u ≤ n_lo |
+| maximum | m + u ≤ n_lo | m - u ≥ n_hi |
+
+  PASS ⇒ the true interval meets the *true* bound, and VIOLATION ⇒ it breaks it, whichever
+  way the conversion rounded. Rounding a single value either way would make one side unsound.
+  This changes `verdict.v` slightly; the proof in step 2 covers it.
+- Contracts therefore stay in ns and don't depend on the clock. The **assumption** is that the
+  chip runs at the clock the image was assembled for (ledger A9).
+
+## 7. Loader and host port
+
+- **Image:** 98 words = program[0..63], then bounds[0..15] (2 words each: n_lo[19:4];
+  {n_lo[3:0], inexact, is_max, 10 zero bits}), then pin modes (8 × 2 bits), then channel mux
+  (4 × 4 bits).
+- **Checksum:** CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over the 98 words in order, MSB
+  first. The host writes the expected CRC.
+- **RUN:** the engine reads the 98 words through its own read port (98 cycles), computes the
+  CRC, and starts only on a match. Otherwise it stays halted and sets CRC_FAIL, and the RUN
+  command is answered NAK. Any image write clears the "checked" state, so every RUN re-checks.
+- **Writes only while halted, in hardware:** the engine gates its own write enables with
+  !running. The host port's NAK is only a courtesy.
+- **Readback:** every image word and the computed CRC can be read back while halted.
 
 | Command | Bytes | Notes |
 | --- | --- | --- |
-| Write program word | `57 addr hi lo` | addr 0..63 (was 0..31) |
-| Write bounds entry | `42 idx byte sel` | builds the 21-bit entry byte by byte (sel 0..2) |
-| Pin mode | `4D pin mode 00` | mode 0 input, 1 push-pull, 2 open-drain (replaces the raw 'O' mask) |
-| IN FIFO push | `50 byte 00 00` | NAK if full |
-| OUT FIFO pop | `70 00 00 00` | data = byte; NAK if empty |
-| VERDICT pop | `56 00 00 00` | 2 replies' worth: sent as `06 hi` then `06 lo`, or NAK if empty |
-| Status | `51 00 00 00` | adds the sticky overflow bits |
+| Identify | `49 00 00 00` | data 0x52 |
+| Write image word | `57 addr hi lo` | addr 0..97; NAK while running |
+| Read image word | `72 addr sel 00` | sel 0: high byte, 1: low byte; NAK while running |
+| Expected CRC | `43 hi lo 00` | |
+| Read computed CRC | `63 sel 00 00` | after a RUN attempt |
+| Run / halt | `52 01 00 00` / `52 00 00 00` | RUN: ACK only if the CRC matched |
+| IN push | `50 byte 00 00` | NAK if full |
+| OUT pop | `70 00 00 00` | NAK if empty |
+| VERDICT pop | `56 sel 00 00` | pops one 16-bit slot: sel 0 high byte (read first), 1 low byte (completes the pop) |
+| Status | `51 00 00 00` | running, S, sticky bits, NI; read-and-clear of the sticky bits |
 
-## 7. What step 2 will prove and test
+## 8. Proofs and tests in step 2
 
-- **Formal:** every non-waiting instruction issues in exactly 1 cycle; WAITD next-issue =
-  max(t+1, DL); deadline monotonicity (DL changes only by MARK / DL / WAITD); program and
-  configuration writes only while halted; JUDGE feeds the verdict unit exactly Y - X, FX | FY
-  and bounds[b]; pads change only one cycle after SET/SHO.
-- **Lockstep:** the RTL against the model generated from `isa.yaml`, on random programs.
-- **Firmware:** UART TX and RX, and JUDGE on an external UART at in-spec and off-spec baud, on
-  RTL and gate level. Then harden at 6x4, STA at 60 MHz, and the area ledger.
+- **Formal (engine):**
+  - every non-waiting instruction issues in exactly 1 cycle;
+  - WAITD: next issue = max(t+1, DL);
+  - DL is written only by MARK/WAITD and TO only by TMO/TMON;
+  - WAITP/WAITS: the event wins a tie;
+  - pads change only one cycle after SET/SHO;
+  - image writes only while halted;
+  - no issue unless the CRC matched;
+  - JUDGE feeds the verdict unit exactly Y - X, FX | FY | SNAP_OVR, and bounds[b].
+- **Formal (edge_ts snapshot):**
+  - after an accepted trigger, snapshot == the edge_ts latched state;
+  - the snapshot is constant while S;
+  - SNAP_OVR is set iff a trigger arrives while S.
+- **Formal (verdict):** the two-sided rounding rule, sound for every n_lo / inexact.
+- **Lockstep:** RTL against the model generated from `isa.yaml`, on random programs.
+- **Firmware:**
+  - UART TX and RX;
+  - JUDGE on an external UART at in-spec and off-spec baud;
 
-## 8. Open questions for review
+  all on RTL and gate level.
+- **Physical:** harden at 6x4, close STA at 60 MHz, update the area ledger.
 
-1. **Engine count:** v0 has one engine. Two engines (generator plus referee) need a second
-   64x16 memory (~55k µm²). Decide at the 8 Nov gate from the v0 area.
-2. **Judge channels:** 4 (ui_in[4..7]) at ~37 flops each. Enough for I2C (2) and SPI
-   (CLK, MOSI, CS = 3). More channels would have to come from ui_in[0..2].
-3. **10BASE-T:** at 60 MHz a Manchester half-bit is 3 cycles. A firmware loop of SHO + WAITD +
-   LOOP is exactly 3 cycles, with zero slack and two transitions per bit, so it isn't practical.
-   It needs the hardware serializer from the PLAN (stretch).
-4. **WAITP on judge channels:** allowed (they are inputs 12..15), so the referee can sync on
-   the bus it watches. Is that wanted?
+## 9. Open questions (remaining)
+
+1. **Two engines:** shared edge_ts with one snapshot each, or one snapshot shared by
+   both? (Proposal: one edge_ts, one snapshot per engine.)
+2. **SNAP_OVR clearing:** only by the host (as specified), or also by firmware after it has
+   resynchronized? (Proposal: host only, so a lost trigger can't be hidden.)
+
+## 10. Assumption ledger
+
+Every assumption behind a timing or verdict claim, where it is used, and how it is handled.
+"Flagged" means the hardware detects the violation and the verdict becomes INDETERMINATE.
+
+| # | Assumption | Used by | Handling |
+| --- | --- | --- | --- |
+| A1 | Each level on a judged pin lasts ≥ 4 cycles | edge_ts / verdict proofs | **Assumed.** Some minimum is unavoidable: a pulse between two samples is invisible (`docs/results/glitch_counterexample.md`). `missed` warns at the limit. |
+| A2 | No judged pin changes in the first 6 cycles after reset | verdict proof | **Assumed**; harmless in practice: timestamps are stale (→ INDETERMINATE) until the first edge |
+| A3 | Zero skew between the channels' synchronizers | verdict proof | **Assumed**; real skew (tens of ps) adds to u |
+| A4 | No glitch filter on judge channels | u = 2 | Design fact; a filter's fixed delay must be added to u |
+| A5 | A metastable first flop resolves within one cycle | edge_ts proof | **Assumed** (standard 2-flop synchronizer argument) |
+| A6 | Intervals are shorter than a quarter of the timestamp range | verdict | **Flagged** (stale); no longer assumed |
+| A7 | For streaming at line rate, the host keeps IN non-empty at frame boundaries | firmware throughput | **Observable:** E (firmware) and IN_UNDERRUN (host); timing never depends on it (PULL never stalls) |
+| A8 | DL and TO stay within half the 16-bit range of NOW | waits | **Enforced** by the assembler (static bound 2^14); single timeouts are at most 16,368 cycles by encoding |
+| A9 | The chip runs at the clock the image was assembled for | bounds from ns, time literals | **Assumed**; the host library sets the demo-board clock from the image header |
+| A10 | Non-intrusive only when all channels select ui_in | the non-intrusive claim | **Reported** per verdict (NI bit) |
+| A11 | All timestamps of one verdict come from one instant | JUDGE | **Enforced** by the snapshot; a lost trigger is **flagged** (SNAP_OVR) |
+| A12 | Timing contracts restart at `mark` after an input- or host-paced wait | static timing | **By construction** (DL changes only at MARK/WAITD); stated in §3.4 |
+| A13 | The image in memory is the image the host meant | everything | **Enforced:** CRC check before RUN; readback |
