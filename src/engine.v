@@ -364,6 +364,7 @@ module engine (
   always @(posedge clk) begin
     if (!rst_n) begin
 `ifdef ENGINE_FORMAL_START_RUNNING
+      crc_exp_e <= 16'hFFFF;  // = crc_got_e: as after a passed check (formal only)
       // Formal reachability tasks only (formal/engine.sby `cover`, `tie_timeout`):
       // come out of reset in exactly the state a successful RUN leaves
       // (f_post_run below, which `prove` checks against the real RUN path),
@@ -374,7 +375,9 @@ module engine (
       st <= ST_HALTED;
 `endif
       chk_idx <= 7'd0;
+`ifndef ENGINE_FORMAL_START_RUNNING
       crc_exp_e <= 16'd0;
+`endif
       crc_got_g <= 16'hFFFF;
       crc_got_e <= 16'hFFFF;
       crc_fail <= 1'b0;
@@ -408,7 +411,9 @@ module engine (
       for (i = 0; i < 5; i = i + 1) shadow[i] <= 16'd0;
     end else begin
       // ---- host: expected CRC, run, halt ---------------------------------
-      if (h_crc_we) crc_exp_e <= h_crc;
+      // the expected CRC is part of what the RUN check verifies: written only
+      // while halted, so it can't change between RUN and the check's verdict
+      if (h_crc_we && halted) crc_exp_e <= h_crc;
       if (h_run && halted) begin
         st <= ST_CHECK;
         chk_idx <= 7'd0;
@@ -603,7 +608,7 @@ module engine (
   // The state a successful RUN leaves, in the cycle of the first issue
   // (docs/isa-timing.md 0b, diff 2): running at pc 0; X, Y, SR, RC, flags,
   // tags, trigger, sticky bits 0; DL = TO = NOW; no snapshot, epoch 0, no
-  // capture pending; every claimed pin owned in a driving
+  // capture pending; both CRCs matched; every claimed pin owned in a driving
   // mode. (LOST, stats, FIFO contents and pin values are kept from before the
   // RUN, so their reset values are one valid case of "before".)
   wire f_post_run = running && pc == 6'd0 && X == 16'd0 && Y == 16'd0 && SR == 16'd0 && RC == 8'd0 &&
@@ -612,9 +617,8 @@ module engine (
       {out_ovf, vf_ovf, in_underrun, pin_fault, crc_fail} == 5'd0 &&
       !S && !valid && epoch == 2'd0 && f_snap_stage == 2'd0 &&
       sn_rts == 64'd0 && sn_fts == 64'd0 &&
-      {sn_rstale, sn_fstale, sn_missed, sn_last, sn_ord_r, sn_ord_f} == 24'd0 && claims_ok;
-  // (Not in it: the CRC registers. They are host-readable only, never steer
-  //  execution, and the host may write a new expected CRC in the start cycle.)
+      {sn_rstale, sn_fstale, sn_missed, sn_last, sn_ord_r, sn_ord_f} == 24'd0 &&
+      crc_got_g == g_crc_exp && crc_got_e == crc_exp_e && claims_ok;
 
   wire f_wait = (op == OP_WAITD) || (op == OP_WAITP) || (op == OP_WAITS);
   wire f_halting_now = (issue && op == OP_HALT) || (h_halt && running);
@@ -676,6 +680,16 @@ module engine (
       if (f_widx >= 7'd64 && f_widx < 7'd96 && bnd[f_widx[4:0]] != $past(bnd[f_widx[4:0]]))
         assert ($past(h_we && halted && h_addr == f_widx));
       if (claims != $past(claims)) assert ($past(h_we && halted && h_addr == 7'd96));
+      if (crc_exp_e != $past(crc_exp_e)) assert ($past(h_crc_we && halted));
+      // -- 6b. from RUN until the engine runs or the check fails (and while it
+      //        runs), the image and the expected CRC are constant: the image
+      //        that runs is exactly the image whose CRC the check verified
+      if (!$past(halted)) begin
+        assert (prog[f_widx[5:0]] == $past(prog[f_widx[5:0]]));
+        assert (bnd[f_widx[4:0]] == $past(bnd[f_widx[4:0]]));
+        assert (claims == $past(claims));
+        assert (crc_exp_e == $past(crc_exp_e));
+      end
 
       // -- 7. no issue unless the RUN check passed: running is entered only
       //       from a check whose two CRCs and pin-claim check all passed

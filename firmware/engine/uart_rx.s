@@ -1,13 +1,14 @@
 ; UART receiver, 8N1, LSB first, on engine input 1 (uio_in[1]); every good byte
-; goes to the OUT FIFO for the host. 115200 baud at 60 MHz: BIT = 520.8 -> 521.
+; goes to the OUT FIFO for the host. 115200 baud: BIT = 347 cycles at 40 MHz, 521 at 60 MHz.
 ;
 ; Timing: the start bit's falling edge is seen by `waitp` 1 - 2 cycles after it
 ; happens (2-flop synchronizer); `mark` puts the schedule there, so each data
 ; bit is sampled about half a bit (HALF) + k * BIT later: near its middle, the
 ; error staying well under a quarter bit for the whole frame.
-.clock_hz 60e6
-.equ BIT 521
-.equ HALF 260
+; Clock-independent: assembled for the chip's clock (referee_host.py takes it from info.yaml;
+; refasm.py --clock-hz). Time literals and BIT are converted to cycles at that clock.
+.equ BIT 1s/115200
+.equ HALF 1s/115200/2
 
 idle:   tmon 1023, x16           ; 273 us without a start bit: just look again
         waitp 1, 0               ; start bit (line goes low)

@@ -1,7 +1,8 @@
 ; UART TX, 8N1, drift-free, with CTS flow control (docs/isa-timing.md section 5.1).
 ; Bytes come from the IN FIFO; TX is output pin 0 (uio[0]); CTS is input 8 (ui_in[0], active low).
-.clock_hz 60e6
-.equ BIT 521                 ; 115200 baud at 60 MHz (8.68 us; 0.03% slow)
+; Clock-independent: assembled for the chip's clock (referee_host.py takes it from info.yaml;
+; refasm.py --clock-hz). Time literals and BIT are converted to cycles at that clock.
+.equ BIT 1s/115200           ; 115200 baud: 347 cycles at 40 MHz, 521 at 60 MHz
 
 start:  pull                 ; non-blocking
         je   idle

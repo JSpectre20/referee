@@ -104,9 +104,10 @@ def test_claimed_pins_mask():
 
 def test_firmware_examples_assemble():
     for f in FW.glob("*.s"):
-        a = refasm.Assembler(None)
-        words = a.assemble(f.read_text())
-        assert 0 < len(words) <= 64, f.name
+        for clock in (40e6, 60e6):  # the firmware is clock-independent: both clocks must work
+            a = refasm.Assembler(clock)
+            words = a.assemble(f.read_text())
+            assert 0 < len(words) <= 64, (f.name, clock)
 
 
 def test_verdict_rule_is_sound_by_brute_force():

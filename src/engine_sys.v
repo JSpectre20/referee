@@ -103,8 +103,12 @@ module engine_sys (
   end
   reg [15:0] g_crc_exp;
   always @(posedge clk) begin
+`ifdef ENGINE_FORMAL_START_RUNNING
+    if (!rst_n) g_crc_exp <= 16'hFFFF;  // = crc_got_g: as after a passed check (formal only)
+`else
     if (!rst_n) g_crc_exp <= 16'd0;
-    else if (h_gcrc_we) g_crc_exp <= h_gcrc;
+`endif
+    else if (h_gcrc_we && halted) g_crc_exp <= h_gcrc;  // only while halted, like the image
   end
   assign h_grdata = glob[h_gaddr];
   wire [2:0] gw_addr;
@@ -244,6 +248,10 @@ module engine_sys (
       // the global config (pin owners and modes, channel mux) changes only by a
       // host write while the engine is halted
       if (glob[f_gidx] != $past(glob[f_gidx])) assert ($past(h_gwe && halted && h_gaddr == f_gidx));
+      if (g_crc_exp != $past(g_crc_exp)) assert ($past(h_gcrc_we && halted));
+      // from RUN until the engine runs or the check fails (and while it runs),
+      // the global config and its expected CRC are constant
+      if (!$past(halted)) assert (glob[f_gidx] == $past(glob[f_gidx]) && g_crc_exp == $past(g_crc_exp));
 
       // -- pads change only one cycle after a SET / SHO, and only for owned pins
       //    (checked over a stretch where the engine runs throughout; while it is

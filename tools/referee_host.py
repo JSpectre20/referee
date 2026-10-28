@@ -13,8 +13,8 @@ the command-line tool, so the two can't drift apart.
     python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
 
-The chip's UART starts at 115200 8N1 at the 60 MHz project clock (ui_in[3] RX,
-uo_out[4] TX); `--fast` switches both ends to 3 Mbaud first.
+The chip's UART starts at 115200 8N1 (ui_in[3] RX, uo_out[4] TX) at the project clock in
+info.yaml; `--fast` switches both ends to clock / 20 first (2 Mbaud at 40 MHz).
 """
 
 import argparse
@@ -25,9 +25,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import refasm  # noqa: E402
 
 ACK, NAK, ID = 0x06, 0x15, 0x52
-CLOCK_HZ = 60_000_000
+
+
+def _clock_hz():
+    """The project clock: info.yaml is the single source (the demo board sets the clock from it)."""
+    import re
+
+    text = (Path(__file__).resolve().parent.parent / "info.yaml").read_text()
+    return int(re.search(r"^\s*clock_hz:\s*(\d+)", text, re.M).group(1))
+
+
+CLOCK_HZ = _clock_hz()
 BAUD = 115200
-FAST_DIV = 20  # 3 Mbaud at 60 MHz
+POWER_UP_DIV = round(CLOCK_HZ / BAUD)  # the chip's power-up bit period (src/project.v CLKS_PER_BIT)
+FAST_DIV = 20  # clock / 20: 2 Mbaud at 40 MHz, 3 Mbaud at 60 MHz
 ENGINE_WORDS = refasm.IMAGE_WORDS  # 97
 GLOBAL_WORDS = refasm.GLOBAL_WORDS  # 8
 VERDICT = {0: "INDETERMINATE", 1: "PASS", 2: "VIOLATION", 3: "?"}
@@ -201,7 +212,7 @@ class Referee:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", required=True)
-    ap.add_argument("--fast", action="store_true", help="switch to 3 Mbaud first")
+    ap.add_argument("--fast", action="store_true", help="switch to clock / 20 baud first")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("id")
     sub.add_parser("status")

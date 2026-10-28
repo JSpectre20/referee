@@ -275,8 +275,8 @@ async def lockstep_firmware(dut):
     rng = random.Random(5)
     ls = Lockstep(dut, rng)
     await ls.reset()
-    a = refasm.Assembler(None)
-    words = a.assemble((ROOT / "firmware" / "engine" / "uart_tx.s").read_text().replace(".equ BIT 521", ".equ BIT 23"))
+    a = refasm.Assembler(60e6)  # cycle-level test: the spec's 60 MHz numbers
+    words = a.assemble((ROOT / "firmware" / "engine" / "uart_tx.s").read_text().replace(".equ BIT 1s/115200", ".equ BIT 23"))
     img = a.image(words)
     glob = refasm.global_image({0: (1, 1)})
     await ls.load(glob, img)
@@ -301,7 +301,7 @@ async def lockstep_i2c_setup_referee(dut):
     rng = random.Random(7)
     ls = Lockstep(dut, rng)
     await ls.reset()
-    a = refasm.Assembler(None)
+    a = refasm.Assembler(60e6)  # cycle-level test: the spec's 60 MHz numbers
     img = a.image(a.assemble((ROOT / "firmware" / "engine" / "i2c_setup_referee.s").read_text()))
     await ls.load(refasm.global_image(), img)
     await ls.tick(ops=[("run",)])
@@ -328,3 +328,35 @@ async def lockstep_i2c_setup_referee(dut):
     dut._log.info("i2c referee: %d PASS, %d VIOLATION, %d INDETERMINATE", n_pass, n_viol, n_indet)
     assert n_pass + n_viol + n_indet == 10
     assert n_pass >= 4 and n_viol >= 1 and n_indet >= 1
+
+
+@cocotb.test()
+async def no_writes_during_run_check(dut):
+    """A13: from RUN until the engine runs or the check fails, image, global config and
+    both expected-CRC writes are refused in hardware. Hammer all four write strobes with
+    corrupting values in every cycle of the 105-cycle check: the check must still pass on
+    the original image, and the image, config and expected CRCs must be unchanged
+    (RTL == model every cycle, and read back directly)."""
+    rng = random.Random(13)
+    ls = Lockstep(dut, rng)
+    await ls.reset()
+    a = refasm.Assembler(60e6)  # cycle-level test: the spec's 60 MHz numbers
+    img = a.image(a.assemble((ROOT / "firmware" / "engine" / "uart_tx.s").read_text().replace(".equ BIT 1s/115200", ".equ BIT 23")))
+    glob = refasm.global_image({0: (1, 1)})
+    await ls.load(glob, img)
+    await ls.tick(ops=[("run",)])
+    hits = 0
+    while ls.md.state == "check":
+        k = ls.cycle % 4
+        op = [("ew", rng.randrange(97), rng.randrange(1 << 16)), ("gw", rng.randrange(8), rng.randrange(1 << 16)),
+              ("gcrc", rng.randrange(1 << 16)), ("ecrc", rng.randrange(1 << 16))][k]
+        await ls.tick(ops=[op])
+        hits += 1
+    assert hits >= 100, f"only {hits} check cycles hit"
+    assert ls.md.state == "running", "the check must pass on the original image"
+    e, s = dut.u_sys.u_eng, dut.u_sys
+    assert [int(e.prog[i].value) for i in range(64)] == img[:64]
+    assert [int(e.bnd[i].value) for i in range(32)] == img[64:96]
+    assert int(e.claims.value) == img[96]
+    assert [int(s.glob[i].value) for i in range(8)] == glob
+    assert int(e.crc_exp_e.value) == refasm.crc16(img) and int(s.g_crc_exp.value) == refasm.crc16(glob)

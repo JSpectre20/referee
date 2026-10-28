@@ -14,7 +14,7 @@
  *
  * Pins
  *   ui_in[3]       UART RX from the host, 115200 8N1 at power-up (Tiny Tapeout
- *                  UART pinout); the host can switch to up to 3 Mbaud ('B')
+ *                  UART pinout); the host can switch to clock/20 = 2 Mbaud at 40 MHz ('B')
  *   uo_out[4]      UART TX to the host (never an engine output)
  *   ui_in[4..7]    judge channels 0..3 (default mux): input-only pads, so judging
  *                  them can't disturb the bus (non-intrusive, NI)
@@ -27,7 +27,9 @@
 `default_nettype none
 
 module tt_um_shreyansh_referee #(
-    parameter integer CLKS_PER_BIT = 521  // power-up baud: 115200 at the 60 MHz project clock
+    // Power-up baud 115200 at the project clock in info.yaml (40 MHz: 347.2 -> 347).
+    // Must equal round(clock_hz / 115200): test/test.py checks it against info.yaml.
+    parameter integer CLKS_PER_BIT = 347
 ) (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs

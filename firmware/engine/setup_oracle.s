@@ -3,9 +3,10 @@
 ; (ui_in[4], "data") latest edge to it, against a minimum and a maximum bound,
 ; and stream every verdict with its exact m (push all + raw), so the test can
 ; check each one against the true interval it computed from its own stimulus.
-.clock_hz 60e6
-.bound 0, min, 400ns             ; 24 cycles, exact
-.bound 1, max, 700ns             ; 42 cycles, exact
+; Clock-independent: assembled for the chip's clock (referee_host.py takes it from info.yaml;
+; refasm.py --clock-hz). Time literals and BIT are converted to cycles at that clock.
+.bound 0, min, 400ns             ; 16 cycles at 40 MHz, 24 at 60 (exact)
+.bound 1, max, 700ns             ; 28 cycles at 40 MHz, 42 at 60 (exact)
 
         trig 1, rise
 loop:   tmon 1023, x16

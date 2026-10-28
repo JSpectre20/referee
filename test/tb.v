@@ -1,12 +1,12 @@
 `default_nettype none
-`timescale 1ns / 1fs
+`timescale 1ns / 1ps
 
 /* Chip-level testbench, used for both RTL and gate-level simulation.
 
-   - The 60 MHz clock is generated here rather than from cocotb: with Icarus a
+   - The clock is generated here rather than from cocotb: with Icarus a
      cocotb-driven clock is many times slower, and these tests run real UART
-     traffic. Half period 8.333333 ns (fs precision), so the chip runs at the
-     clock its images are assembled for (ledger A9) to within 1e-7.
+     traffic. It must be the clock in info.yaml (40 MHz until CP6): images are
+     assembled for that clock (ledger A9), and test/test.py checks the period.
    - `host_rx` drives ui_in[3] (the chip's UART RX); `host_tx` is uo_out[4]
      (the chip's UART TX). The other ui_in bits come from `ui_in_pins`
      (ui_in[4..7] are the judge channels).
@@ -23,7 +23,7 @@ module tb ();
   end
 
   reg clk = 1'b0;
-  always #8.333333 clk = ~clk;
+  always #12.5 clk = ~clk;  // 40 MHz
 
   reg rst_n;
   reg ena;

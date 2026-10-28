@@ -49,8 +49,8 @@
  *     completes while a reply is still going out is dropped and sets
  *     `overrun` ('Q' e 1 reads and clears it).
  *   - Resync: a packet that is not complete within TIMEOUT cycles of its
- *     previous byte is thrown away (a host that lost count pauses ~2.2 ms at
- *     60 MHz). A UART framing error also throws the partial packet away.
+ *     previous byte is thrown away (a host that lost count pauses ~3.3 ms at
+ *     40 MHz). A UART framing error also throws the partial packet away.
  *   - Image and config writes are also refused inside engine_sys / engine
  *     unless halted (hardware write gates); the NAK here just tells the host.
  *   - Every strobe to engine_sys is a one-cycle pulse in the cycle the 4th
@@ -63,8 +63,8 @@
 `default_nettype none
 
 module host_port #(
-    parameter integer TIMEOUT_W = 17,   // resync after 2**17 cycles = 2.2 ms at 60 MHz
-    parameter integer DIV_RESET = 521   // power-up bit period: 115200 baud at 60 MHz
+    parameter integer TIMEOUT_W = 17,   // resync after 2**17 cycles = 3.3 ms at 40 MHz
+    parameter integer DIV_RESET = 347   // power-up bit period: 115200 baud at 40 MHz (set by the top)
 ) (
     input  wire        clk,
     input  wire        rst_n,

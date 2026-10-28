@@ -114,6 +114,7 @@ class Model:
         self.sync1 = [0] * 12
         self.sync2 = [0] * 12
         self.state = "halted"  # halted | check | running
+        self._state0 = "halted"  # the state at the start of the last step (gates host writes)
         self.check_idx = 0
         self.crc_fail = 0
         self.fifo_in, self.fifo_out, self.fifo_v = [], [], []
@@ -162,20 +163,25 @@ class Model:
 
     # -- host operations (between cycles) ---------------------------------
 
+    # Host writes are gated by the run state at the START of the cycle they
+    # arrive in (as the RTL's `halted`), so none lands during a RUN check.
     def write_global(self, addr, word):
-        if self.state != "halted":
+        if self._state0 != "halted":
             return False
         self.glob[addr] = word & M16
         return True
 
     def write_engine(self, addr, word):
-        if self.state != "halted":
+        if self._state0 != "halted":
             return False
         self.img[addr] = word & M16
         return True
 
     def set_crc(self, sel, value):
+        if self._state0 != "halted":
+            return False
         self.crc_exp[sel] = value & M16
+        return True
 
     def run(self):
         if self.state != "halted":
@@ -263,6 +269,7 @@ class Model:
     # -- one clock cycle ----------------------------------------------------
 
     def step(self, ui_in, uio_in):
+        self._state0 = self.state
         now = self.now
         ed = self.edge
         pulses = ed.pulses()

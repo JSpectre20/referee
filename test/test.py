@@ -5,9 +5,13 @@
 These tests touch only the chip's pins, so the same file runs on the RTL and
 on the gate-level netlist (make GATES=yes). The host's UART is cocotbext-uart,
 an independent model; the packets come from tools/referee_host.py, the same
-code that talks to real hardware. Each test starts at 115200 baud (the
-power-up rate) and switches the link to 3 Mbaud with the 'B' command, so
-loading a 105-word image takes ~2 ms of simulated time instead of ~60 ms.
+code that talks to real hardware. The clock is the one in info.yaml (40 MHz
+until CP6; `power_up_baud_matches_clock` checks the testbench and the chip
+agree with it). Every test's first packet, at the 115200 power-up rate, is the
+'B' command that switches the link to clock / 20 (2 Mbaud at 40 MHz), so
+loading a 105-word image takes ~3 ms of simulated time instead of ~90 ms and
+gl_test stays fast. `reset_state`, `power_up_baud_matches_clock`,
+`identify_and_fast_baud` and `resync_after_partial_packet` stay at 115200.
 
 The referee test is an INDEPENDENT ORACLE: cocotb drives the judged edges at
 known times in ns and computes each true interval from its own stimulus,
@@ -18,13 +22,14 @@ cycle the verdict must be the decisive one.
 """
 
 import logging
+import math
 import os
 import random
 import sys
 from pathlib import Path
 
 import cocotb
-from cocotb.triggers import ClockCycles, Timer
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, Timer
 from cocotb.utils import get_sim_time
 from cocotbext.uart import UartSink, UartSource
 
@@ -33,10 +38,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 import referee_host as host  # noqa: E402
 
 CLOCK_HZ = host.CLOCK_HZ
-P_NS = 1e9 / CLOCK_HZ  # one chip cycle, 16.667 ns
+P_NS = 1e9 / CLOCK_HZ  # one chip cycle (25 ns at 40 MHz)
 U = 2  # the verdict rule's uncertainty, cycles
 BAUD = host.BAUD
-FAST_BAUD = CLOCK_HZ // host.FAST_DIV  # 3 Mbaud
+FAST_BAUD = CLOCK_HZ // host.FAST_DIV  # 2 Mbaud at 40 MHz
 GL = os.environ.get("REFEREE_GL") == "1"  # gate-level: fewer events, skip timing-only tests
 FW = ROOT / "firmware" / "engine"
 
@@ -85,7 +90,7 @@ class Host:
         return data
 
     async def fast(self):
-        """Switch both ends to 3 Mbaud (the chip switches once its reply is out)."""
+        """Switch both ends to clock / 20 baud (the chip switches once its reply is out)."""
         await self.must(host.pkt_baud(host.FAST_DIV))
         # The sink hands over a byte before its stop bit has ended; the chip
         # switches only when that stop bit is out. Wait a couple of old bit times.
@@ -151,8 +156,31 @@ async def reset_state(dut):
 
 
 @cocotb.test()
+async def power_up_baud_matches_clock(dut):
+    """info.yaml's clock_hz, the testbench clock and the chip's power-up UART divisor agree:
+    the chip answers at 115200 only if its divisor is round(clock_hz / 115200) for the clock
+    the demo board will actually set (from info.yaml)."""
+    h = await start(dut, fast=False)
+    await RisingEdge(dut.clk)
+    t1 = get_sim_time("ps")
+    await RisingEdge(dut.clk)
+    period_ps = get_sim_time("ps") - t1
+    assert period_ps == round(1e12 / CLOCK_HZ), f"testbench clock {period_ps} ps, info.yaml says {CLOCK_HZ} Hz"
+    # The reply to identify starts 06 = start bit, then bits 0, 1, 1, ...: the start bit's
+    # falling edge to the next rising edge is exactly 2 bit periods.
+    await h.src.write(host.pkt_id())
+    await FallingEdge(dut.host_tx)
+    t_fall = get_sim_time("ps")
+    await RisingEdge(dut.host_tx)
+    div = (get_sim_time("ps") - t_fall) / period_ps / 2
+    assert div == host.POWER_UP_DIV == round(CLOCK_HZ / BAUD), (
+        f"power-up divisor {div} cycles/bit; info.yaml clock {CLOCK_HZ} Hz needs {round(CLOCK_HZ / BAUD)}")
+    assert (await h._read(2)) == bytes([host.ACK, host.ID])
+
+
+@cocotb.test()
 async def identify_and_fast_baud(dut):
-    """Identify at 115200, switch to 3 Mbaud, identify again; nothing dropped."""
+    """Identify at 115200, switch to clock / 20 baud, identify again; nothing dropped."""
     h = await start(dut, fast=False)
     assert await h.must(host.pkt_id()) == host.ID
     await h.fast()
@@ -196,6 +224,33 @@ async def load_readback_and_run_check(dut):
     for sel, words in ((0, glob), (1, img)):
         crc = await h.word16(host.pkt_read(sel, 0x80, 0), host.pkt_read(sel, 0x80, 1))
         assert crc == host.refasm.crc16(words), f"computed CRC sel {sel}: {crc:#06x}"
+
+
+@cocotb.test()
+async def no_image_writes_around_run(dut):
+    """A13 at chip level: a RUN followed back to back by image and expected-CRC writes.
+    A packet takes far longer than the 105-cycle check, so it can't land inside it (the
+    cycle-exact case is proved in formal/engine.sby and hammered in the engine lockstep);
+    here every such write is refused (dropped while the RUN reply is pending, or NAK'd
+    because the engine runs), and after a halt the image and CRCs are unchanged."""
+    h = await start(dut)
+    glob, img, _ = host.build((FW / "uart_tx.s").read_text(), {0: (1, 1)})
+    await h.load(glob, img)
+    writes = [host.pkt_write_engine(0, 0xFFFF), host.pkt_crc(1, 0x1234), host.pkt_write_global(2, 0), host.pkt_crc(0, 0x4321)]
+    await h.src.write(host.pkt_run(True) + b"".join(writes))  # no gap: RUN, then the writes
+    await h.src.wait()
+    await Timer(50, unit="us")
+    replies = bytes(h.sink.read_nowait(h.sink.count()))
+    assert replies[:2] == bytes([host.ACK, 1]), f"RUN must pass on the original image: {replies.hex()}"
+    for i in range(2, len(replies), 2):
+        assert replies[i] == host.NAK, f"a write while not halted was accepted: {replies.hex()}"
+    await h.must(host.pkt_run(False))
+    for sel, addr, word in [(1, 0, img[0]), (0, 2, glob[2])]:
+        assert await h.word16(host.pkt_read(sel, addr, 0), host.pkt_read(sel, addr, 1)) == word
+    for sel, words in ((0, glob), (1, img)):
+        crc = await h.word16(host.pkt_read(sel, 0x80, 0), host.pkt_read(sel, 0x80, 1))
+        assert crc == host.refasm.crc16(words)
+    assert await h.run(), "the expected CRCs are still the original ones"
 
 
 @cocotb.test()
@@ -273,10 +328,31 @@ async def referee_oracle(dut):
     # Interval plan: decisive for both bounds, near each bound, and near-coincident
     # data edges just before or just AFTER the clock rise (order-ambiguous: ORD).
     plan = [150, 600, 900, 250, 650, 1000, 120, 395, 405, 690, 715, 20, -10, -25, 8]
+    # Late-resolving samples (see `edge` below): the worst case of the measurement, an
+    # error just above one cycle, aimed right at each bound. u = 2 must stay sound here;
+    # u = 1 must not (it is caught by these events).
+    plan[3:3] = [("meta", "over", 0), ("meta", "over", 1), ("meta", "under", 0), ("meta", "under", 1)]
     n_events = 12 if GL else 40
     while len(plan) < n_events:
         plan.append(rng.choice([rng.uniform(60, 1200), rng.uniform(330, 470), rng.uniform(630, 770), rng.uniform(-40, 40)]))
     plan = plan[:n_events]
+
+    # Sampling model. The chip's input flops sample at every rising clock edge. An input
+    # that changes inside a flop's setup window may be captured as the OLD level (the
+    # sample resolves late): the chip then sees the change one cycle later. The test
+    # models this for chosen edges: the TRUE time (used for the truth) stays t, but the
+    # pin changes just after the clock edge that follows t. APERTURE is the window.
+    APERTURE = 1.0  # ns, < P_NS / 4
+
+    def next_clock_edge(t):  # first rising edge at or after t (rising edges at P/2 + kP)
+        return P_NS / 2 + math.ceil((t - P_NS / 2) / P_NS - 1e-9) * P_NS
+
+    async def edge(t_true, late=False):
+        if late:
+            assert 0 < next_clock_edge(t_true) - t_true <= APERTURE
+            await at(next_clock_edge(t_true) + 0.5)
+        else:
+            await at(t_true)
 
     # One data edge first, so the first judgment has a fresh reference.
     t = get_sim_time("ns") + 500
@@ -286,15 +362,29 @@ async def referee_oracle(dut):
     last_sda_t = t
 
     results = []
-    for k, T_plan in enumerate(plan):
-        t_clk = get_sim_time("ns") + 1500 + rng.uniform(0, P_NS)  # any phase within a cycle
-        if T_plan >= 0:
+    max_err = 0.0  # largest measurement error seen on an unflagged verdict, in ns
+    for k, ev in enumerate(plan):
+        sda_late = scl_late = False
+        if isinstance(ev, tuple):  # ("meta", over|under, bound slot)
+            _, how, b = ev
+            n = round(bounds[b][1] / P_NS)  # the bound in cycles (exact here)
+            ea = next_clock_edge(get_sim_time("ns") + 1500)
+            eb = ea + n * P_NS
+            if how == "over":  # data sampled at once, clock sampled a cycle late: m = n + 1, T just below n
+                t_sda, t_clk, scl_late = ea - 0.2, eb - 0.9, True
+            else:  # data sampled a cycle late, clock at once: m = n - 1, T just above n
+                t_sda, t_clk, sda_late = ea - 0.9, eb - 0.2, True
+            T_plan = t_clk - t_sda
+        else:
+            T_plan = ev
+            t_clk = get_sim_time("ns") + 1500 + rng.uniform(0, P_NS)  # any phase within a cycle
             t_sda = t_clk - T_plan
-            await at(t_sda)
+        if T_plan >= 0:
+            await edge(t_sda, sda_late)
             sda ^= 1
             pins()
             last_sda_t = t_sda
-            await at(t_clk)
+            await edge(t_clk, scl_late)
             scl = 1
             pins()
             after = None
@@ -338,6 +428,7 @@ async def referee_oracle(dut):
             flagged = hd["FX"] or hd["FY"] or hd["ORD"] or hd["TAG"]
             if not flagged:
                 assert abs(m * P_NS - T) < U * P_NS, "measurement error >= 2 cycles: " + where
+                max_err = max(max_err, abs(m * P_NS - T))
             # completeness: a margin above u + 1 cycle must be decided
             if not near and k > 0:
                 margin = (T - N) if kind == "min" else (N - T)  # > 0: meets the bound
@@ -347,7 +438,8 @@ async def referee_oracle(dut):
                 elif margin < -(U + 1) * P_NS:
                     assert v == "VIOLATION", "expected VIOLATION: " + where
                     decisive_expected[(b, "VIOLATION")] += 1
-    dut._log.info("oracle: %d events; verdicts %s", len(results), seen)
+    dut._log.info("oracle: %d events; verdicts %s; largest error %.2f cycles", len(results), seen, max_err / P_NS)
+    assert max_err > P_NS, "the late-sample events must produce an error above one cycle (else u = 1 looks sound)"
     for key, n in decisive_expected.items():
         assert n > 0, f"no clear-margin case produced {key}: the plan must cover it"
     for b in bounds:
@@ -372,7 +464,7 @@ async def resync_after_partial_packet(dut):
     h = await start(dut, fast=False)
     await h.src.write(bytes([0x49, 0x00]))
     await h.src.wait()
-    await Timer(2.5, unit="ms")  # > 2**17 cycles at 60 MHz
+    await Timer(round(1.1 * 2**17 / CLOCK_HZ * 1e6), unit="us")  # > 2**17 cycles
     assert h.sink.empty(), "a partial packet must not get a reply"
     assert await h.must(host.pkt_id()) == host.ID
     assert await h.must(host.pkt_status(port=True)) == 0x00, "no overrun"

@@ -1,6 +1,7 @@
 ; Referee: I2C data setup time (tSU;DAT) on every SCL rise (docs/isa-timing.md section 5.3).
 ; Channels: 0 = SDA (ui_in[4]), 1 = SCL (ui_in[5]); non-intrusive.
-.clock_hz 60e6
+; Clock-independent: assembled for the chip's clock (referee_host.py takes it from info.yaml;
+; refasm.py --clock-hz). Time literals and BIT are converted to cycles at that clock.
 .bound 0, min, 100ns         ; Fast-mode tSU;DAT
 
         trig 1, rise         ; snapshot on every SCL rise
