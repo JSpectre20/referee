@@ -5,47 +5,77 @@ This file is used to generate your project datasheet.
 ## How it works
 
 Referee is a programmable protocol emulator and bus referee, built for the Jane Street
-protocol emulator ASIC competition. Protocols are programs, not fixed logic.
+protocol emulator ASIC competition. Protocols are programs, not fixed logic, and the chip
+can also *judge* timing on a bus it is not part of, with verdicts that are proved sound.
 
-This build contains the first pieces:
+This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
 
-- **seq**, a four-instruction pin sequencer (`set`, `wait`, `shout`, `jump`) with a
-  32-word program memory. Every instruction takes exactly one cycle, `wait n` takes exactly
-  n cycles, and a `set` or `shout` is visible on its pin the next cycle. A UART transmitter, for
-  example, is a 21-word program (`firmware/seq/uart_tx.s`).
-- **A UART host port** (115200 baud, 8N1, at the 40 MHz project clock) on the standard
-  Tiny Tapeout UART pins. The host loads programs, sets the sequencer's shift register,
-  enables output pins and starts or halts the sequencer with 4-byte commands. Each command
-  gets a 2-byte reply: ACK (0x06) or NAK (0x15), then a data byte.
+- **A 24-instruction timing engine** with a 64-word program memory. Every instruction takes
+  exactly one cycle, except the three waits. A `set` or `sho` changes its pin exactly one
+  cycle later. Two deadline registers keep schedules drift-free: DL for the schedule
+  (`mark`, `waitd`) and TO for timeouts (`tmo`, `tmon`). A UART transmitter or receiver is
+  about 15 words of firmware (`firmware/engine/`).
+- **An edge-timestamp unit** on four judge channels (default `ui_in[4..7]`, input-only pads, so
+  judging them cannot disturb the bus). A **snapshot** freezes every channel's timestamps
+  at one instant. The trigger edge sets that instant, and edges too close to it to order are
+  flagged (ORD).
+- **A three-valued verdict block**: `judge` compares a measured interval with a bound written
+  in ns and answers PASS, VIOLATION or INDETERMINATE. The rule is proved sound by formal
+  proofs (`formal/verdict.sby`): a PASS means the true interval met the bound, and a
+  VIOLATION means it broke it. **Stats** count verdicts per bound, and a FIFO streams them
+  (all, or only the non-PASS ones) to the host.
+- **Pin ownership**: a global config gives each output pin an owner and a mode (push-pull or
+  open-drain). Each image carries a CRC, and RUN refuses an image that fails its CRC or
+  claims a pin it doesn't own.
+- **A UART host port** on the standard Tiny Tapeout UART pins: 115200 8N1 at power-up, and up
+  to 3 Mbaud on command. Commands are 4 bytes. Each reply is ACK (0x06) or NAK (0x15), then a
+  data byte; the verdict drain sends more.
 
 | Command | Bytes | Effect |
 | --- | --- | --- |
 | Identify | `49 00 00 00` | reply `06 52` |
-| Write program word | `57 addr hi lo` | only while halted; addr 0..31 |
-| Set shift register | `53 byte 00 00` | only while halted |
-| Run / halt | `52 01 00 00` / `52 00 00 00` | halting puts pc back to 0 |
-| Output enable | `4F mask 00 00` | bit n = 1 makes uio[n] an output |
-| Status | `51 00 00 00` | data = {running, overrun, 0, pc[4:0]} |
+| Write global word | `47 addr hi lo` | addr 0..7; only while halted |
+| Write engine word | `57 addr hi lo` | addr 0..96 (program 0..63, bounds 64..95, claimed pins 96); only while halted |
+| Read word | `72 sel addr part` | sel 0 global / 1 engine; addr `80` = computed CRC; part 0 low / 1 high byte |
+| Expected CRC | `43 sel hi lo` | sel 0 global / 1 engine |
+| Run / halt | `52 00 01 00` / `52 00 00 00` | RUN answers after the 105-cycle image check: ACK only if it passed |
+| IN push / OUT pop | `50 00 byte 00` / `70 00 00 00` | byte FIFOs between host and firmware |
+| Verdict drain | `44 00 max 00` | reply `06 n`, then n 16-bit slots, high byte first |
+| Stats latch / read / clear | `53 00 slot 00` / `73 00 idx part` / `5A 00 slot 00` | per bound slot 0..3: PASS, VIOLATION, INDETERMINATE counts, min and max m |
+| Lost triggers | `4C 00 op 00` | op 1 also clears |
+| Baud | `42 hi lo 00` | UART bit period in clock cycles (20 = 3 Mbaud at 60 MHz), after the reply |
+| Status | `51 00 sel 00` | sel 0: {running, S, CRC_FAIL, PIN_FAULT, IN_UNDERRUN, VERDICT_OVF, OUT_OVF, NI}, read-and-clear |
 
-The sequencer's pins drive `uio[7:0]`; all uio pins are inputs until the host enables them.
-`uo_out[0]` is high while the sequencer runs.
+Pins: `uio[0..7]` are engine pins 0..7 (input, push-pull or open-drain). `uo_out[0..3]` and
+`uo_out[5..7]` are engine pins 8..14 (push-pull). `uo_out[4]` is the host UART TX, which the
+engine can never drive. Nothing is driven until the global config gives the engine a pin and
+a RUN check has passed.
 
 ## How to test
 
-Set the project clock to 40 MHz and connect a 115200-baud serial port (3.3 V) to
-`ui_in[3]` (chip RX) and `uo_out[4]` (chip TX); the demo board's microcontroller can act as
-the host. Then, from a PC:
+Set the project clock to 60 MHz. Connect a 3.3 V serial port at 115200 baud to `ui_in[3]`
+(chip RX) and `uo_out[4]` (chip TX); the demo board's microcontroller can act as the host.
+Then, from a PC:
 
 ```bash
 python3 tools/referee_host.py --port /dev/ttyUSB0 id
-python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/seq/uart_tx.s --sr 0x41 --oe 0x01 --run
+python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/uart_tx.s --pin 0:pp --run
 ```
 
-The second command loads the UART-transmitter program, puts `0x41` ('A') in the shift
-register, makes `uio[0]` an output and starts the sequencer: `uio[0]` sends one 'A' at
-115200 baud. Halt, set a new byte and run again to send another.
+The second command assembles the UART transmitter, gives the engine `uio[0]` (push-pull),
+loads both images with their CRCs and runs it. Bytes pushed into IN (`50 00 byte 00`) come
+out of `uio[0]` at 115200 baud while `ui_in[0]` (CTS) is low.
+
+To referee a bus, load `firmware/engine/setup_oracle.s` (or `i2c_setup_referee.s`) and feed
+the data and clock lines to `ui_in[4]` and `ui_in[5]`. Then read the verdicts:
+
+```bash
+python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/i2c_setup_referee.s --run
+python3 tools/referee_host.py --port /dev/ttyUSB0 drain
+python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
+```
 
 ## External hardware
 
-A 3.3 V USB-serial adapter (or the demo board's RP2350 as host) for the command port;
-optionally a second one on `uio[0]` to watch what the program sends.
+A 3.3 V USB-serial adapter (or the demo board's RP2350 as host) for the command port.
+To referee a bus, wire its lines to `ui_in[4..7]`, for example an I2C bus's SDA and SCL.

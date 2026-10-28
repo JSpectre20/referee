@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Host side of Referee's UART command port (src/host_port.v).
+"""Host side of Referee's UART command port v2 (src/host_port.v, docs/isa-timing.md section 7).
 
-Packets are 4 bytes, CMD A B C; every packet gets a 2-byte reply, STATUS DATA.
-The packet builders here are shared by the cocotb tests (test/test.py) and
+Packets are 4 bytes, CMD A B C; every reply starts STATUS DATA (ACK 0x06 / NAK 0x15).
+The packet builders here are shared by the cocotb chip tests (test/test.py) and
 the command-line tool, so the two can't drift apart.
 
     python3 tools/referee_host.py --port /dev/ttyUSB0 id
-    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/seq/uart_tx.s --sr 0x41 --oe 0x01 --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/uart_tx.s --pin 0:pp --run
     python3 tools/referee_host.py --port /dev/ttyUSB0 status
+    python3 tools/referee_host.py --port /dev/ttyUSB0 drain
+    python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
 
-The chip's UART is 115200 8N1 at the 40 MHz project clock (ui_in[3] RX,
-uo_out[4] TX).
+The chip's UART starts at 115200 8N1 at the 60 MHz project clock (ui_in[3] RX,
+uo_out[4] TX); `--fast` switches both ends to 3 Mbaud first.
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import refasm  # noqa: E402
+
 ACK, NAK, ID = 0x06, 0x15, 0x52
+CLOCK_HZ = 60_000_000
 BAUD = 115200
-PROG_WORDS = 32
+FAST_DIV = 20  # 3 Mbaud at 60 MHz
+ENGINE_WORDS = refasm.IMAGE_WORDS  # 97
+GLOBAL_WORDS = refasm.GLOBAL_WORDS  # 8
+VERDICT = {0: "INDETERMINATE", 1: "PASS", 2: "VIOLATION", 3: "?"}
 
 
 class HostError(Exception):
@@ -29,53 +38,131 @@ class HostError(Exception):
 
 
 # ----------------------------------------------------------------------------
-# Packets
+# Packets (one builder per command of src/host_port.v)
 # ----------------------------------------------------------------------------
 
 
+def _p(*b):
+    return bytes(x & 0xFF for x in (list(b) + [0, 0, 0, 0])[:4])
+
+
 def pkt_id():
-    return bytes([0x49, 0, 0, 0])
+    return _p(0x49)
 
 
-def pkt_write(addr, word):
-    return bytes([0x57, addr & 0xFF, (word >> 8) & 0xFF, word & 0xFF])
+def pkt_write_global(addr, word):
+    return _p(0x47, addr, word >> 8, word)
 
 
-def pkt_sr(byte):
-    return bytes([0x53, byte & 0xFF, 0, 0])
+def pkt_write_engine(addr, word, e=0):
+    return _p(0x57, (e << 7) | addr, word >> 8, word)
 
 
-def pkt_run(on):
-    return bytes([0x52, 1 if on else 0, 0, 0])
+def pkt_read(sel, addr, part):
+    """sel 0 global / 1 engine 0; addr 0x80 = computed CRC; part 0 low / 1 high byte."""
+    return _p(0x72, sel, addr, part)
 
 
-def pkt_oe(mask):
-    return bytes([0x4F, mask & 0xFF, 0, 0])
+def pkt_crc(sel, crc):
+    return _p(0x43, sel, crc >> 8, crc)
 
 
-def pkt_status():
-    return bytes([0x51, 0, 0, 0])
+def pkt_run(on, e=0):
+    return _p(0x52, e, 1 if on else 0)
+
+
+def pkt_push(byte, e=0):
+    return _p(0x50, e, byte)
+
+
+def pkt_pop(e=0):
+    return _p(0x70, e)
+
+
+def pkt_drain(maxn=8, e=0):
+    return _p(0x44, e, maxn)
+
+
+def pkt_stats_latch(slot, e=0):
+    return _p(0x53, e, slot)
+
+
+def pkt_stats_read(idx, part, e=0):
+    return _p(0x73, e, idx, part)
+
+
+def pkt_stats_clear(slot, e=0):
+    return _p(0x5A, e, slot)
+
+
+def pkt_lost(clear=False, e=0):
+    return _p(0x4C, e, 1 if clear else 0)
+
+
+def pkt_baud(div):
+    return _p(0x42, div >> 8, div)
+
+
+def pkt_status(port=False, e=0):
+    return _p(0x51, e, 1 if port else 0)
 
 
 def decode_status(data):
-    """DATA byte of a 'Q' reply -> dict."""
-    return {"running": bool(data & 0x80), "overrun": bool(data & 0x40), "pc": data & 0x1F}
+    """DATA of 'Q' e 0 -> dict (reading it cleared the sticky bits)."""
+    names = ["running", "S", "crc_fail", "pin_fault", "in_underrun", "verdict_ovf", "out_ovf", "ni"]
+    return {n: bool(data >> (7 - i) & 1) for i, n in enumerate(names)}
 
 
-def load_packets(words, sr=None, oe=None, run=False):
-    """Packets that halt, load a program (padded with `jump 0`), and optionally start it."""
-    if len(words) > PROG_WORDS:
-        raise HostError(f"program has {len(words)} words; seq holds {PROG_WORDS}")
-    jump0 = 0xC000
-    padded = list(words) + [jump0] * (PROG_WORDS - len(words))
-    pkts = [pkt_run(False)] + [pkt_write(a, w) for a, w in enumerate(padded)]
-    if sr is not None:
-        pkts.append(pkt_sr(sr))
-    if oe is not None:
-        pkts.append(pkt_oe(oe))
-    if run:
-        pkts.append(pkt_run(True))
+def decode_verdict(hdr):
+    """A VERDICT header slot -> dict (src/engine.v `vhdr`)."""
+    msat = hdr & 7
+    return {
+        "verdict": VERDICT[hdr >> 14], "FX": hdr >> 13 & 1, "FY": hdr >> 12 & 1, "TAG": hdr >> 11 & 1,
+        "L": hdr >> 10 & 1, "NI": hdr >> 9 & 1, "raw": hdr >> 8 & 1, "b": hdr >> 4 & 0xF,
+        "ORD": hdr >> 3 & 1, "m3": msat - 8 if msat & 4 else msat,
+    }
+
+
+def split_verdicts(slots):
+    """Drained 16-bit slots -> list of (header dict, raw m or None), pairing raw slots."""
+    out, i = [], 0
+    while i < len(slots):
+        h = decode_verdict(slots[i])
+        m = None
+        if h["raw"] and i + 1 < len(slots):
+            m = slots[i + 1] - 0x10000 if slots[i + 1] & 0x8000 else slots[i + 1]
+            i += 1
+        out.append((h, m))
+        i += 1
+    return out
+
+
+def pin_config(spec):
+    """'0:pp,1:od' -> {pin: (owner 1 = engine 0, mode 1 push-pull / 2 open-drain)}."""
+    modes = {"pp": 1, "od": 2}
+    pins = {}
+    for item in filter(None, (spec or "").split(",")):
+        p, m = item.split(":")
+        pins[int(p)] = (1, modes[m])
+    return pins
+
+
+def load_packets(glob, img):
+    """Halt, write the global config and the engine image, and both expected CRCs."""
+    if len(glob) != GLOBAL_WORDS or len(img) != ENGINE_WORDS:
+        raise HostError(f"image sizes {len(glob)}/{len(img)}, expected {GLOBAL_WORDS}/{ENGINE_WORDS}")
+    pkts = [pkt_run(False)]
+    pkts += [pkt_write_global(a, w) for a, w in enumerate(glob)]
+    pkts += [pkt_write_engine(a, w) for a, w in enumerate(img)]
+    pkts += [pkt_crc(0, refasm.crc16(glob)), pkt_crc(1, refasm.crc16(img))]
     return pkts
+
+
+def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ):
+    """Assemble firmware -> (global image, engine image, notes)."""
+    a = refasm.Assembler(clock_hz)
+    words = a.assemble(source_text)
+    return refasm.global_image(pins or {}, mux), a.image(words), a.notes
 
 
 # ----------------------------------------------------------------------------
@@ -90,58 +177,73 @@ class Referee:
         self.ser = serial.Serial(port, baud, timeout=timeout)
         self.ser.reset_input_buffer()
 
-    def transact(self, pkt):
+    def transact(self, pkt, extra=0):
         self.ser.write(pkt)
         reply = self.ser.read(2)
-        if len(reply) != 2:
-            raise HostError(f"no reply to {pkt.hex()} (got {reply.hex() or 'nothing'})")
-        status, data = reply
-        if status not in (ACK, NAK):
-            raise HostError(f"bad reply {reply.hex()} to {pkt.hex()}")
-        return status == ACK, data
+        if len(reply) != 2 or reply[0] not in (ACK, NAK):
+            raise HostError(f"bad reply {reply.hex() or 'nothing'} to {pkt.hex()}")
+        rest = b""
+        if reply[0] == ACK and pkt[0] == 0x44:
+            rest = self.ser.read(2 * reply[1])
+        return reply[0] == ACK, reply[1], rest
 
     def must(self, pkt):
-        ok, data = self.transact(pkt)
+        ok, data, rest = self.transact(pkt)
         if not ok:
             raise HostError(f"NAK for {pkt.hex()}")
-        return data
+        return (data, rest) if pkt[0] == 0x44 else data
+
+    def fast(self):
+        self.must(pkt_baud(FAST_DIV))
+        self.ser.baudrate = CLOCK_HZ // FAST_DIV
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", required=True)
+    ap.add_argument("--fast", action="store_true", help="switch to 3 Mbaud first")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("id")
     sub.add_parser("status")
     sub.add_parser("halt")
-    sub.add_parser("run")
-    ld = sub.add_parser("load", help="assemble and load a seq program")
+    sub.add_parser("drain")
+    st = sub.add_parser("stats")
+    st.add_argument("slot", type=int)
+    ld = sub.add_parser("load", help="assemble firmware, load it with a pin config, optionally run")
     ld.add_argument("source")
-    ld.add_argument("--sr", type=lambda s: int(s, 0), help="shift-register byte")
-    ld.add_argument("--oe", type=lambda s: int(s, 0), help="uio output-enable mask")
+    ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
     ld.add_argument("--run", action="store_true")
     args = ap.parse_args(argv)
 
     ref = Referee(args.port)
     try:
+        if args.fast:
+            ref.fast()
         if args.cmd == "id":
-            data = ref.must(pkt_id())
-            print("Referee" if data == ID else f"unexpected id {data:#04x}")
+            print("Referee" if ref.must(pkt_id()) == ID else "unexpected id")
         elif args.cmd == "status":
             print(decode_status(ref.must(pkt_status())))
         elif args.cmd == "halt":
             ref.must(pkt_run(False))
-        elif args.cmd == "run":
-            ref.must(pkt_run(True))
+        elif args.cmd == "drain":
+            n, rest = ref.must(pkt_drain())
+            slots = [rest[2 * i] << 8 | rest[2 * i + 1] for i in range(n)]
+            for h, m in split_verdicts(slots):
+                print(h, "" if m is None else f"m = {m}")
+        elif args.cmd == "stats":
+            ref.must(pkt_stats_latch(args.slot))
+            names = ["pass", "viol", "indet", "min", "max"]
+            print({n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)})
         else:
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
-            import seqasm
-
-            words = seqasm.assemble(Path(args.source).read_text())
-            for p in load_packets(words, args.sr, args.oe, args.run):
+            glob, img, notes = build(Path(args.source).read_text(), pin_config(args.pin))
+            for p in load_packets(glob, img):
                 ref.must(p)
-            print(f"loaded {len(words)} words" + (", running" if args.run else ""))
-    except HostError as e:
+            if args.run:
+                ok, _, _ = ref.transact(pkt_run(True))
+                if not ok:
+                    raise HostError(f"RUN refused: {decode_status(ref.must(pkt_status()))}")
+            print("\n".join(notes) + ("\nloaded, running" if args.run else "\nloaded"))
+    except (HostError, refasm.AsmError) as e:
         sys.exit(str(e))
 
 

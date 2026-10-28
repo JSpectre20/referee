@@ -5,7 +5,7 @@ project:
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Programmable protocol emulator and bus referee"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     40000000       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     60000000       # Clock frequency in Hz (or 0 if not applicable); 40 MHz fallback
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "6x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
@@ -21,40 +21,44 @@ project:
     - "uart_tx.v"
     - "uart_rx.v"
     - "host_port.v"
-    - "seq.v"
+    - "engine_sys.v"
+    - "engine.v"
+    - "snapshot.v"
+    - "edge_ts.v"
+    - "verdict.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
+  ui[0]: "engine input 8"
+  ui[1]: "engine input 9"
+  ui[2]: "engine input 10"
   ui[3]: "UART RX (host)"
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  ui[4]: "judge channel 0"
+  ui[5]: "judge channel 1"
+  ui[6]: "judge channel 2"
+  ui[7]: "judge channel 3"
 
   # Outputs
-  uo[0]: "seq running"
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
+  uo[0]: "engine pin 8"
+  uo[1]: "engine pin 9"
+  uo[2]: "engine pin 10"
+  uo[3]: "engine pin 11"
   uo[4]: "UART TX (host)"
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[5]: "engine pin 12"
+  uo[6]: "engine pin 13"
+  uo[7]: "engine pin 14"
 
   # Bidirectional pins
-  uio[0]: "seq pin 0"
-  uio[1]: "seq pin 1"
-  uio[2]: "seq pin 2"
-  uio[3]: "seq pin 3"
-  uio[4]: "seq pin 4"
-  uio[5]: "seq pin 5"
-  uio[6]: "seq pin 6"
-  uio[7]: "seq pin 7"
+  uio[0]: "engine pin 0"
+  uio[1]: "engine pin 1"
+  uio[2]: "engine pin 2"
+  uio[3]: "engine pin 3"
+  uio[4]: "engine pin 4"
+  uio[5]: "engine pin 5"
+  uio[6]: "engine pin 6"
+  uio[7]: "engine pin 7"
 
 # Do not change!
 yaml_version: 6

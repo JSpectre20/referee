@@ -24,25 +24,32 @@
  * (e.g. a mux of the shift register) can glitch while its inputs settle, and
  * a glitch on an idle UART line looks like a start bit to the receiver.
  *
- * Counter sizing: `cnt` counts 0 .. CLKS_PER_BIT-1 inside one bit, so it
- * needs clog2(CLKS_PER_BIT) bits: 9 bits for the default 347.
+ * Bit period: the runtime input `div` (written CLKS_PER_BIT above), so the
+ * host can change the baud rate between frames. `cnt` counts 0 .. div-1
+ * inside one bit and is DIV_W = 16 bits wide (down to 2 cycles per bit).
  */
 
 `default_nettype none
 
 module uart_tx #(
-    parameter integer CLKS_PER_BIT = 347  // 40 MHz / 115200 baud, rounded (0.06% fast)
+    /* verilator lint_off UNUSEDPARAM */
+    parameter integer CLKS_PER_BIT = 347,  // used only by the formal properties (div == it)
+    /* verilator lint_on UNUSEDPARAM */
+    parameter integer DIV_W = 16          // width of the runtime bit period
 ) (
     input  wire       clk,
     input  wire       rst_n,  // synchronous, active low
+    input  wire [DIV_W-1:0] div,  // bit period in cycles (>= 2); change it only while idle
     input  wire [7:0] data,   // byte to send, sampled when `start` is accepted
     input  wire       start,  // one-cycle pulse: send `data`
     output reg        tx,     // the serial line; 1 (idle) during and after reset
     output wire       busy    // high while a frame is on the line
 );
 
-  localparam integer CW = (CLKS_PER_BIT > 1) ? $clog2(CLKS_PER_BIT) : 1;
-  localparam [CW-1:0] LAST = CLKS_PER_BIT[CW-1:0] - 1'b1;  // last cycle of a bit
+  // The bit period is a runtime input, so the host can switch baud rates
+  // (host port command 'B', applied only between frames).
+  localparam integer CW = DIV_W;
+  wire [CW-1:0] last = div - 1'b1;  // last cycle of a bit
 
   // Four states, two bits. `default` in the case below brings any illegal
   // value back to IDLE (cannot happen from reset, but costs nothing).
@@ -54,7 +61,7 @@ module uart_tx #(
   reg [   7:0] shreg;  // copy of the byte: `data` may change mid-frame
 
   assign busy = (state != IDLE);
-  wire bit_end = (cnt == LAST);
+  wire bit_end = (cnt == last);
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -101,7 +108,7 @@ module uart_tx #(
 `ifdef UART_TX_MUTANT_SHORT_STOP
         // Negative control: the stop bit ends one cycle early.
         // formal/uart.sby must FAIL when this is defined.
-        STOP: if (cnt == LAST - 1'b1) state <= IDLE;
+        STOP: if (cnt == last - 1'b1) state <= IDLE;
 `else
         STOP: if (bit_end) state <= IDLE;
 `endif
@@ -118,6 +125,7 @@ module uart_tx #(
   reg f_past_valid = 1'b0;
   always @(posedge clk) f_past_valid <= 1'b1;
   always @(*) if (!f_past_valid) assume (!rst_n);
+  always @(*) assume (div == CLKS_PER_BIT);  // the proof is for one fixed bit period
 
   // Harness view of a frame, written from the frame format, not from the FSM:
   // `f_t` counts cycles since the accepted start (1 = first cycle of the start
@@ -148,7 +156,7 @@ module uart_tx #(
         else assert (tx == f_byte[f_bit-16'd1]);
       end
       // Inductive strengthening (the FSM's position matches the harness).
-      assert (cnt <= LAST);
+      assert (cnt <= last);
       if (f_t != 16'd0) assert ({16'd0, cnt} == (f_t - 16'd1) % CLKS_PER_BIT);
       if (state == DATA) assert ({13'd0, idx} == f_bit - 16'd1);
       if (state == DATA) assert (shreg == (f_byte >> (f_bit)));

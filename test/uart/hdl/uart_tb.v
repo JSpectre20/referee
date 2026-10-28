@@ -20,13 +20,14 @@ module uart_tb #(
   wire [7:0] rx_data, lb_data;
   wire       rx_valid, rx_ferr, lb_valid, lb_ferr;
 
+  localparam [15:0] DIV = CLKS;  // the runtime bit period, fixed here
   uart_tx #(.CLKS_PER_BIT(CLKS)) u_tx (
-      .clk(clk), .rst_n(rst_n), .data(tx_data), .start(tx_start), .tx(tx), .busy(tx_busy)
+      .clk(clk), .rst_n(rst_n), .div(DIV), .data(tx_data), .start(tx_start), .tx(tx), .busy(tx_busy)
   );
-  uart_rx #(.CLKS_PER_BIT(CLKS)) u_rx (
-      .clk(clk), .rst_n(rst_n), .rx(rx_in), .data(rx_data), .valid(rx_valid), .frame_err(rx_ferr)
+  uart_rx u_rx (
+      .clk(clk), .rst_n(rst_n), .div(DIV), .rx(rx_in), .data(rx_data), .valid(rx_valid), .frame_err(rx_ferr)
   );
-  uart_rx #(.CLKS_PER_BIT(CLKS)) u_lb (
-      .clk(clk), .rst_n(rst_n), .rx(tx), .data(lb_data), .valid(lb_valid), .frame_err(lb_ferr)
+  uart_rx u_lb (
+      .clk(clk), .rst_n(rst_n), .div(DIV), .rx(tx), .data(lb_data), .valid(lb_valid), .frame_err(lb_ferr)
   );
 endmodule

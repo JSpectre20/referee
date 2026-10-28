@@ -36,7 +36,9 @@ as numbers, and keeps the **assumption ledger** (§11).
 | **7. RUN check timing:** strobe in cycle c, check in cycles c + 1 .. c + 105, first issue at c + 106 (= C_START) | 8 + 97 words, one per cycle |
 | **8. `isa.yaml` gained `enums`, `flags_kw`, `aliases`** | Structured, non-semantic: the generator needs them |
 | **9. Generated Verilog constants are spliced between markers in `src/engine.v`**, not `` `include ``d | Unsure whether the Tiny Tapeout LibreLane flow resolves include paths |
-| **10. Host fast-baud command:** designed (§7), not implemented yet | `uart_tx` / `uart_rx` have a fixed CLKS_PER_BIT; done with host port v2 (CP3) |
+| **10. Host fast-baud command:** implemented in CP3 (`42 hi lo 00`, bit period in cycles, ≥ 6, applied after the reply has been sent) | `uart_tx` / `uart_rx` now take the bit period as a runtime input; the chip tests load images at 3 Mbaud |
+| **11. Host port v2 as built (CP3)**: `r` (read word) takes the byte select in C and addr `0x80` = the CRC the last RUN check computed; `s` (stats read) takes the byte select in C; `L` takes its clear flag in B; `Q` B = 0 engine status `{running, S, CRC_FAIL, PIN_FAULT, IN_UNDERRUN, VERDICT_OVF, OUT_OVF, NI}` (read-and-clear), B = 1 port status `{overrun}`; the drain reply is `ACK, n, n × {hi, lo}`; RUN's reply waits for the image check | The §7 table left byte selects and reply layouts open; the 2-byte reply format needs them for 16-bit values. Documented in `src/host_port.v` and `docs/info.md` |
+| **12. Project clock 60 MHz from CP3** (`info.yaml` clock_hz, UART 521 cycles per bit at 115200) | The firmware and bounds are assembled for 60 MHz (A9). STA closure at 60 MHz (`CLOCK_PERIOD`) stays in CP6; 40 MHz is the fallback |
 
 ## 1. Decisions, with evidence
 
