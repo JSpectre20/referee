@@ -17,7 +17,14 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "CLOCK_PERIOD": 25,
+  "CLOCK_PERIOD": 16.6,
+
+  "//": "Timing probe (side branch sta-rtl, not for merging): the 801e728 RTL timing fixes plus the",
+  "//": "sta-flow settings, at 60 MHz. (test.py's clock check fails here by design: 16.6 != info.yaml.)",
+  "RUN_POST_GRT_RESIZER_TIMING": 1,
+  "RUN_POST_GRT_DESIGN_REPAIR": 1,
+  "PL_TIMING_DRIVEN": 1,
+  "SYNTH_STRATEGY": "DELAY 4",
 
   "//": "Referee: 25 ns = 40 MHz, the clock in info.yaml (one clock, docs/isa-timing.md 0b diff 12).",
   "//": "STA is judged at the slow corner (nom_slow_1p08V_125C); change this together with info.yaml.",
