@@ -5,8 +5,11 @@
 #   prove        engine_sys, every input free, arbitrary program: 1-cycle issue,
 #                WAITD = max(t+1, DL), DL/TO writers, event wins a tie, pads only
 #                after SET/SHO to owned pins, image/config writes only while halted,
-#                no issue without a passed RUN check, JUDGE inputs, LOST, HALT
-#                releases open-drain pins (k-induction, unbounded)
+#                no issue without a passed RUN check (and the registered RUN start
+#                equals the last-cycle check), JUDGE inputs and its cycle-2 effects
+#                (push / FIFO-full / VERDICT_OVF / stats / L clear, back to back),
+#                the four pc copies equal pc, LOST, HALT releases open-drain pins
+#                (k-induction, unbounded)
 #   cover        the interesting cases of those are reachable. Starts in the
 #                post-RUN state (ENGINE_FORMAL_START_RUNNING) instead of a 106-cycle
 #                RUN check: claims constrained valid, and the first cycle must

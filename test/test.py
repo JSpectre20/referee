@@ -21,6 +21,7 @@ VIOLATION => it breaks it), and when the true margin is larger than u + 1
 cycle the verdict must be the decisive one.
 """
 
+import json
 import logging
 import math
 import os
@@ -166,6 +167,9 @@ async def power_up_baud_matches_clock(dut):
     await RisingEdge(dut.clk)
     period_ps = get_sim_time("ps") - t1
     assert period_ps == round(1e12 / CLOCK_HZ), f"testbench clock {period_ps} ps, info.yaml says {CLOCK_HZ} Hz"
+    # ... and the hardening flow times that same clock (src/config.json CLOCK_PERIOD, in ns)
+    sta_ns = json.loads((ROOT / "src" / "config.json").read_text())["CLOCK_PERIOD"]
+    assert abs(sta_ns - 1e9 / CLOCK_HZ) < 0.01, f"src/config.json CLOCK_PERIOD {sta_ns} ns, info.yaml says {CLOCK_HZ} Hz"
     # The reply to identify starts 06 = start bit, then bits 0, 1, 1, ...: the start bit's
     # falling edge to the next rising edge is exactly 2 bit periods.
     await h.src.write(host.pkt_id())

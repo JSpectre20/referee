@@ -17,7 +17,10 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "CLOCK_PERIOD": 20,
+  "CLOCK_PERIOD": 25,
+
+  "//": "Referee: 25 ns = 40 MHz, the clock in info.yaml (one clock, docs/isa-timing.md 0b diff 12).",
+  "//": "STA is judged at the slow corner (nom_slow_1p08V_125C); change this together with info.yaml.",
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,

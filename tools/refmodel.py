@@ -10,6 +10,8 @@ What it models, per clock cycle:
   - the judge-channel mux and edge_ts (4 channels, 16-bit timestamps)
   - the engine's snapshot (trigger, one-cycle delay, ORD window r-1..r+1, epoch, LOST)
   - the engine: every instruction, deadlines DL/TO, flags, FIFOs, JUDGE + stats
+    (JUDGE in two cycles: issue latches its inputs; the next cycle computes the
+    verdict and does the push, VERDICT_OVF, stats and the L clear together)
   - images, the RUN check (CRC + pin claims), halt, open-drain release
 
 Host operations are methods called between cycles; `step(ui_in, uio_in)` runs one
@@ -122,6 +124,8 @@ class Model:
         self.lost = 0
         self.sticky = {"OUT_OVF": 0, "VERDICT_OVF": 0, "IN_UNDERRUN": 0, "PIN_FAULT": 0}
         self.out_val = [1] * 15
+        self.j_pend = None  # a JUDGE issued last cycle: its cycle 2 runs at the start of this step
+        self._popped_v = 0  # a host verdict pop happened before this step (frees room only next cycle)
         self._reset_core()
 
     def _reset_core(self):
@@ -211,7 +215,10 @@ class Model:
         return self.fifo_out.pop(0) if self.fifo_out else None
 
     def verdict_pop(self):
-        return self.fifo_v.pop(0) if self.fifo_v else None
+        if not self.fifo_v:
+            return None
+        self._popped_v = 1
+        return self.fifo_v.pop(0)
 
     def stats_latch(self, slot):
         st = self.stats[slot]
@@ -283,6 +290,12 @@ class Model:
         clear_missed = False
         start_core = False
         rel = 0
+        # JUDGE cycle 2 for a JUDGE issued last cycle, on the state this cycle starts
+        # from (lost_since, FIFO level before this cycle's pop); a trigger lost in this
+        # same cycle sets lost_since again below (set wins over the clear)
+        jp, self.j_pend = self.j_pend, None
+        if jp is not None:
+            self._judge2(jp)
         # Registered state at the start of the cycle: an instruction issued in this
         # cycle (trig, halt) only takes effect from the next one.
         was_running, trig_before = self.state == "running", self.trig
@@ -345,6 +358,7 @@ class Model:
         ed.commit(now, pulses, raw_ch, clear_missed)
         self.sync2, self.sync1 = list(self.sync1), raw_sync
         self.now = (now + 1) & M16
+        self._popped_v = 0
 
     # -- the engine ----------------------------------------------------------
 
@@ -447,13 +461,21 @@ class Model:
         return rel
 
     def _judge(self, f):
-        m = s16(self.Y - self.X)
+        """JUDGE cycle 1 (issue): latch m, the tags, bound b's words and the fields."""
         fx, ox, ex = self.tag["X"]
         fy, oy, ey = self.tag["Y"]
-        tagbad = int(ex != ey)
-        invalid = int(fx or fy or ox or oy or tagbad)
         b = f["b"]
-        w_hi, w_lo = self.img[64 + 2 * b], self.img[65 + 2 * b]
+        self.j_pend = {
+            "m": s16(self.Y - self.X), "fx": fx, "fy": fy, "ord": int(ox or oy), "tagbad": int(ex != ey),
+            "invalid": int(fx or fy or ox or oy or ex != ey), "b": b, "raw": f["raw"], "push": f["push"],
+            "w_hi": self.img[64 + 2 * b], "w_lo": self.img[65 + 2 * b], "ni": self.non_intrusive(),
+        }
+
+    def _judge2(self, jp):
+        """JUDGE cycle 2: verdict, push (room against the level at the start of this
+        cycle), VERDICT_OVF, stats, and the L bit's report and clear."""
+        m, invalid, b = jp["m"], jp["invalid"], jp["b"]
+        w_hi, w_lo = jp["w_hi"], jp["w_lo"]
         n_lo = (w_hi << 4) | (w_lo >> 12)
         inexact, is_max = (w_lo >> 11) & 1, (w_lo >> 10) & 1
         v = verdict_rule(m, n_lo, inexact, is_max, invalid)
@@ -464,17 +486,17 @@ class Model:
             if not invalid:
                 st[3] = m if st[3] is None else min(st[3], m)
                 st[4] = m if st[4] is None else max(st[4], m)
-        mode = f["push"]
+        mode = jp["push"]
         push = mode == E["push"]["all"] or (mode == E["push"]["nonpass"] and v != "PASS")
         if push:
-            need = 1 + f["raw"]
-            if len(self.fifo_v) + need <= 8:
+            need = 1 + jp["raw"]
+            if len(self.fifo_v) + self._popped_v + need <= 8:
                 vcode = {"INDET": 0, "PASS": 1, "VIOL": 2}[v]
                 msat = max(-4, min(3, m)) & 7
-                hdr = (vcode << 14 | fx << 13 | fy << 12 | tagbad << 11 | self.lost_since << 10
-                       | self.non_intrusive() << 9 | f["raw"] << 8 | b << 4 | (ox or oy) << 3 | msat)
+                hdr = (vcode << 14 | jp["fx"] << 13 | jp["fy"] << 12 | jp["tagbad"] << 11 | self.lost_since << 10
+                       | jp["ni"] << 9 | jp["raw"] << 8 | b << 4 | jp["ord"] << 3 | msat)
                 self.fifo_v.append(hdr)
-                if f["raw"]:
+                if jp["raw"]:
                     self.fifo_v.append(m & M16)
             else:
                 self.sticky["VERDICT_OVF"] = 1

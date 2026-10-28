@@ -101,7 +101,7 @@ class Lockstep:
                 continue
             if k == "out" and (int(d.out_empty.value) or int(e.fout_n.value) == 4):
                 continue
-            if k == "vf" and int(d.vf_count.value) in (0, 8):
+            if k == "vf" and int(d.vf_count.value) == 0:
                 continue
             if k == "run" and md.state != "halted":
                 continue
@@ -360,3 +360,95 @@ async def no_writes_during_run_check(dut):
     assert int(e.claims.value) == img[96]
     assert [int(s.glob[i].value) for i in range(8)] == glob
     assert int(e.crc_exp_e.value) == refasm.crc16(img) and int(s.g_crc_exp.value) == refasm.crc16(glob)
+
+
+@cocotb.test()
+async def lockstep_back_to_back_judges(dut):
+    """JUDGE is two pipeline cycles (src/engine.v): cycle 2 does the verdict, the push and
+    its FIFO-full check, VERDICT_OVF, the stats update and the L-bit clear together. This
+    runs eight JUDGEs in a row on every clock rise (mixed raw / push modes / stats and
+    non-stats slots), so cycle 2 of one overlaps cycle 1 of the next, with clock rises
+    close enough to lose triggers (L bit), and the host popping, latching and clearing
+    stats and clearing status in the same cycles. RTL == model every cycle, and every
+    popped verdict slot (header with L, and raw m) must equal the model's."""
+    rng = random.Random(21)
+    ls = Lockstep(dut, rng)
+    await ls.reset()
+    src = """
+.bound 0, min, 100ns
+.bound 1, max, 200ns
+.bound 2, min, 50ns
+.bound 6, max, 1us             ; slot 6: no stats
+        trig 1, rise
+loop:   tmon 1023, x16
+        waits
+        jt   loop
+        tsget X, 0, last
+        tsget Y, 1, rise
+        judge 0, raw           ; eight JUDGEs back to back: up to 12 slots per rise
+        judge 1
+        judge 2, raw, nonpass
+        judge 6, raw
+        judge 0, none
+        judge 1, raw
+        judge 2
+        judge 6, nonpass
+        rel
+        jmp  loop
+"""
+    a = refasm.Assembler(60e6)  # cycle-level test: the spec's 60 MHz numbers
+    img = a.image(a.assemble(src))
+    await ls.load(refasm.global_image(), img)
+    await ls.tick(ops=[("run",)])
+    for _ in range(110):
+        await ls.tick()
+    assert ls.md.state == "running"
+
+    # instrument the model: what the host pops, and when VERDICT_OVF rises
+    popped = []
+    pop0 = ls.md.verdict_pop
+
+    def pop():
+        v = pop0()
+        popped.append(v)
+        return v
+
+    ls.md.verdict_pop = pop
+    j2 = ls.md._judge2
+    l_reports = []  # cycle-2s that reported (and cleared) lost_since = 1
+
+    def judge2(jp):
+        l_reports.append(ls.md.lost_since)
+        j2(jp)
+
+    ls.md._judge2 = judge2
+    ovf = 0
+    sda = scl = 0
+    for k in range(100):
+        sda ^= rng.random() < 0.7
+        gap = rng.choice([1, 3, 6, 12, 20])  # data edge this many cycles before the clock rise
+        for c in range(gap + rng.choice([2, 4, 6, 10, 25, 40])):  # short periods lose triggers
+            if c == gap:
+                scl = 1
+            elif c == gap + 2:
+                scl = 0
+            ops = []
+            r = rng.random()
+            if r < 0.30:
+                ops.append(("vf",))
+            elif r < 0.33:
+                ops.append(("latch", rng.randrange(4)))
+            elif r < 0.35:
+                ops.append(("sclear", rng.randrange(4)))
+            elif r < 0.37:
+                ops.append(("stclear",))
+            await ls.tick(ui=(sda << 4) | (scl << 5), ops=ops, read_shadow=ls.latched)
+            ls.latched = bool(ops) and ops[0][0] == "latch"
+            ovf += ls.md.sticky["VERDICT_OVF"]
+    hdrs = [v for v in popped if v is not None]
+    dut._log.info("back-to-back judges: %d JUDGEs, %d with L = 1, %d slots popped, LOST %d, "
+                  "%d cycles with VERDICT_OVF", len(l_reports), sum(l_reports), len(hdrs), ls.md.lost, ovf)
+    assert len(l_reports) >= 400, "eight JUDGEs per clock rise that wasn't lost"
+    assert len(hdrs) > 100, "the host should drain plenty of verdicts"
+    assert ovf > 0, "the FIFO should overflow (eight JUDGEs per clock rise)"
+    assert ls.md.lost > 0 and sum(l_reports) > 0, "close clock rises should lose triggers, reported in L"
