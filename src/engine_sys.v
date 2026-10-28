@@ -91,6 +91,12 @@ module engine_sys (
   always @(posedge clk) begin
     if (!rst_n) begin
       for (gi = 0; gi < 8; gi = gi + 1) glob[gi] <= 16'd0;  // all pins unowned, mux = ui_in
+`ifdef ENGINE_FORMAL_START_RUNNING
+      // formal reachability tasks only (see engine.v): uio[0..7] owned by
+      // engine 0, open-drain, so the pad covers are reachable without a RUN check
+      glob[2] <= 16'h6666;
+      glob[3] <= 16'h6666;
+`endif
     end else if (h_gwe && halted) begin
       glob[h_gaddr] <= h_gwdata;
     end
@@ -170,6 +176,10 @@ module engine_sys (
   // Engine 0
   // ---------------------------------------------------------------------------
   wire [14:0] out_val;
+`ifdef FORMAL
+  wire [14:0] f_drive;
+  wire f_halting;
+`endif
   engine u_eng (
       .clk(clk), .rst_n(rst_n), .now(now),
       .in_sync({et_level, sync2}),
@@ -189,6 +199,9 @@ module engine_sys (
       .h_lost_clear(h_lost_clear), .lost(lost), .h_status_clear(h_status_clear),
       .halted(halted), .running(running), .checking(checking),
       .crc_got_g(crc_got_g), .crc_got_e(crc_got_e), .status(status)
+`ifdef FORMAL
+      , .f_drive(f_drive), .f_halting(f_halting)
+`endif
   );
 
   // ---------------------------------------------------------------------------
@@ -208,6 +221,56 @@ module engine_sys (
   };
 
   wire _unused = &{1'b0, et_toggled, pp_mode[14:8], pin_nib[63:60]};  // pin 15 is reserved
+
+`ifdef FORMAL
+  // ===========================================================================
+  // Pad and global-config properties (docs/isa-timing.md section 9), proved by
+  // formal/engine.sby together with the engine's own (src/engine.v).
+  // ===========================================================================
+  reg f_past;  // the last cycle was out of reset
+  always @(posedge clk) f_past <= rst_n;
+
+  // what each output pin presents: uio = {oe, out}; uo_out bits = value
+  wire [29:0] f_pad = {
+    2'b00, uo_eng[7], uo_eng[6], uo_eng[5], uo_eng[3], uo_eng[2], uo_eng[1], uo_eng[0],
+    uio_oe[7], uio_out[7], uio_oe[6], uio_out[6], uio_oe[5], uio_out[5], uio_oe[4], uio_out[4],
+    uio_oe[3], uio_out[3], uio_oe[2], uio_out[2], uio_oe[1], uio_out[1], uio_oe[0], uio_out[0]
+  };
+  (* anyconst *) reg [2:0] f_gidx;  // any global config word
+  integer fp;
+
+  always @(posedge clk) begin
+    if (rst_n && f_past) begin
+      // the global config (pin owners and modes, channel mux) changes only by a
+      // host write while the engine is halted
+      if (glob[f_gidx] != $past(glob[f_gidx])) assert ($past(h_gwe && halted && h_gaddr == f_gidx));
+
+      // -- pads change only one cycle after a SET / SHO, and only for owned pins
+      //    (checked over a stretch where the engine runs throughout; while it is
+      //    halted, the host may change the config and with it the pads)
+      if ($past(running) && running) begin
+        for (fp = 0; fp < 8; fp = fp + 1)
+          if ({uio_oe[fp], uio_out[fp]} != $past({uio_oe[fp], uio_out[fp]})) assert ($past(f_drive[fp]) && owned[fp]);
+        for (fp = 8; fp < 15; fp = fp + 1)
+          if (f_pad[16+fp-8] != $past(f_pad[16+fp-8])) assert ($past(f_drive[fp]) && owned[fp]);
+      end
+      // an unowned pin is never driven, and uo_out[4] (host TX) never by the engine
+      for (fp = 0; fp < 8; fp = fp + 1) if (!owned[fp]) assert (!uio_oe[fp] && !uio_out[fp]);
+      assert (!uo_eng[4]);
+
+      // -- HALT releases open-drain pins: after a halt, no open-drain pin pulls low
+      if ($past(f_halting))
+        for (fp = 0; fp < 8; fp = fp + 1) if (od_mode[fp]) assert (!uio_oe[fp]);
+    end
+  end
+
+  always @(posedge clk) begin
+    if (rst_n && f_past) begin
+      cover ($past(running) && running && uio_oe[0] != $past(uio_oe[0]));  // an open-drain pin pulled low / released
+      cover ($past(f_halting) && od_mode[1] && $past(uio_oe[1]));  // a halt releasing a held-low pin
+    end
+  end
+`endif
 
 endmodule
 

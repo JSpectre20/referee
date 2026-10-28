@@ -47,13 +47,13 @@ machine:                 # per engine
     S:  "a snapshot is pending (taken, not yet released by REL)"
   timestamp_tags:        # copied by TSGET
     FX: "X's timestamp is unusable: stale | missed | no valid snapshot yet"
-    OX: "X's edge is order-ambiguous with the trigger (latched in cycles r-1..r+1, r = the trigger's report cycle)"
+    OX: "X's edge is order-ambiguous with the trigger (latched in cycles r-1..r+1, r = the trigger's report cycle; never the trigger edge itself)"
     EX: "2-bit epoch of the snapshot X came from"
     FY: "same for Y"
     OY: "same for Y"
     EY: "same for Y"
   counters:
-    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was pending; saturating; host-readable; host-clearable only"}
+    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was held or a capture pending; saturating; host-readable; host-clearable only"}
   sticky_status:         # host-visible; cleared by the host status read or a new RUN
     OUT_OVF:     "PUSH found OUT full; byte dropped"
     VERDICT_OVF: "JUDGE found VERDICT full; entry dropped"
@@ -84,17 +84,18 @@ edge_ts_snapshot:        # one edge_ts; one snapshot + trigger per engine
   tracks_last_edge: "per channel, which of rise/fall was latched last (for TSGET e = last)"
   trigger: "per engine, set by TRIG ch, e (default: disabled)"
   on_trigger: >-
-    if !S: ONE CYCLE AFTER the trigger's report cycle, snapshot <- every channel's {rise_ts, fall_ts,
-    last_edge, rise_stale, fall_stale, missed} as latched then, plus per edge an ORD bit = "latched in
-    cycle r-1, r or r+1" where r is the trigger's report cycle (order relative to the trigger is
+    if !S and no capture pending: snapshot <- every channel's {rise_ts, fall_ts, last_edge, rise_stale,
+    fall_stale, missed} AS LATCHED AT THE END OF CYCLE r+1 (r = the trigger's report cycle; copied at the
+    end of r+2 from the edge_ts registers, so S, epoch and valid are visible from r+3), plus per edge an ORD
+    bit = "latched in cycle r-1, r or r+1", except the trigger edge itself (order relative to the trigger is
     ambiguous: report latencies differ by < 2 cycles in either direction); epoch <- epoch + 1; S <- 1; valid <- 1.
     The one-cycle delay guarantees every edge that truly happened before the trigger edge is in the
     snapshot, so no earlier edge can be missed (that would allow a false PASS).
-    If S: snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
+    If S or a capture is pending (r..r+2): snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
     lost_since_verdict <- 1. A lost trigger does NOT force INDETERMINATE.
   read_by: TSGET
   released_by: REL
-  formal: "after an accepted trigger, snapshot == edge_ts latched state one cycle after the trigger's report; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in cycles r-1..r+1; any edge latched at r-2 or earlier is truly before the trigger; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S"
+  formal: "after an accepted trigger, snapshot == edge_ts state as of the end of cycle r+1; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in cycles r-1..r+1 other than the trigger edge itself; any edge latched at r-2 or earlier is truly before the trigger; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S or a capture is pending, and saturates"
 
 fifos:                   # per engine
   IN:      {width: 8,  depth: 4, dir: host_to_engine, engine_side: "PULL: never stalls; empty -> E <- 1, SR unchanged, IN_UNDERRUN"}

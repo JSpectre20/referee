@@ -25,6 +25,18 @@ as numbers, and keeps the **assumption ledger** (§11).
 | ORD window is cycles **r - 1, r, r + 1** (was r, r + 1) | Review of v0.3: report latencies differ by < 2 cycles in *either* direction, so an edge latched at r - 1 may truly come after the trigger. Edges latched at r - 2 or earlier are certainly before it; taking the snapshot at r + 1 already guarantees no earlier edge is missed. |
 | §5.4 budget ≤ 11 cycles (183 ns) | 2 + 1/K (visibility) + 1 (`waitp` ends) + 6 instructions + 1 (pad) ≈ 10.25 cycles |
 | Opcodes 0x18..0x1B reserved for the v1 bitstream unit | LFSR CRC/parity tapping SHO/SHI bits, bit stuffing, NRZI (ledger A18) |
+| **1. Snapshot timing (accepted 28 Oct).** The snapshot is loaded at the **end of cycle r + 2** from the edge_ts registers. In cycle r + 2 those registers hold exactly the **edge_ts state as of the end of cycle r + 1**, so the content is what §3.6 specifies; an edge reported in r + 2 is not in it. **S is visible from r + 3**, one cycle later than v0.3 implied. §5.3's cycle budget is +1 | Loading from the registers (not from edge_ts's next-state logic) keeps the capture path short and the snapshot a plain register copy. Formal: `formal/engine.sby` (`snap`) |
+| **ORD excludes the trigger edge itself** (found while writing the CP2 proofs) | The trigger edge is reported in cycle r by definition, so the r - 1..r + 1 rule flagged it ORD, and every judgment that uses it (e.g. `tsget Y, 1, rise` in §5.3) was INDETERMINATE: the referee could never say PASS. Its order relative to the trigger is known (it *is* the trigger), so its own report in r is excluded. All other edges keep the full window. Found by the snapshot lemma; the lockstep couldn't see it because the model followed the same rule. New lockstep test runs §5.3 and needs all three verdicts |
+| **Lost triggers: while S *or a capture is pending*** (r .. r + 2) | Follows from diff 1: S is not yet 1 in r + 1 and r + 2. The same trigger edge can't repeat that fast (A1), so this only matters for a TRIG to another channel |
+| **2. RUN start state:** pc = 0; X, Y, SR, RC = 0; flags 0; **DL = TO = NOW of the first issue cycle**; snapshot, epoch, trigger and `valid` cleared (TSGET before any snapshot returns 0 with F = 1); sticky bits and CRC_FAIL cleared. LOST and stats are **not** cleared (host only); FIFO contents are kept | A defined start state for the proofs and the model. DL = TO = NOW makes a leading `waitd`/`tmo` relative to the first instruction |
+| **3. RUN clears edge_ts `missed`** (through its `clear` input, which also clears `toggled`) | A `missed` from before the run must not poison the first verdicts |
+| **4. Stricter pin-claim check:** a claimed pin must be owned by the engine **and in a driving mode**; uo_out pins must be push-pull | An owned pin in input mode would accept SET/SHO and drive nothing |
+| **5. A stats clear also zeroes min/max** (they read 0 until the next valid judgment) | One clear = a fresh slot |
+| **6. Host clears win** over a same-cycle hardware set (status read-and-clear, LOST clear) | The alternative loses the clear silently; a set in the same cycle is seen again on the next event |
+| **7. RUN check timing:** strobe in cycle c, check in cycles c + 1 .. c + 105, first issue at c + 106 (= C_START) | 8 + 97 words, one per cycle |
+| **8. `isa.yaml` gained `enums`, `flags_kw`, `aliases`** | Structured, non-semantic: the generator needs them |
+| **9. Generated Verilog constants are spliced between markers in `src/engine.v`**, not `` `include ``d | Unsure whether the Tiny Tapeout LibreLane flow resolves include paths |
+| **10. Host fast-baud command:** designed (§7), not implemented yet | `uart_tx` / `uart_rx` have a fixed CLKS_PER_BIT; done with host port v2 (CP3) |
 
 ## 1. Decisions, with evidence
 
@@ -104,11 +116,13 @@ as numbers, and keeps the **assumption ledger** (§11).
 
 ### 3.6 Snapshots (atomic, ordered timestamps)
 - `trig ch, e` arms this engine's trigger on channel ch, rise or fall.
-- When the trigger edge is reported (report cycle r) and **S = 0**:
-  - at the end of cycle **r + 1**, the snapshot ← every channel's {rise_ts, fall_ts,
-    last-edge, stale and missed flags} as latched then;
-  - per edge, **ORD** = "latched in cycle r - 1, r or r + 1";
-  - epoch ← epoch + 1, S ← 1.
+- When the trigger edge is reported (report cycle r) and **S = 0** (and no capture is pending):
+  - the snapshot ← every channel's {rise_ts, fall_ts, last-edge, stale and missed flags}
+    **as edge_ts had latched them at the end of cycle r + 1**. The copy is made at the end of
+    r + 2 from edge_ts's registers, which hold exactly that state during r + 2 (§0b, diff 1);
+  - per edge, **ORD** = "latched in cycle r - 1, r or r + 1", **except the trigger edge
+    itself** (its report in r: its order relative to the trigger is known);
+  - epoch ← epoch + 1, S ← 1, both visible from cycle **r + 3**.
 - **Why one cycle later, and why ORD:**
   - Two edges' report latencies differ by less than 1 + 2/K < 2 cycles, **in either direction**.
     - An edge that truly came *before* the trigger is latched by the end of cycle r + 1, so the
@@ -120,7 +134,7 @@ as numbers, and keeps the **assumption ledger** (§11).
     INDETERMINATE.
   - The header still reports ORD, so near-coincident edges can be counted. For I2C, an SDA
     edge within ~2 cycles of an SCL rise breaks a rule whichever order it came in.
-- **Trigger while S = 1:** the snapshot is kept (still one consistent instant), LOST + 1
+- **Trigger while S = 1 or a capture is pending (r .. r + 2):** the snapshot is kept (still one consistent instant), LOST + 1
   (saturating), and lost_since_verdict ← 1. **Not** INDETERMINATE: the loss is coverage, not
   soundness.
 - `tsget r, ch, e`: r ← that edge's timestamp from the snapshot. e is rise, fall or **last**
@@ -237,8 +251,10 @@ loop:   tmon 1023, x16       ; 273 us without an SCL rise = bus idle
         rel
         jmp  loop
 ```
-- **Cycle budget:** waits ends → 5 instructions → back in `waits` after ~7 cycles. A 400 kHz
-  SCL period is 150 cycles at 60 MHz, so no trigger is lost in steady state.
+- **Cycle budget:** S appears in r + 3 (§0b, diff 1) → waits ends → 5 instructions → back in
+  `waits` ~8 cycles after the SCL rise is reported (v0.3 said ~7; +1 for the capture delay).
+  A 400 kHz SCL period is 150 cycles at 60 MHz, so no trigger is lost in steady state.
+- `tsget Y, 1, rise` reads the trigger edge itself, which is never ORD (§3.6).
 - **What each outcome means:**
   - SDA's last edge ≥ 100 ns + u before SCL: PASS.
   - Clearly closer: VIOLATION.
@@ -368,9 +384,24 @@ At 115200 baud (the power-up default) the drain gives ~5,000 slots/s, which is e
   (t_Y - t_X)| < 2 cycles, where t is the true edge time.
 - Every edge that truly came before the trigger edge is in the snapshot.
 - ORD is set exactly on the edges latched in cycles r - 1 .. r + 1 (r = the trigger's report
-  cycle), and any edge latched at r - 2 or earlier truly came before the trigger.
+  cycle) other than the trigger edge itself, and any edge latched at r - 2 or earlier truly
+  came before the trigger.
+- The snapshot equals the edge_ts state as of the end of cycle r + 1, and is constant while S.
 
 This removes the harness condition used by the merged cross-interval proof (A16).
+
+**Status (engine-v0 CP2): all of section 9's formal items are proved.**
+
+| Item | Where | Task(s) |
+| --- | --- | --- |
+| Snapshot lemma at tick level: Y is the trigger edge and never ORD; X is never older than pin 0's last rise at or before the trigger (completeness); X without ORD *is* that rise (order); the cross verdict judged **through the snapshot** is sound, with the A16 harness condition removed | `formal/verdict_formal.sv` (+ `src/snapshot.v`) | `verdict.sby`: prove4, prove8, sharp4, sharp8 (unbounded), bmc4, cover4 |
+| Snapshot at cycle level, every input free: capture == edge_ts state as of the end of r + 1, visible from r + 3; ORD exactly on reports in r - 1..r + 1 except the trigger edge; constant while S; lost triggers | `src/snapshot.v` (`SNAPSHOT_PROPS`) | `engine.sby`: snap, snap_cover; snap_early (capture at r + 1) must FAIL |
+| Combinational theorem, engine parameters (M_W 16, FRAC_W 4, N_W 20, sharp) | `formal/verdict_comb.sv` | `verdict.sby`: comb, comb_cover; comb_onesided (rounded-down bound only) and comb_u1 must FAIL |
+| Engine properties 1-10 above, every input free, arbitrary image | `src/engine.v`, `src/engine_sys.v` (`FORMAL`) | `engine.sby`: prove (unbounded), cover; tie_timeout (timeout wins a tie) must FAIL |
+
+The cover and tie_timeout tasks start the engine running (define `ENGINE_FORMAL_START_RUNNING`)
+so that they don't spend ~106 cycles in a RUN check with an arbitrary image; `prove` doesn't
+use it and goes through the real check.
 
 **Theorem (verdict block alone, combinational):** for every m, n_lo, inexact, is_max and every
 true interval T with |m - T| < u, PASS ⇒ T meets the true bound and VIOLATION ⇒ T breaks it.
@@ -422,6 +453,6 @@ This holds for any K, because bounds are in 1/16 cycle and the lemma is in cycle
 | A13 | The image in memory is the image the host meant | everything | **Enforced**: per-image CRC before RUN; readback |
 | A14 | A judged interval is at most 16,384 cycles (16-bit timestamps): **273 µs at 60 MHz** (410 µs at 40) | JUDGE | **Flagged** (stale) beyond it. Per-bit UART checks fit at 9600 baud (104 µs per bit); a whole 9600-baud frame (1.04 ms) doesn't. 16 bits kept for v0; widening later is an ISA change |
 | A15 | One LOOP counter, no nesting | firmware | Design limit for v0; the assembler reports nested-loop attempts |
-| A16 | The earlier edge of a judged pair is latched before the pair is judged | cross intervals | Was a **harness condition** in the merged verdict proof. Now **enforced** by the one-cycle snapshot delay; ambiguous order **flagged** (ORD) |
+| A16 | The earlier edge of a judged pair is latched before the pair is judged | cross intervals | Was a **harness condition** in the merged verdict proof. Now **enforced** by the one-cycle snapshot delay, ambiguous order **flagged** (ORD), and **proved**: the cross verdict is judged through `src/snapshot.v` with no harness condition (`formal/verdict.sby`, snapshot lemma, §9) |
 | A18 | No parity or CRC in v0 (no ALU) | UART 8E1/8O1, CAN, USB, any CRC | **Design limit**: until the v1 bitstream unit (opcodes 0x18..0x1B reserved: LFSR CRC/parity on SHO/SHI bits, bit stuffing, NRZI), the host supplies the parity bit (e.g. as the 9th bit of a 16-bit IN pair) |
 | A17 | Two engines never drive one pin | outputs | **Enforced** by the image format (one owner per pin; claims ⊆ owned, checked at RUN) and at run time (PIN_FAULT) |

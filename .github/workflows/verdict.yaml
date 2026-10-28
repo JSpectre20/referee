@@ -1,4 +1,5 @@
-# Verdict soundness (src/verdict.v on src/edge_ts.v): SymbiYosys at tick resolution.
+# Verdict soundness (src/verdict.v on src/edge_ts.v, judged through src/snapshot.v):
+# SymbiYosys at tick resolution, plus the combinational theorem on verdict.v alone.
 name: verdict
 
 on:
@@ -6,8 +7,10 @@ on:
     paths:
       - "src/verdict.v"
       - "src/edge_ts.v"
+      - "src/snapshot.v"
       - "formal/verdict.sby"
       - "formal/verdict_formal.sv"
+      - "formal/verdict_comb.sv"
       - ".github/workflows/verdict.yaml"
   workflow_dispatch:
 
@@ -22,14 +25,15 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}  # avoid the anonymous API rate limit
 
-      - name: Soundness proofs, covers, and the negative controls u1 and glitch (must fail)
+      - name: Soundness proofs, snapshot lemma, combinational theorem, covers, negative controls (must fail)
         run: |
           cd formal
           sby -f verdict.sby
           # sby exits 0 for u1 only because of `expect fail`;
           # check each task's status explicitly so a silent change is caught.
-          for t in bmc4 prove4 prove8 cover4 sharp4 sharp8; do
+          for t in bmc4 prove4 prove8 cover4 sharp4 sharp8 comb comb_cover; do
             grep -q '^PASS' verdict_$t/status || { echo "verdict_$t: $(cat verdict_$t/status)"; exit 1; }
           done
-          grep -q '^FAIL' verdict_u1/status
-          grep -q '^FAIL' verdict_glitch/status
+          for t in u1 glitch comb_onesided comb_u1; do
+            grep -q '^FAIL' verdict_$t/status || { echo "verdict_$t should FAIL: $(cat verdict_$t/status)"; exit 1; }
+          done

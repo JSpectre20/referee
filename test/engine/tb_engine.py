@@ -286,3 +286,45 @@ async def lockstep_firmware(dut):
     for _ in range(3 * 11 * 23 + 300):
         await ls.tick(ui=0)  # CTS (ui_in[0]) low
     assert ls.md.state == "running"
+
+
+@cocotb.test()
+async def lockstep_i2c_setup_referee(dut):
+    """The section 5.3 referee (firmware/engine/i2c_setup_referee.s) in lockstep, judging a
+    synthetic bus: SDA (channel 0 = ui_in[4]) changes d cycles before each SCL rise
+    (channel 1 = ui_in[5]). Bound: min 100 ns = 6 cycles at 60 MHz, u = 2 cycles.
+
+    The trigger edge (the SCL rise) is reported in the trigger cycle r itself; it must NOT
+    be flagged ORD, or `tsget Y, 1, rise` would make every verdict INDETERMINATE. So all
+    three verdicts must appear: d >= 9 PASS, d <= 3 VIOLATION, d within ~2 cycles of the
+    SCL rise INDETERMINATE (ORD)."""
+    rng = random.Random(7)
+    ls = Lockstep(dut, rng)
+    await ls.reset()
+    a = refasm.Assembler(None)
+    img = a.image(a.assemble((ROOT / "firmware" / "engine" / "i2c_setup_referee.s").read_text()))
+    await ls.load(refasm.global_image(), img)
+    await ls.tick(ops=[("run",)])
+    for _ in range(110):
+        await ls.tick()
+    assert ls.md.state == "running"
+    sda = scl = 0
+
+    async def hold(n):
+        for _ in range(n):
+            await ls.tick(ui=(sda << 4) | (scl << 5))
+
+    await hold(20)
+    for d in [20, 12, 9, 3, 1, 0, 15, 2, 10, 4]:
+        sda ^= 1
+        await hold(d)
+        scl = 1
+        await hold(30)
+        scl = 0
+        await hold(30 - d if d < 30 else 0)
+    await ls.tick(ops=[("latch", 0)])
+    await ls.tick(read_shadow=True)
+    n_pass, n_viol, n_indet = ls.md.stats[0][:3]
+    dut._log.info("i2c referee: %d PASS, %d VIOLATION, %d INDETERMINATE", n_pass, n_viol, n_indet)
+    assert n_pass + n_viol + n_indet == 10
+    assert n_pass >= 4 and n_viol >= 1 and n_indet >= 1

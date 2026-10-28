@@ -135,6 +135,7 @@ class Model:
         self.epoch = 0
         self.cap_stage = 0  # 0 idle, 1 = trigger was last cycle, 2 = capture this cycle
         self.trig = None  # (ch, e)
+        self.trig_pend = None  # (ch, e) of the trigger edge reported in r, while a capture is pending
         self.lost_since = 0
         self.snap = None
         self.hist = [[[0, 0] for _ in range(4)] for _ in range(3)]  # pulses at c-1, c-2, c-3
@@ -295,10 +296,13 @@ class Model:
 
         # Snapshot logic. A trigger reported in cycle r is captured in cycle r+2 from
         # the edge_ts registers, which then hold exactly the state latched at the end
-        # of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses 3, 2, 1 cycles ago).
+        # of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses 3, 2, 1 cycles ago),
+        # except the trigger edge's own report in r: its order relative to the trigger
+        # is known (it is the trigger).
         snap_next = None
         if self.cap_stage == 2:
-            ordb = [[int(self.hist[0][i][e] or self.hist[1][i][e] or self.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
+            ordb = [[int(self.hist[0][i][e] or (self.hist[1][i][e] and (i, e) != self.trig_pend)
+                         or self.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
             snap_next = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
                          "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb}
         hit = was_running and trig_before is not None and pulses[trig_before[0]][trig_before[1]]
@@ -309,6 +313,7 @@ class Model:
                 lost_now = 1
             else:
                 new_pending = 1
+                self.trig_pend = trig_before
         if snap_next is not None:
             self.snap = snap_next
             self.epoch = (self.epoch + 1) & 3

@@ -33,6 +33,10 @@ formal/uart/
 formal/verdict/
 formal/verdict_*/
 
+# engine formal runs
+formal/engine/
+formal/engine_*/
+
 # formal counterexamples kept as documented results
 !docs/results/*.vcd
 

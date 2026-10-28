@@ -19,7 +19,7 @@ def test_engine():
     build_dir = HERE / "sim_build"
     runner = get_runner(os.getenv("SIM", "icarus"))
     runner.build(
-        sources=[SRC / f for f in ("edge_ts.v", "verdict.v", "engine.v", "engine_sys.v")] + [HERE / "hdl" / "engine_tb.v"],
+        sources=[SRC / f for f in ("edge_ts.v", "verdict.v", "snapshot.v", "engine.v", "engine_sys.v")] + [HERE / "hdl" / "engine_tb.v"],
         hdl_toplevel="engine_tb",
         build_dir=build_dir,
         timescale=("1ns", "1ps"),

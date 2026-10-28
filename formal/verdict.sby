@@ -11,6 +11,12 @@
 #   glitch            negative control: levels may last a single tick (no hold
 #                     precondition). EXPECTED TO FAIL: a pulse can vanish between
 #                     two samples. Counterexample in docs/results/.
+#   comb              the verdict block alone (verdict_comb.sv): the two-sided rule is
+#                     sound for every m, n_lo, inexact, is_max when |m - T| < 2 cycles
+#   comb_cover        every verdict reachable in that theorem, with inexact bounds
+#   comb_onesided     negative control: the block sees only the rounded-down bound.
+#                     EXPECTED TO FAIL (two-sided rounding is needed)
+#   comb_u1           negative control: u = 1. EXPECTED TO FAIL
 [tasks]
 bmc4
 glitch
@@ -20,6 +26,10 @@ cover4
 u1
 sharp4
 sharp8
+comb
+comb_cover
+comb_onesided
+comb_u1
 
 [options]
 multiclock on
@@ -41,6 +51,16 @@ sharp4: mode prove
 sharp4: depth 40
 sharp8: mode prove
 sharp8: depth 80
+comb: mode prove
+comb: depth 1
+comb_cover: mode cover
+comb_cover: depth 1
+comb_onesided: mode bmc
+comb_onesided: depth 1
+comb_onesided: expect fail
+comb_u1: mode bmc
+comb_u1: depth 1
+comb_u1: expect fail
 
 [engines]
 glitch: smtbmc yices
@@ -51,10 +71,21 @@ sharp8: smtbmc yices
 bmc4: smtbmc yices
 cover4: smtbmc yices
 u1: smtbmc yices
+comb: smtbmc bitwuzla
+comb_cover: smtbmc bitwuzla
+comb_onesided: smtbmc bitwuzla
+comb_u1: smtbmc bitwuzla
 
 [script]
 read_verilog -formal -DFORMAL edge_ts.v
+read_verilog -formal -DFORMAL snapshot.v
 read_verilog -formal verdict.v
+comb:          read_verilog -formal -sv verdict_comb.sv
+comb_cover:    read_verilog -formal -sv verdict_comb.sv
+comb_onesided: read_verilog -formal -sv verdict_comb.sv
+comb_u1:       read_verilog -formal -sv verdict_comb.sv
+comb_onesided: chparam -set ONESIDED 1 verdict_comb
+comb_u1:       chparam -set U_CYC 1 verdict_comb
 glitch: read_verilog -formal -sv -DNO_INVARIANTS verdict_formal.sv
 bmc4:   read_verilog -formal -sv verdict_formal.sv
 prove4: read_verilog -formal -sv verdict_formal.sv
@@ -68,9 +99,22 @@ u1:     chparam -set U_CYC 1 verdict_formal
 glitch: chparam -set HOLD 1 verdict_formal
 sharp4: chparam -set SHARP 1 verdict_formal
 sharp8: chparam -set SHARP 1 -set K_W 3 verdict_formal
-prep -top verdict_formal
+comb:          prep -top verdict_comb
+comb_cover:    prep -top verdict_comb
+comb_onesided: prep -top verdict_comb
+comb_u1:       prep -top verdict_comb
+bmc4:   prep -top verdict_formal
+glitch: prep -top verdict_formal
+prove4: prep -top verdict_formal
+prove8: prep -top verdict_formal
+cover4: prep -top verdict_formal
+u1:     prep -top verdict_formal
+sharp4: prep -top verdict_formal
+sharp8: prep -top verdict_formal
 
 [files]
 ../src/edge_ts.v
+../src/snapshot.v
 ../src/verdict.v
 verdict_formal.sv
+verdict_comb.sv
