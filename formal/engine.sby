@@ -7,8 +7,10 @@
 #                after SET/SHO to owned pins, image/config writes only while halted,
 #                no issue without a passed RUN check, JUDGE inputs, LOST, HALT
 #                releases open-drain pins (k-induction, unbounded)
-#   cover        the interesting cases of those are reachable (starts running:
-#                ENGINE_FORMAL_START_RUNNING skips the 106-cycle RUN check)
+#   cover        the interesting cases of those are reachable. Starts in the
+#                post-RUN state (ENGINE_FORMAL_START_RUNNING) instead of a 106-cycle
+#                RUN check: claims constrained valid, and the first cycle must
+#                satisfy f_post_run, the predicate `prove` asserts after every real RUN
 #   snap         snapshot alone, every input free: capture == edge_ts state as of
 #                the end of r+1, visible in r+3; ORD exactly r-1..r+1 except the
 #                trigger edge; constant while S; lost triggers (k-induction)

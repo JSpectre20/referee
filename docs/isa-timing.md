@@ -399,9 +399,13 @@ This removes the harness condition used by the merged cross-interval proof (A16)
 | Combinational theorem, engine parameters (M_W 16, FRAC_W 4, N_W 20, sharp) | `formal/verdict_comb.sv` | `verdict.sby`: comb, comb_cover; comb_onesided (rounded-down bound only) and comb_u1 must FAIL |
 | Engine properties 1-10 above, every input free, arbitrary image | `src/engine.v`, `src/engine_sys.v` (`FORMAL`) | `engine.sby`: prove (unbounded), cover; tie_timeout (timeout wins a tie) must FAIL |
 
-The cover and tie_timeout tasks start the engine running (define `ENGINE_FORMAL_START_RUNNING`)
-so that they don't spend ~106 cycles in a RUN check with an arbitrary image; `prove` doesn't
-use it and goes through the real check.
+The cover and tie_timeout tasks start the engine in the post-RUN state (define
+`ENGINE_FORMAL_START_RUNNING`) so that they don't spend ~106 cycles in a RUN check with an
+arbitrary image. That start is pinned to the real one: one predicate, `f_post_run` in
+`src/engine.v` (pc 0; registers, flags, tags, trigger, sticky bits 0; DL = TO = NOW; no
+snapshot or pending capture; valid pin claims), is asserted by `prove` in the cycle after every
+real RUN, and by the fast-start tasks in their first cycle (claims constrained valid). `prove`
+itself never uses the fast start.
 
 **Theorem (verdict block alone, combinational):** for every m, n_lo, inexact, is_max and every
 true interval T with |m - T| < u, PASS ⇒ T meets the true bound and VIOLATION ⇒ T breaks it.

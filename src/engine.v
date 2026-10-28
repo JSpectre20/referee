@@ -340,6 +340,9 @@ module engine (
   wire start = check_ok;
   assign et_clear_missed = start;
 
+`ifdef FORMAL
+  wire [1:0] f_snap_stage;
+`endif
   snapshot #(
       .N(4), .CH_W(2), .TS_W(16)
   ) u_snap (
@@ -352,7 +355,7 @@ module engine (
       .sn_rts(sn_rts), .sn_fts(sn_fts), .sn_rstale(sn_rstale), .sn_fstale(sn_fstale),
       .sn_missed(sn_missed), .sn_last(sn_last), .sn_ord_r(sn_ord_r), .sn_ord_f(sn_ord_f)
 `ifdef FORMAL
-      , .f_cap_stage(), .f_tm_r(), .f_tm_f()
+      , .f_cap_stage(f_snap_stage), .f_tm_r(), .f_tm_f()
 `endif
   );
 
@@ -362,8 +365,10 @@ module engine (
     if (!rst_n) begin
 `ifdef ENGINE_FORMAL_START_RUNNING
       // Formal reachability tasks only (formal/engine.sby `cover`, `tie_timeout`):
-      // come out of reset running, instead of spending ~106 cycles in a RUN check
-      // with an arbitrary image. The unbounded `prove` task does not use this.
+      // come out of reset in exactly the state a successful RUN leaves
+      // (f_post_run below, which `prove` checks against the real RUN path),
+      // instead of spending ~106 cycles in a RUN check with an arbitrary image.
+      // The unbounded `prove` task does not use this.
       st <= ST_RUN;
 `else
       st <= ST_HALTED;
@@ -595,6 +600,22 @@ module engine (
   always @(posedge clk) f_cyc <= !rst_n ? 3'd0 : (&f_cyc ? f_cyc : f_cyc + 3'd1);
   wire f_ok = rst_n && f_cyc != 3'd0;  // this cycle and the last were out of reset
 
+  // The state a successful RUN leaves, in the cycle of the first issue
+  // (docs/isa-timing.md 0b, diff 2): running at pc 0; X, Y, SR, RC, flags,
+  // tags, trigger, sticky bits 0; DL = TO = NOW; no snapshot, epoch 0, no
+  // capture pending; every claimed pin owned in a driving
+  // mode. (LOST, stats, FIFO contents and pin values are kept from before the
+  // RUN, so their reset values are one valid case of "before".)
+  wire f_post_run = running && pc == 6'd0 && X == 16'd0 && Y == 16'd0 && SR == 16'd0 && RC == 8'd0 &&
+      DL == now && TO == now && {T, C, E, wd_stall} == 4'd0 && {FX, OX, FY, OY} == 4'd0 &&
+      EX == 2'd0 && EY == 2'd0 && {trig_en, trig_e} == 2'b00 && trig_ch == 2'd0 && !lost_since &&
+      {out_ovf, vf_ovf, in_underrun, pin_fault, crc_fail} == 5'd0 &&
+      !S && !valid && epoch == 2'd0 && f_snap_stage == 2'd0 &&
+      sn_rts == 64'd0 && sn_fts == 64'd0 &&
+      {sn_rstale, sn_fstale, sn_missed, sn_last, sn_ord_r, sn_ord_f} == 24'd0 && claims_ok;
+  // (Not in it: the CRC registers. They are host-readable only, never steer
+  //  execution, and the host may write a new expected CRC in the start cycle.)
+
   wire f_wait = (op == OP_WAITD) || (op == OP_WAITP) || (op == OP_WAITS);
   wire f_halting_now = (issue && op == OP_HALT) || (h_halt && running);
   // the pc a non-waiting instruction hands over to
@@ -664,6 +685,9 @@ module engine (
         assert ($past(crc_got_g) == $past(g_crc_exp) && $past(crc_e_next) == $past(crc_exp_e) && $past(claims_ok));
       end
 
+      // -- RUN start state: the cycle after a successful check is f_post_run
+      if ($past(start)) assert (f_post_run);
+
       // -- 9. LOST counts exactly the triggers that arrive while a snapshot is
       //       held or pending, saturating; only the host clears it
       if ($past(h_lost_clear)) assert (lost == 8'd0);
@@ -679,6 +703,19 @@ module engine (
       assert (!(v_pass && v_viol));
     end
   end
+
+`ifdef ENGINE_FORMAL_START_RUNNING
+  // Fast start = exactly the post-RUN state: in the first cycle out of reset
+  // the claimed-pin mask (no reset: arbitrary) is constrained to be valid, as
+  // the RUN check would require, and the whole state must then be f_post_run,
+  // the same predicate `prove` asserts after every real RUN.
+  always @(posedge clk) begin
+    if (rst_n && f_cyc == 3'd0) begin
+      assume (claims_ok);
+      assert (f_post_run);
+    end
+  end
+`endif
 
   // non-vacuity: the interesting cases are reachable
   always @(posedge clk) begin
