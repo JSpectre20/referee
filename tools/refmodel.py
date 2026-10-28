@@ -133,11 +133,11 @@ class Model:
         self.S = 0
         self.valid = 0
         self.epoch = 0
-        self.cap_pending = 0
+        self.cap_stage = 0  # 0 idle, 1 = trigger was last cycle, 2 = capture this cycle
         self.trig = None  # (ch, e)
         self.lost_since = 0
         self.snap = None
-        self.hist = [[[0, 0] for _ in range(4)] for _ in range(2)]  # pulses at c-1, c-2
+        self.hist = [[[0, 0] for _ in range(4)] for _ in range(3)]  # pulses at c-1, c-2, c-3
 
     # -- config decode ----------------------------------------------------
 
@@ -179,7 +179,7 @@ class Model:
     def run(self):
         if self.state != "halted":
             return False
-        self.state, self.check_idx = "check", -1  # the check starts next cycle
+        self.state, self.check_idx = "check", 0  # called after the RUN cycle: the check starts next cycle
         return True
 
     def halt(self):
@@ -205,6 +205,30 @@ class Model:
 
     def verdict_pop(self):
         return self.fifo_v.pop(0) if self.fifo_v else None
+
+    def stats_latch(self, slot):
+        st = self.stats[slot]
+        self.shadow = [st[0], st[1], st[2], (st[3] or 0) & M16, (st[4] or 0) & M16]
+
+    def stats_read(self, idx):
+        return getattr(self, "shadow", [0] * 5)[idx]
+
+    def stats_clear(self, slot):
+        self.stats[slot] = [0, 0, 0, None, None]
+
+    def lost_clear(self):
+        self.lost = 0
+
+    def status_clear(self):
+        for k in self.sticky:
+            self.sticky[k] = 0
+        self.crc_fail = 0
+
+    def status(self):
+        st = self.sticky
+        return (int(self.state == "check") << 7 | int(self.state == "running") << 6 | self.S << 5
+                | self.crc_fail << 4 | st["PIN_FAULT"] << 3 | st["IN_UNDERRUN"] << 2
+                | st["VERDICT_OVF"] << 1 | st["OUT_OVF"])
 
     # -- observable outputs -----------------------------------------------
 
@@ -251,6 +275,9 @@ class Model:
         clear_missed = False
         start_core = False
         rel = 0
+        # Registered state at the start of the cycle: an instruction issued in this
+        # cycle (trig, halt) only takes effect from the next one.
+        was_running, trig_before = self.state == "running", self.trig
         if self.state == "check":
             if self.check_idx >= 0:
                 if self.check_idx == CHECK_CYCLES - 1:
@@ -266,28 +293,29 @@ class Model:
         elif self.state == "running":
             rel = self._execute(now, in_now)
 
-        # snapshot logic (uses this cycle's pulses and the latched state at the end of it)
+        # Snapshot logic. A trigger reported in cycle r is captured in cycle r+2 from
+        # the edge_ts registers, which then hold exactly the state latched at the end
+        # of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses 3, 2, 1 cycles ago).
         snap_next = None
-        if self.cap_pending:
-            ts, stale, last, missed = ed.next_latched(now, pulses)
-            ordb = [[int(pulses[i][e] or self.hist[0][i][e] or self.hist[1][i][e]) for e in (0, 1)] for i in range(4)]
-            snap_next = {"ts": ts, "stale": stale, "last": last, "missed": missed, "ord": ordb}
-        hit = self.state == "running" and self.trig is not None and pulses[self.trig[0]][self.trig[1]]
+        if self.cap_stage == 2:
+            ordb = [[int(self.hist[0][i][e] or self.hist[1][i][e] or self.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
+            snap_next = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
+                         "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb}
+        hit = was_running and trig_before is not None and pulses[trig_before[0]][trig_before[1]]
         lost_now = 0
         new_pending = 0
         if hit:
-            if self.S or self.cap_pending:
+            if self.S or self.cap_stage:
                 lost_now = 1
             else:
                 new_pending = 1
         if snap_next is not None:
             self.snap = snap_next
             self.epoch = (self.epoch + 1) & 3
-            self.S, self.valid, self.cap_pending = 1, 1, 0
+            self.S, self.valid = 1, 1
         elif rel:
             self.S = 0
-        if new_pending:
-            self.cap_pending = 1
+        self.cap_stage = 1 if new_pending else (2 if self.cap_stage == 1 else 0)
         if lost_now:
             self.lost = min(self.lost + 1, 255)
             self.lost_since = 1
@@ -301,7 +329,7 @@ class Model:
             self.crc_fail = 0
             clear_missed = True
 
-        self.hist = [pulses, self.hist[0]]
+        self.hist = [pulses, self.hist[0], self.hist[1]]
         ed.commit(now, pulses, raw_ch, clear_missed)
         self.sync2, self.sync1 = list(self.sync1), raw_sync
         self.now = (now + 1) & M16

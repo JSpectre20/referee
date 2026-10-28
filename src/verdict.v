@@ -5,7 +5,7 @@
  * verdict: the referee's three-valued rule (PLAN.md 4.8), as hardware.
  *
  * Given an interval measured from edge timestamps (m, in clock cycles), a
- * timing bound from a protocol contract (n_fx, in fixed point: cycles with
+ * timing bound from a protocol contract (n_lo + inexact, in fixed point: cycles with
  * FRAC_W fractional bits, so a bound such as 600 ns = 24.0 cycles at 40 MHz,
  * or 62.4 cycles at 48 MHz to 1/16 cycle, is represented exactly enough),
  * and whether it is a minimum or a maximum bound, return:
@@ -15,7 +15,7 @@
  *   INDETERMINATE  the measurement can't tell (true interval within the
  *                  instrument's uncertainty of the bound)
  *
- * With U = the measurement uncertainty (U_FX, same fixed point as n_fx):
+ * With U = the measurement uncertainty (U_FX, same fixed point as n_lo):
  *   minimum bound  PASS if m - U >= n      VIOLATION if m + U <= n  (< n if SHARP = 0)
  *   maximum bound  PASS if m + U <= n      VIOLATION if m - U >= n  (> n if SHARP = 0)
  *   The sharper VIOLATION test (default) is sound because the measurement
@@ -35,13 +35,14 @@
 
 module verdict #(
     parameter integer M_W    = 16,              // width of m (signed cycles)
-    parameter integer FRAC_W = 4,               // fractional bits of n_fx and U_FX
-    parameter integer N_W    = M_W + FRAC_W,    // width of n_fx (unsigned)
+    parameter integer FRAC_W = 4,               // fractional bits of n_lo and U_FX
+    parameter integer N_W    = M_W + FRAC_W,    // width of n_lo (unsigned)
     parameter integer U_FX   = 2 << FRAC_W,     // uncertainty: 2 cycles
     parameter integer SHARP  = 1                // 1: VIOLATION also when m+U == n (min) / m-U == n (max); proved sound
 ) (
     input  wire signed [M_W-1:0] m,        // measured interval, cycles
-    input  wire        [N_W-1:0] n_fx,     // bound, cycles in fixed point
+    input  wire        [N_W-1:0] n_lo,     // bound in cycles, fixed point, rounded DOWN
+    input  wire                  inexact,  // 1: the true bound is above n_lo (n_hi = n_lo + 1 LSB)
     input  wire                  is_max,   // 0: minimum bound, 1: maximum bound
     input  wire                  invalid,  // stale timestamp or `missed` pin: force INDETERMINATE
     output wire                  pass,
@@ -54,14 +55,18 @@ module verdict #(
 
   wire signed [W-1:0] mk = $signed({{(W - M_W - FRAC_W) {m[M_W-1]}}, m, {FRAC_W{1'b0}}});
   wire signed [W-1:0] u = U_FX[W-1:0];
-  wire signed [W-1:0] n = $signed({{(W - N_W) {1'b0}}, n_fx});
+  // Two-sided rounding (docs/isa-timing.md section 6): PASS is tested against the
+  // rounded-up bound n_hi, VIOLATION against the rounded-down n_lo, so both stay
+  // sound whichever way the ns -> cycles conversion rounded.
+  wire signed [W-1:0] n = $signed({{(W - N_W) {1'b0}}, n_lo});
+  wire signed [W-1:0] nh = n + $signed({{(W - 1) {1'b0}}, inexact});
   wire signed [W-1:0] lo = mk - u;  // the true interval is above this
   wire signed [W-1:0] hi = mk + u;  // ... and below this
 
-  wire min_pass = (lo >= n);
+  wire min_pass = (lo >= nh);
   wire min_viol = (SHARP != 0) ? (hi <= n) : (hi < n);
   wire max_pass = (hi <= n);
-  wire max_viol = (SHARP != 0) ? (lo >= n) : (lo > n);
+  wire max_viol = (SHARP != 0) ? (lo >= nh) : (lo > nh);
 
   assign pass      = !invalid && (is_max ? max_pass : min_pass);
   assign violation = !invalid && (is_max ? max_viol : min_viol);

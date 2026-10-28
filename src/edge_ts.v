@@ -78,7 +78,8 @@ module edge_ts #(
     output reg  [     N-1:0] toggled,
     output reg  [     N-1:0] rise_stale,  // rise_ts[i] is not a usable reference (see below)
     output reg  [     N-1:0] fall_stale,
-    output reg  [     N-1:0] missed       // sticky: edges on pin i may have been missed
+    output reg  [     N-1:0] missed,      // sticky: edges on pin i may have been missed
+    output reg  [     N-1:0] last_fall    // 1: the last edge latched on pin i was a fall
 `ifdef FORMAL
     // Internal state, visible only to the formal harness (inductive invariants).
     ,
@@ -138,6 +139,7 @@ module edge_ts #(
           rise_stale[i]         <= 1'b1;  // nothing latched yet
           fall_stale[i]         <= 1'b1;
           missed[i]             <= 1'b0;
+          last_fall[i]          <= 1'b0;
         end else begin
           if (rise[i]) rise_ts[i*TS_W+:TS_W] <= now;
 `ifdef EDGE_TS_MUTANT_FALL_LATE
@@ -155,6 +157,10 @@ module edge_ts #(
           else if (now - rise_ts[i*TS_W+:TS_W] == QUARTER) rise_stale[i] <= 1'b1;
           if (fall[i]) fall_stale[i] <= 1'b0;
           else if (now - fall_ts[i*TS_W+:TS_W] == QUARTER) fall_stale[i] <= 1'b1;
+
+          // Which edge came last (for `tsget ..., last`).
+          if (rise[i]) last_fall[i] <= 1'b0;
+          if (fall[i]) last_fall[i] <= 1'b1;
 
           // Two transitions in the synchronizer at once (s1 != s2 != s3).
           missed[i] <= (missed[i] & ~clear[i]) | (armed & (s1[i] ^ s2[i]) & (s2[i] ^ s3[i]));

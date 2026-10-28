@@ -127,7 +127,7 @@ def gen_python(d, fields, reserved, instrs):
 
 
 def gen_verilog(d, fields, instrs):
-    out = [V_BEGIN]
+    out = [V_BEGIN, "  /* verilator lint_off UNUSEDPARAM */"]
     for i in instrs:
         out.append(f"  localparam [4:0] OP_{i['name']:<6} = 5'h{i['opcode']:02x};")
     for k, (hi, lo) in fields.items():
@@ -136,6 +136,7 @@ def gen_verilog(d, fields, instrs):
         width = max(1, max(vals.values()).bit_length())
         for name, v in vals.items():
             out.append(f"  localparam [{width - 1}:0] {enum.upper()}_{name.upper()} = {width}'d{v};")
+    out.append("  /* verilator lint_on UNUSEDPARAM */")
     out.append(V_END)
     return "\n".join(out)
 

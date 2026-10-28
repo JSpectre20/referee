@@ -168,12 +168,12 @@ module verdict_formal #(
   verdict #(
       .M_W(TS_W), .FRAC_W(K_W), .N_W(N_W), .U_FX(U_CYC * K), .SHARP(SHARP)
   ) v_pulse (
-      .m(m_pulse), .n_fx(n_pulse), .is_max(max_pulse), .invalid(inv_p), .pass(pass_p), .violation(viol_p)
+      .m(m_pulse), .n_lo(n_pulse), .inexact(1'b0), .is_max(max_pulse), .invalid(inv_p), .pass(pass_p), .violation(viol_p)
   );
   verdict #(
       .M_W(TS_W), .FRAC_W(K_W), .N_W(N_W), .U_FX(U_CYC * K), .SHARP(SHARP)
   ) v_cross (
-      .m(m_cross), .n_fx(n_cross), .is_max(max_cross), .invalid(inv_x), .pass(pass_x), .violation(viol_x)
+      .m(m_cross), .n_lo(n_cross), .inexact(1'b0), .is_max(max_cross), .invalid(inv_x), .pass(pass_x), .violation(viol_x)
   );
 
   wire judge_p = rst_n && fall[0] && !pend_r0;
