@@ -13,7 +13,7 @@ module edge_ts_tb;
   reg  [15:0] now = 16'd0;
   always @(posedge clk) now <= now + 16'd1;
 
-  wire [ 1:0] level, rise, fall, toggled;
+  wire [ 1:0] level, rise, fall, toggled, rise_stale, fall_stale, missed;
   wire [31:0] rise_ts, fall_ts;
 
   edge_ts #(
@@ -21,6 +21,7 @@ module edge_ts_tb;
   ) dut (
       .clk(clk), .rst_n(rst_n), .pins(pins), .now(now), .clear(clear),
       .level(level), .rise(rise), .fall(fall),
-      .rise_ts(rise_ts), .fall_ts(fall_ts), .toggled(toggled)
+      .rise_ts(rise_ts), .fall_ts(fall_ts), .toggled(toggled),
+      .rise_stale(rise_stale), .fall_stale(fall_stale), .missed(missed)
   );
 endmodule
