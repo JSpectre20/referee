@@ -35,3 +35,8 @@ formal/verdict_*/
 
 # formal counterexamples kept as documented results
 !docs/results/*.vcd
+
+# engine tests
+test/engine/sim_build
+test/tools/__pycache__
+tools/__pycache__

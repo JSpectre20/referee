@@ -186,6 +186,22 @@ fields:
   e:    {bits: [3, 2],  doc: "0: rising edge, 1: falling edge, 2: last edge (whichever was latched later), 3: reserved"}
   b:    {bits: [3, 0],  doc: "bounds-table entry 0..15 (stats for 0..3)"}
 
+enums:             # operand keywords (structured form of the field docs above)
+  c:    {T: 0, nT: 1, C: 2, nC: 3, E: 4, nE: 5, S: 6, nS: 7}
+  e:    {rise: 0, fall: 1, last: 2}
+  r:    {X: 0, Y: 1}
+  push: {all: 0, nonpass: 1, none: 2}
+flags_kw: [msb, hi, raw, x16]   # 1-bit operands written as a bare keyword: `sho 0, msb`
+aliases:           # assembler aliases for BR
+  jt: T
+  jnt: nT
+  jc: C
+  jnc: nC
+  je: E
+  jne: nE
+  js: S
+  jns: nS
+
 reserved_opcodes:
   0x18: "v1 bitstream unit (LFSR CRC/parity tapping SHO/SHI bits)"
   0x19: "v1 bitstream unit"

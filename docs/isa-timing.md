@@ -147,37 +147,40 @@ as numbers, and keeps the **assumption ledger** (§11).
 
 ## 4. Instruction set
 
-Generated from `isa.yaml` in step 2; hand-written here for review. Opcode in [15:11]; 24 used,
+Generated from `isa.yaml` by `tools/isagen.py` (do not edit the table by hand). Opcode in [15:11]; 24 used,
 4 reserved, 4 free.
 
 Opcodes 0x18..0x1B are reserved for the v1 bitstream unit; 0x1C..0x1F are free.
 
+<!-- BEGIN GENERATED instruction table (tools/isagen.py) -->
 | Opcode | Syntax | Cycles | Effect |
 | --- | --- | --- | --- |
-| 0x00 | `nop` | 1 | - |
-| 0x01 | `halt` | 1 | stop; open-drain pins released |
-| 0x02 | `set p, v` | 1 | owned output pin p ← v (pad at t+1); open-drain: 1 releases |
-| 0x03 | `sho p[, msb]` | 1 | pin p ← SR[0] or SR[15]; SR shifts, refills with 1 |
-| 0x04 | `shi q[, msb]` | 1 | C ← in[q]; SR shifts it in |
-| 0x05 | `tstp q` | 1 | C ← in[q] |
-| 0x06 | `mark` | 1 | DL ← NOW |
-| 0x07 | `tmo t[, x16]` | 1 | TO ← DL + t (×16) |
-| 0x08 | `waitd n` | ≥ 1 | DL ← DL + n; next issues at max(t+1, DL) |
-| 0x09 | `waitp q, v` | ≥ 1 | until in[q] == v (T ← 0) or TO (T ← 1); event wins a tie |
-| 0x0A | `waits` | ≥ 1 | until a snapshot is pending (T ← 0) or TO (T ← 1) |
-| 0x0B | `jmp a` | 1 | pc ← a |
-| 0x0C | `br c, a` | 1 | if T / !T / C / !C / E / !E / S / !S: pc ← a (aliases `jt` … `jns`) |
-| 0x0D | `loop a` | 1 | if RC != 0: RC--, pc ← a |
-| 0x0E | `ldrc imm` | 1 | RC ← imm |
-| 0x0F | `ldsr imm[, hi]` | 1 | SR byte ← imm |
-| 0x10 | `pull[ hi]` | 1 | SR byte ← IN, E ← 0; E ← 1 if empty |
-| 0x11 | `push[ hi]` | 1 | OUT ← SR byte (dropped if full) |
-| 0x12 | `trig ch, e` | 1 | this engine's snapshot trigger ← channel ch, rise/fall |
-| 0x13 | `rel` | 1 | S ← 0 |
-| 0x14 | `tsget r, ch, e` | 1 | X/Y ← snapshot timestamp (rise / fall / last) + tags F, O, E |
-| 0x15 | `judge b[, raw][, push]` | 1 | verdict(Y - X, bounds[b]) → stats, VERDICT FIFO per push mode |
-| 0x16 | `tmon t[, x16]` | 1 | TO ← NOW + t (×16) |
-| 0x17 | `cmp imm[, hi]` | 1 | C ← (SR byte == imm) |
+| 0x00 | `nop` | 1 | nothing |
+| 0x01 | `halt` | 1 | stop. Push-pull pins keep their level; open-drain pins are RELEASED (a held-low SDA would hang the bus). |
+| 0x02 | `set p, v` | 1 | pin p <- v if this engine owns p (else no effect, PIN_FAULT). Push-pull: drive v. Open-drain: v=0 drives low, v=1 releases. |
+| 0x03 | `sho p[, msb]` | 1 | pin p <- msb ? SR[15] : SR[0] (ownership as SET); SR shifts that bit out, refilling with 1 |
+| 0x04 | `shi q[, msb]` | 1 | C <- in[q]; SR <- msb ? {SR[14:0], in[q]} : {in[q], SR[15:1]} |
+| 0x05 | `tstp q` | 1 | C <- in[q] |
+| 0x06 | `mark` | 1 | DL <- NOW |
+| 0x07 | `tmo t[, x16]` | 1 | TO <- DL + t * (x16 ? 16 : 1) (timeout relative to the schedule) |
+| 0x08 | `waitd n` | ≥ 1 (waits) | DL <- DL + n; the next instruction issues at max(t + 1, DL) |
+| 0x09 | `waitp q, v` | ≥ 1 (waits) | until in[q] == v (T <- 0) or NOW - TO >= 0 (T <- 1); pin event wins a tie; DL and TO unchanged |
+| 0x0a | `waits` | ≥ 1 (waits) | until S (T <- 0) or NOW - TO >= 0 (T <- 1); snapshot wins a tie; DL and TO unchanged |
+| 0x0b | `jmp a` | 1 | pc <- a |
+| 0x0c | `br c, a` | 1 | if condition c: pc <- a. Aliases: jt jnt jc jnc je jne js jns |
+| 0x0d | `loop a` | 1 | if RC != 0: RC <- RC - 1, pc <- a; else fall through |
+| 0x0e | `ldrc imm` | 1 | RC <- imm |
+| 0x0f | `ldsr imm[, hi]` | 1 | SR[7:0] (or SR[15:8]) <- imm |
+| 0x10 | `pull[ hi]` | 1 | if IN non-empty: SR byte <- IN, E <- 0; else E <- 1, SR unchanged, IN_UNDERRUN <- 1. Never stalls. |
+| 0x11 | `push[ hi]` | 1 | OUT <- SR byte; never stalls; full -> drop, OUT_OVF <- 1 |
+| 0x12 | `trig ch, e` | 1 | this engine's snapshot trigger <- channel ch, edge e (rise or fall) |
+| 0x13 | `rel` | 1 | S <- 0 (release the snapshot; the next trigger may replace it) |
+| 0x14 | `tsget r, ch, e` | 1 | r <- snapshot timestamp of channel ch, edge e (rise, fall or last); F(r) <- its stale \| missed \| !valid; O(r) <- its ORD bit; E(r) <- snapshot epoch |
+| 0x15 | `judge b[, raw][, push]` | 1 | m <- Y - X; v <- verdict(m, bounds[b], invalid = FX \| FY \| OX \| OY \| (EX != EY)); update stats[b] if b < 4; push per mode (all / nonpass / none), header (+ m if raw), all or nothing; clear lost_since_verdict |
+| 0x16 | `tmon t[, x16]` | 1 | TO <- NOW + t * (x16 ? 16 : 1) (timeout relative to now, e.g. after an input-paced wait) |
+| 0x17 | `cmp imm[, hi]` | 1 | C <- (SR[7:0] (or SR[15:8]) == imm) |
+| 0x18..0x1b | reserved | - | v1 bitstream unit (LFSR CRC/parity tapping SHO/SHI bits) |
+<!-- END GENERATED instruction table -->
 
 Output pins `p`: 0-7 = uio[0..7], 8-14 = uo_out[0,1,2,3,5,6,7]. Input pins `q`: 0-7 =
 uio_in[0..7], 8-11 = ui_in[0..3], 12-15 = judge channels 0-3.
