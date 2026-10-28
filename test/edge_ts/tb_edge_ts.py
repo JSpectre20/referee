@@ -12,7 +12,7 @@ latency in (1, 2] cycles and interval error below 1 cycle. The formal proof
 import random
 
 import cocotb
-from cocotb.triggers import FallingEdge, RisingEdge, Timer
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, Timer
 from cocotb.utils import get_sim_time
 
 PERIOD_PS = 25_000  # 40 MHz, set in hdl/edge_ts_tb.v
@@ -181,3 +181,94 @@ async def edge_beats_clear(dut):
     await FallingEdge(dut.clk)
     dut.clear.value = 0
     assert int(dut.toggled.value) == 0b10
+
+
+# -----------------------------------------------------------------------------
+# Flags: stale timestamps and missed edges
+# -----------------------------------------------------------------------------
+
+QUARTER = 1 << 14  # 2**(TS_W-2) with TS_W = 16
+
+
+async def settle(dut, cycles=6):
+    """Get past the 3-cycle warm-up after reset."""
+    for _ in range(cycles):
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def stale_out_of_reset_and_after_a_quarter_range(dut):
+    """Timestamps are stale until an edge is latched, fresh after it, stale again QUARTER cycles later."""
+    await reset(dut)
+    await settle(dut)
+    assert int(dut.rise_stale.value) == 0b11 and int(dut.fall_stale.value) == 0b11, "nothing latched yet"
+
+    dut.pins.value = 0b01
+    await wait_pulse(dut, dut.rise, 0b01)
+    ts = int(dut.now.value)
+    await FallingEdge(dut.clk)
+    assert int(dut.rise_stale.value) & 1 == 0, "fresh right after the rise is latched"
+    assert int(dut.fall_stale.value) & 1 == 1, "no fall latched yet"
+
+    # Age = now - ts. The flag must still be clear at age QUARTER and set from QUARTER + 1.
+    await ClockCycles(dut.clk, QUARTER - 2)
+    while (int(dut.now.value) - ts) % (1 << 16) != QUARTER:
+        await FallingEdge(dut.clk)
+    assert int(dut.rise_stale.value) & 1 == 0, "age QUARTER: still fresh"
+    await FallingEdge(dut.clk)
+    assert int(dut.rise_stale.value) & 1 == 1, "age QUARTER + 1: stale"
+
+    dut.pins.value = 0b00  # a new edge (the fall) clears fall_stale, not rise_stale
+    await wait_pulse(dut, dut.fall, 0b01)
+    await FallingEdge(dut.clk)
+    assert int(dut.fall_stale.value) & 1 == 0 and int(dut.rise_stale.value) & 1 == 1
+
+
+@cocotb.test()
+async def missed_set_by_a_one_sample_level(dut):
+    """A level that lasts exactly one sample period puts two transitions in the synchronizer: missed."""
+    await reset(dut)
+    await settle(dut)
+    # Mid-cycle (falling clock edge) to mid-cycle: sampled high at exactly one rising edge.
+    dut.pins.value = 0b01
+    await FallingEdge(dut.clk)
+    dut.pins.value = 0b00
+    for _ in range(6):
+        await FallingEdge(dut.clk)
+    assert int(dut.missed.value) == 0b01, f"missed = {int(dut.missed.value):#04b}"
+
+    # Sticky until cleared; a clear removes it.
+    for _ in range(10):
+        await FallingEdge(dut.clk)
+    assert int(dut.missed.value) == 0b01, "missed is sticky"
+    dut.clear.value = 0b01
+    await FallingEdge(dut.clk)
+    dut.clear.value = 0
+    assert int(dut.missed.value) == 0b00
+
+
+@cocotb.test()
+async def missed_not_set_by_legal_pulses(dut):
+    """Pulses that respect the 4-cycle hold, at any sub-cycle offset, never set missed."""
+    rng = random.Random(99)
+    await reset(dut)
+    await settle(dut)
+    log = []
+    await drive_pin(dut, 0, 200, rng, log)  # holds >= 4 cycles + a random fraction
+    await Timer(10 * PERIOD_PS, unit="ps")
+    assert int(dut.missed.value) == 0
+
+
+@cocotb.test()
+async def pulse_between_samples_is_invisible(dut):
+    """The documented limit: a 5 ns pulse between two clock edges leaves no trace at all."""
+    await reset(dut)
+    await settle(dut)
+    await FallingEdge(dut.clk)  # mid-cycle: the next sample is 12.5 ns away
+    dut.pins.value = 0b01
+    await Timer(5_000, unit="ps")
+    dut.pins.value = 0b00
+    for _ in range(8):
+        await FallingEdge(dut.clk)
+        assert int(dut.rise.value) == 0 and int(dut.fall.value) == 0
+    assert int(dut.missed.value) == 0 and int(dut.toggled.value) == 0, "nothing was sampled, so nothing can be flagged"
