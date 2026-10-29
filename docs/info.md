@@ -28,7 +28,7 @@ This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
   open-drain). Each image carries a CRC, and RUN refuses an image that fails its CRC or
   claims a pin it doesn't own.
 - **A UART host port** on the standard Tiny Tapeout UART pins: 115200 8N1 at power-up, and up
-  to clock / 20 on command (2 Mbaud at 40 MHz). Commands are 4 bytes. Each reply is ACK (0x06) or NAK (0x15), then a
+  to clock / 20 on command (3 Mbaud at 60 MHz). Commands are 4 bytes. Each reply is ACK (0x06) or NAK (0x15), then a
   data byte; the verdict drain sends more.
 
 | Command | Bytes | Effect |
@@ -43,7 +43,7 @@ This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
 | Verdict drain | `44 00 max 00` | reply `06 n`, then n 16-bit slots, high byte first |
 | Stats latch / read / clear | `53 00 slot 00` / `73 00 idx part` / `5A 00 slot 00` | per bound slot 0..3: PASS, VIOLATION, INDETERMINATE counts, min and max m |
 | Lost triggers | `4C 00 op 00` | op 1 also clears |
-| Baud | `42 hi lo 00` | UART bit period in clock cycles (20 = 2 Mbaud at 40 MHz), after the reply |
+| Baud | `42 hi lo 00` | UART bit period in clock cycles (20 = 3 Mbaud at 60 MHz), after the reply |
 | Status | `51 00 sel 00` | sel 0: {running, S, CRC_FAIL, PIN_FAULT, IN_UNDERRUN, VERDICT_OVF, OUT_OVF, NI}, read-and-clear |
 
 Pins: `uio[0..7]` are engine pins 0..7 (input, push-pull or open-drain). `uo_out[0..3]` and
@@ -53,7 +53,7 @@ a RUN check has passed.
 
 ## How to test
 
-Set the project clock to 40 MHz (the clock in `info.yaml`; the power-up 115200 baud and the
+Set the project clock to 60 MHz (the clock in `info.yaml`; the power-up 115200 baud and the
 firmware timing depend on it). Connect a 3.3 V serial port at 115200 baud to `ui_in[3]`
 (chip RX) and `uo_out[4]` (chip TX); the demo board's microcontroller can act as the host.
 Then, from a PC:

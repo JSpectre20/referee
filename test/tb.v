@@ -5,7 +5,7 @@
 
    - The clock is generated here rather than from cocotb: with Icarus a
      cocotb-driven clock is many times slower, and these tests run real UART
-     traffic. It must be the clock in info.yaml (40 MHz until CP6): images are
+     traffic. It must be the clock in info.yaml (60 MHz): images are
      assembled for that clock (ledger A9), and test/test.py checks the period.
    - `host_rx` drives ui_in[3] (the chip's UART RX); `host_tx` is uo_out[4]
      (the chip's UART TX). The other ui_in bits come from `ui_in_pins`
@@ -29,7 +29,11 @@ module tb ();
   end
 
   reg clk = 1'b0;
-  always #12.5 clk = ~clk;  // 40 MHz
+  // 60 MHz: 16.667 ns, as 8.333 + 8.334 ns (1 ps resolution)
+  always begin
+    #8.333 clk = 1'b1;
+    #8.334 clk = 1'b0;
+  end
 
   reg rst_n;
   reg ena;

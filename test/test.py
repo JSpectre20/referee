@@ -5,10 +5,10 @@
 These tests touch only the chip's pins, so the same file runs on the RTL and
 on the gate-level netlist (make GATES=yes). The host's UART is cocotbext-uart,
 an independent model; the packets come from tools/referee_host.py, the same
-code that talks to real hardware. The clock is the one in info.yaml (40 MHz
-until CP6; `power_up_baud_matches_clock` checks the testbench and the chip
-agree with it). Every test's first packet, at the 115200 power-up rate, is the
-'B' command that switches the link to clock / 20 (2 Mbaud at 40 MHz), so
+code that talks to real hardware. The clock is the one in info.yaml (60 MHz;
+`power_up_baud_matches_clock` checks the testbench, the chip and the hardening
+flow agree with it). Every test's first packet, at the 115200 power-up rate, is the
+'B' command that switches the link to clock / 20 (3 Mbaud at 60 MHz), so
 loading a 105-word image takes ~3 ms of simulated time instead of ~90 ms and
 gl_test stays fast. `reset_state`, `power_up_baud_matches_clock`,
 `identify_and_fast_baud` and `resync_after_partial_packet` stay at 115200.
@@ -41,10 +41,16 @@ import referee_host as host  # noqa: E402
 from bus_models import I2CTarget, SPITarget  # noqa: E402
 
 CLOCK_HZ = host.CLOCK_HZ
-P_NS = 1e9 / CLOCK_HZ  # one chip cycle (25 ns at 40 MHz)
+# One chip cycle as the testbench makes it: the clock's period rounded to tb.v's 1 ps
+# resolution (16.667 ns at 60 MHz, as 8.333 + 8.334 ns), first rising edge at RISE0_NS.
+# Timing in the tests uses these, not 1e9 / CLOCK_HZ: at 60 MHz the 0.3 ps difference
+# adds up to ~80 ns over 4 ms of simulation, and the oracle's late-sample events aim
+# within 1 ns of a clock edge.
+P_NS = round(1e12 / CLOCK_HZ) / 1000
+RISE0_NS = (round(1e12 / CLOCK_HZ) // 2) / 1000
 U = 2  # the verdict rule's uncertainty, cycles
 BAUD = host.BAUD
-FAST_BAUD = CLOCK_HZ // host.FAST_DIV  # 2 Mbaud at 40 MHz
+FAST_BAUD = CLOCK_HZ // host.FAST_DIV  # 3 Mbaud at 60 MHz
 GL = os.environ.get("REFEREE_GL") == "1"  # gate-level: fewer events, skip timing-only tests
 FW = ROOT / "firmware" / "engine"
 
@@ -215,9 +221,11 @@ async def power_up_baud_matches_clock(dut):
     await RisingEdge(dut.clk)
     period_ps = get_sim_time("ps") - t1
     assert period_ps == round(1e12 / CLOCK_HZ), f"testbench clock {period_ps} ps, info.yaml says {CLOCK_HZ} Hz"
-    # ... and the hardening flow times that same clock (src/config.json CLOCK_PERIOD, in ns)
+    # ... and the hardening flow times that clock: src/config.json CLOCK_PERIOD (ns) may be a
+    # little tighter than the clock's period (never looser), within 1%
     sta_ns = json.loads((ROOT / "src" / "config.json").read_text())["CLOCK_PERIOD"]
-    assert abs(sta_ns - 1e9 / CLOCK_HZ) < 0.01, f"src/config.json CLOCK_PERIOD {sta_ns} ns, info.yaml says {CLOCK_HZ} Hz"
+    period_ns = 1e9 / CLOCK_HZ
+    assert 0.99 * period_ns <= sta_ns <= period_ns, f"src/config.json CLOCK_PERIOD {sta_ns} ns, info.yaml says {CLOCK_HZ} Hz"
     # The reply to identify starts 06 = start bit, then bits 0, 1, 1, ...: the start bit's
     # falling edge to the next rising edge is exactly 2 bit periods.
     await h.src.write(host.pkt_id())
@@ -403,8 +411,8 @@ async def referee_oracle(dut):
     # pin changes just after the clock edge that follows t. APERTURE is the window.
     APERTURE = 1.0  # ns, < P_NS / 4
 
-    def next_clock_edge(t):  # first rising edge at or after t (rising edges at P/2 + kP)
-        return P_NS / 2 + math.ceil((t - P_NS / 2) / P_NS - 1e-9) * P_NS
+    def next_clock_edge(t):  # first rising edge at or after t (rising edges at RISE0 + kP)
+        return RISE0_NS + math.ceil((t - RISE0_NS) / P_NS - 1e-9) * P_NS
 
     async def edge(t_true, late=False):
         if late:

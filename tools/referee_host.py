@@ -14,7 +14,7 @@ the command-line tool, so the two can't drift apart.
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
 
 The chip's UART starts at 115200 8N1 (ui_in[3] RX, uo_out[4] TX) at the project clock in
-info.yaml; `--fast` switches both ends to clock / 20 first (2 Mbaud at 40 MHz).
+info.yaml; `--fast` switches both ends to clock / 20 first (3 Mbaud at 60 MHz).
 """
 
 import argparse
@@ -38,7 +38,7 @@ def _clock_hz():
 CLOCK_HZ = _clock_hz()
 BAUD = 115200
 POWER_UP_DIV = round(CLOCK_HZ / BAUD)  # the chip's power-up bit period (src/project.v CLKS_PER_BIT)
-FAST_DIV = 20  # clock / 20: 2 Mbaud at 40 MHz, 3 Mbaud at 60 MHz
+FAST_DIV = 20  # clock / 20: 3 Mbaud at 60 MHz
 ENGINE_WORDS = refasm.IMAGE_WORDS  # 97
 GLOBAL_WORDS = refasm.GLOBAL_WORDS  # 8
 VERDICT = {0: "INDETERMINATE", 1: "PASS", 2: "VIOLATION", 3: "?"}

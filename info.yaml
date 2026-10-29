@@ -5,8 +5,9 @@ project:
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Programmable protocol emulator and bus referee"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     40000000       # Clock frequency in Hz. 40 MHz until engine v0 CP6 closes STA at 60 MHz;
-                               # then this, CLKS_PER_BIT in src/project.v and docs/info.md change together
+  clock_hz:     60000000       # Clock frequency in Hz. 60 MHz (STA closes at the slow corner, 29 Oct).
+                               # Changes only together with CLOCK_PERIOD in src/config.json,
+                               # CLKS_PER_BIT in src/project.v and docs/info.md (test/test.py checks)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "6x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
