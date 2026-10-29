@@ -12,7 +12,9 @@
  *   - the global config (8 words; written only while every engine is halted)
  *     and its decode: per output pin owner + mode
  *   - engine 0, and the pad drivers: push-pull drives the value; open-drain
- *     drives 0 or releases (oe = 0); unowned pins are not driven
+ *     drives 0 or releases (oe = 0); unowned pins are not driven, and NO pin
+ *     is driven before the first RUN since reset (every uio pin high-impedance,
+ *     the engine's uo_out bits 0), whatever the global config says
  *
  * Output pins: 0..7 = uio[0..7]; 8..14 = uo_out[0,1,2,3,5,6,7]. uo_out[4] is
  * the host UART TX and is never driven from here.
@@ -211,17 +213,34 @@ module engine_sys (
   // ---------------------------------------------------------------------------
   // Pads
   // ---------------------------------------------------------------------------
+  // Nothing is driven before the first RUN (docs/isa-timing.md 0b, diff 16):
+  // the host writes the global config while loading, before any image has
+  // passed its check, and a pin must not start driving a bus just because the
+  // config names an owner. `ran` is set by the first RUN start since reset and
+  // only a reset clears it; from then on the config's ownership applies (a
+  // halted engine keeps its push-pull levels, as the ISA says).
+  reg ran;
+  always @(posedge clk) begin
+`ifdef ENGINE_FORMAL_START_RUNNING
+    if (!rst_n) ran <= 1'b1;  // formal fast start = the state after a passed RUN
+`else
+    if (!rst_n) ran <= 1'b0;
+`endif
+    else if (et_clear_missed) ran <= 1'b1;  // et_clear_missed pulses exactly at a RUN start
+  end
+  wire [14:0] drive = ran ? owned : 15'd0;
+
   generate
     for (p = 0; p < 8; p = p + 1) begin : g_uio
       // push-pull: drive the value; open-drain: drive 0 when the value is 0, else release
-      assign uio_oe[p] = owned[p] && (pp_mode[p] || !out_val[p]);
-      assign uio_out[p] = owned[p] && pp_mode[p] && out_val[p];
+      assign uio_oe[p] = drive[p] && (pp_mode[p] || !out_val[p]);
+      assign uio_out[p] = drive[p] && pp_mode[p] && out_val[p];
     end
   endgenerate
   // pins 8..14 -> uo_out[0,1,2,3,5,6,7]
   assign uo_eng = {
-    owned[14] & out_val[14], owned[13] & out_val[13], owned[12] & out_val[12], 1'b0,
-    owned[11] & out_val[11], owned[10] & out_val[10], owned[9] & out_val[9], owned[8] & out_val[8]
+    drive[14] & out_val[14], drive[13] & out_val[13], drive[12] & out_val[12], 1'b0,
+    drive[11] & out_val[11], drive[10] & out_val[10], drive[9] & out_val[9], drive[8] & out_val[8]
   };
 
   wire _unused = &{1'b0, et_toggled, pp_mode[14:8], pin_nib[63:60]};  // pin 15 is reserved
@@ -265,6 +284,11 @@ module engine_sys (
       // an unowned pin is never driven, and uo_out[4] (host TX) never by the engine
       for (fp = 0; fp < 8; fp = fp + 1) if (!owned[fp]) assert (!uio_oe[fp] && !uio_out[fp]);
       assert (!uo_eng[4]);
+      // -- before the first RUN since reset nothing is driven at all, and only a
+      //    RUN start ends that
+      if (!ran) assert (uio_oe == 8'd0 && uio_out == 8'd0 && uo_eng == 8'd0);
+      if (ran && !$past(ran)) assert ($past(et_clear_missed));
+      if (running) assert (ran);
 
       // -- HALT releases open-drain pins: after a halt, no open-drain pin pulls low
       if ($past(f_halting))

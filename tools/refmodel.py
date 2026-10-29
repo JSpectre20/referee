@@ -124,6 +124,7 @@ class Model:
         self.lost = 0
         self.sticky = {"OUT_OVF": 0, "VERDICT_OVF": 0, "IN_UNDERRUN": 0, "PIN_FAULT": 0}
         self.out_val = [1] * 15
+        self.ran = 0  # a RUN has started since reset: before that no pin is driven
         self.j_pend = None  # a JUDGE issued last cycle: its cycle 2 runs at the start of this step
         self._popped_v = 0  # a host verdict pop happened before this step (frees room only next cycle)
         self._reset_core()
@@ -249,6 +250,8 @@ class Model:
     def pins(self):
         """-> (uio_out, uio_oe, uo_out_bits) driven by the engine."""
         uio_out = uio_oe = uo = 0
+        if not self.ran:  # nothing is driven before the first RUN since reset
+            return 0, 0, 0
         for p in range(8):
             owner, mode = self.pin_cfg(p)
             if owner == 1 and mode == 1:
@@ -346,6 +349,7 @@ class Model:
             self.lost_since = 1
 
         if start_core:
+            self.ran = 1
             self.state = "running"
             self._reset_core()
             self.DL = self.TO = (now + 1) & M16

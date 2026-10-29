@@ -162,6 +162,49 @@ async def reset_state(dut):
 
 
 @cocotb.test()
+async def no_pin_driven_before_first_run(dut):
+    """From reset until the first RUN check passes, nothing is driven: every uio pin is
+    high-impedance and uo_out is 0 except uo_out[4] (host TX, idle high), even after the
+    global config has given the engine push-pull and open-drain pins and while a RUN is
+    refused. The first successful RUN then drives exactly what the config grants."""
+    h = await start(dut)
+
+    def undriven(when):
+        assert int(dut.uio_oe.value) == 0x00, f"{when}: uio_oe = {int(dut.uio_oe.value):#04x}"
+        assert int(dut.uio_out.value) == 0x00, f"{when}: uio_out = {int(dut.uio_out.value):#04x}"
+        assert int(dut.uo_out.value) == 0x10, f"{when}: uo_out = {int(dut.uo_out.value):#04x}"
+
+    undriven("after reset")
+    # pin 0 = uio[0] push-pull, pin 1 = uio[1] open-drain, pin 8 = uo_out[0] push-pull
+    src = """
+        set  0, 1
+        set  1, 1
+        set  8, 1
+loop:   jmp  loop
+"""
+    glob, img, _ = host.build(src, {0: (1, 1), 1: (1, 2), 8: (1, 1)})
+    await h.load(glob, img)
+    undriven("config loaded, before RUN")
+    await h.must(host.pkt_crc(1, refasm_crc(img) ^ 1))  # a wrong expected CRC: RUN is refused
+    assert not await h.run(), "RUN with a bad CRC must be refused"
+    await ClockCycles(dut.clk, 20)
+    undriven("after a refused RUN")
+    await h.must(host.pkt_crc(1, refasm_crc(img)))
+    assert await h.run()
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_oe.value) == 0x01, "after RUN: uio[0] push-pull driven, uio[1] open-drain released"
+    assert int(dut.uio_out.value) == 0x01
+    assert int(dut.uo_out.value) == 0x11, "after RUN: uo_out[0] high, uo_out[4] host TX idle"
+    await h.must(host.pkt_run(False))
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_oe.value) == 0x01, "a halted engine keeps its push-pull levels (ISA 3.1)"
+
+
+def refasm_crc(words):
+    return host.refasm.crc16(words)
+
+
+@cocotb.test()
 async def power_up_baud_matches_clock(dut):
     """info.yaml's clock_hz, the testbench clock and the chip's power-up UART divisor agree:
     the chip answers at 115200 only if its divisor is round(clock_hz / 115200) for the clock
