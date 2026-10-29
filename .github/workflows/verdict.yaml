@@ -2,8 +2,16 @@
 # SymbiYosys at tick resolution, plus the combinational theorem on verdict.v alone.
 name: verdict
 
+# CI runs only at milestones (8 Nov gate, 13 Dec freeze, final): by hand (workflow_dispatch,
+# on any branch) or when a pull request to main is opened / marked ready. Day-to-day work
+# is verified locally (docs/local-flow.md). Not on every push: GitHub Actions minutes on a
+# private repo ran out in three days of push-triggered runs (28 Oct).
+
 on:
-  push:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
     paths:
       - "src/verdict.v"
       - "src/edge_ts.v"
@@ -12,7 +20,10 @@ on:
       - "formal/verdict_formal.sv"
       - "formal/verdict_comb.sv"
       - ".github/workflows/verdict.yaml"
-  workflow_dispatch:
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: verdict-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   formal:

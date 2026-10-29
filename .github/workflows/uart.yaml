@@ -2,8 +2,16 @@
 # The chip-level tests (host port + seq through the pins) run in test.yaml.
 name: uart
 
+# CI runs only at milestones (8 Nov gate, 13 Dec freeze, final): by hand (workflow_dispatch,
+# on any branch) or when a pull request to main is opened / marked ready. Day-to-day work
+# is verified locally (docs/local-flow.md). Not on every push: GitHub Actions minutes on a
+# private repo ran out in three days of push-triggered runs (28 Oct).
+
 on:
-  push:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
     paths:
       - "src/uart_tx.v"
       - "src/uart_rx.v"
@@ -11,7 +19,10 @@ on:
       - "formal/uart.sby"
       - "formal/uart_loopback.sv"
       - ".github/workflows/uart.yaml"
-  workflow_dispatch:
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: uart-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

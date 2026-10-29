@@ -1,11 +1,30 @@
 name: gds
 
+# CI runs only at milestones (8 Nov gate, 13 Dec freeze, final): by hand (workflow_dispatch,
+# on any branch) or when a pull request to main is opened / marked ready. Day-to-day work
+# is verified locally (docs/local-flow.md). Not on every push: GitHub Actions minutes on a
+# private repo ran out in three days of push-triggered runs (28 Oct).
+
 on:
-  push:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
+    # docs, tests or firmware alone don't change the chip: no hardening for those
+    paths-ignore:
+      - "docs/**"
+      - "test/**"
+      - "firmware/**"
+      - "**/*.md"
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: gds-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   gds:
+    # not for draft pull requests (pushes to a draft PR don't trigger anyway)
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     steps:
       - name: checkout repo
