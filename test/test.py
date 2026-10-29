@@ -36,7 +36,9 @@ from cocotbext.uart import UartSink, UartSource
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import referee_host as host  # noqa: E402
+from bus_models import I2CTarget, SPITarget  # noqa: E402
 
 CLOCK_HZ = host.CLOCK_HZ
 P_NS = 1e9 / CLOCK_HZ  # one chip cycle (25 ns at 40 MHz)
@@ -127,6 +129,9 @@ async def start(dut, fast=True):
     dut.ui_in_pins.value = 0
     dut.uio_in_pins.value = 0
     dut.uio_rx1.value = 1
+    dut.i2c_scl_low.value = 0
+    dut.i2c_sda_low.value = 0
+    dut.spi_miso.value = 0
     dut.host_rx.value = 1
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -138,8 +143,8 @@ async def start(dut, fast=True):
     return h
 
 
-async def load_and_run(h, source, pins=None):
-    glob, img, _ = host.build((FW / source).read_text(), pins)
+async def load_and_run(h, source, pins=None, equ=None):
+    glob, img, _ = host.build((FW / source).read_text(), pins, equ=equ)
     await h.load(glob, img)
     assert await h.run(), f"RUN of {source} refused: {host.decode_status(await h.must(host.pkt_status()))}"
     return glob, img
@@ -479,3 +484,135 @@ async def resync_after_partial_packet(dut):
     assert h.sink.empty(), "a partial packet must not get a reply"
     assert await h.must(host.pkt_id()) == host.ID
     assert await h.must(host.pkt_status(port=True)) == 0x00, "no overrun"
+
+
+# -----------------------------------------------------------------------------
+# CP4: bit-serial controllers in firmware, against independent target models
+# -----------------------------------------------------------------------------
+
+
+async def push_in(h, byte):
+    """Push one byte into IN, waiting while it is full."""
+    for _ in range(200):
+        if (await h.transact(host.pkt_push(byte)))[0] == host.ACK:
+            return
+        await Timer(5, unit="us")
+    raise AssertionError("IN stayed full")
+
+
+async def pop_out(h, timeout_us=2000):
+    """Pop one byte from OUT, waiting until the firmware has pushed it."""
+    t0 = get_sim_time("us")
+    while get_sim_time("us") - t0 < timeout_us:
+        status, byte, _ = await h.transact(host.pkt_pop())
+        if status == host.ACK:
+            return byte
+        await Timer(5, unit="us")
+    raise AssertionError("no byte in OUT")
+
+
+async def serial_byte(h, byte, cmd=None):
+    """One byte through i2c_controller.s ('X') or an SPI controller: spread in, gather out."""
+    if cmd is not None:
+        await push_in(h, cmd)
+    for b in host.spread(byte):
+        await push_in(h, b)
+    return host.gather(await pop_out(h), await pop_out(h))
+
+
+async def i2c_bit(h, cmd):
+    """'A' (SDA released, sampled) or 'K' (SDA low): one clock; returns the SDA sample."""
+    await push_in(h, cmd)
+    await pop_out(h)
+    return (await pop_out(h)) & 1
+
+
+async def i2c_write(h, addr, ptr, data):
+    """START, address + W, pointer, data, STOP; returns the target's ACK bits (0 = ACK)."""
+    acks = []
+    await push_in(h, host.I2C_START)
+    for b in [addr << 1, ptr] + list(data):
+        assert await serial_byte(h, b, host.I2C_XFER) == b, "SDA must read back what the controller sent"
+        acks.append(await i2c_bit(h, host.I2C_NACK))  # release SDA and sample: the target's ACK
+        if acks[-1]:
+            break
+    await push_in(h, host.I2C_STOP)
+    return acks
+
+
+async def i2c_read(h, addr, ptr, n):
+    """START, address + W, pointer, repeated START, address + R, n bytes (ACK all but the
+    last, NACK the last), STOP."""
+    await push_in(h, host.I2C_START)
+    for b in (addr << 1, ptr):
+        await serial_byte(h, b, host.I2C_XFER)
+        assert await i2c_bit(h, host.I2C_NACK) == 0, f"no ACK for {b:#04x}"
+    await push_in(h, host.I2C_START)
+    await serial_byte(h, addr << 1 | 1, host.I2C_XFER)
+    assert await i2c_bit(h, host.I2C_NACK) == 0, "no ACK for the read address"
+    got = []
+    for k in range(n):
+        got.append(await serial_byte(h, 0xFF, host.I2C_XFER))  # SDA released: the target drives it
+        await i2c_bit(h, host.I2C_ACK if k < n - 1 else host.I2C_NACK)
+    await push_in(h, host.I2C_STOP)
+    return got
+
+
+async def i2c_session(dut, stretch_ns):
+    h = await start(dut)
+    t = I2CTarget(dut, addr=0x50, stretch_ns=stretch_ns)
+    await load_and_run(h, "i2c_controller.s", {2: (1, 2), 3: (1, 2)})  # SCL, SDA open-drain
+    data = [0xA5, 0x3C] if GL else [0xA5, 0x00, 0xFF, 0x3C, 0x81]
+    assert await i2c_write(h, 0x50, 0x10, data) == [0] * (len(data) + 2), "every byte ACKed"
+    assert list(t.mem[0x10:0x10 + len(data)]) == data, "the EEPROM holds what was written"
+    assert await i2c_read(h, 0x50, 0x10, len(data)) == data, "read back through a repeated START"
+    assert await i2c_write(h, 0x51, 0x00, [0x55]) == [1], "a wrong address is NACKed"
+    t.stop_model()
+    assert not t.violations, "I2C Fast-mode timing: " + "; ".join(t.violations[:5])
+    return t
+
+
+@cocotb.test()
+async def i2c_controller(dut):
+    """firmware/engine/i2c_controller.s at 400 kHz against an EEPROM target model: write,
+    read back through a repeated START, NACK for a wrong address. The model checks every
+    Fast-mode timing limit on the bus wires; SDA reads back what the controller sent."""
+    t = await i2c_session(dut, stretch_ns=0)
+    starts = sum(1 for e in t.events if e[0] == "start")
+    dut._log.info("i2c: %d STARTs, %d events, no timing violations", starts, len(t.events))
+
+
+@cocotb.test()
+async def i2c_controller_clock_stretching(dut):
+    """The same with a target that holds SCL low for 3 us after every byte: the firmware
+    waits for SCL to be seen high, so every high phase still lasts tHIGH."""
+    t = await i2c_session(dut, stretch_ns=3000)
+    assert t.stretches > 5, "the target must actually stretch"
+
+
+@cocotb.test()
+async def spi_controller_modes(dut):
+    """firmware/engine/spi_cpha0.s / spi_cpha1.s in all four modes (CPOL by .equ) against an
+    SPI target model: multi-byte full-duplex frames with CS held low; the model checks the
+    clock idle level, half-periods, CS setup / hold and MOSI setup / hold."""
+    h = await start(dut)
+    rng = random.Random(4)
+    half_ns = 500
+    modes = [0, 3] if GL else [0, 1, 2, 3]
+    for mode in modes:
+        cpol, cpha = mode >> 1, mode & 1
+        frames = [[0x9F, 0x00, 0x00]] if GL else [[0x9F, 0x00, 0x00, 0x00], [rng.randrange(256) for _ in range(5)]]
+        replies = [[rng.randrange(256) for _ in f] for f in frames]
+        t = SPITarget(dut, mode, replies, half_ns, P_NS)
+        await load_and_run(h, f"spi_cpha{cpha}.s", {4: (1, 1), 5: (1, 1), 6: (1, 1)}, equ={"CPOL": cpol})
+        await Timer(5, unit="us")
+        assert int(dut.spi_sck.value) == cpol and int(dut.spi_cs.value) == 1, f"mode {mode}: idle bus"
+        for f, r in zip(frames, replies):
+            got = [await serial_byte(h, b) for b in f]
+            await push_in(h, host.SPI_END)
+            await Timer(5, unit="us")
+            assert got == r, f"mode {mode}: received {[hex(x) for x in got]}, target sent {[hex(x) for x in r]}"
+        t.stop_model()
+        assert t.frames == frames, f"mode {mode}: target got {t.frames}, sent {frames}"
+        assert not t.violations, f"mode {mode}: " + "; ".join(t.violations[:5])
+        dut._log.info("spi mode %d: %d frames, %d bytes each way", mode, len(frames), sum(map(len, frames)))

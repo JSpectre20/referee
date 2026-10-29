@@ -148,6 +148,32 @@ def split_verdicts(slots):
     return out
 
 
+# ----------------------------------------------------------------------------
+# Bit-serial firmware (i2c_controller.s, spi_cpha0.s, spi_cpha1.s)
+# ----------------------------------------------------------------------------
+# SR is the engine's only shift register and each bit needs a shift out (sho) and a
+# shift in (shi). The host spreads each data byte over 16 bits with a 0 after every
+# data bit, so two shifts per bit bring the next data bit to SR[15]; the 8 samples
+# collect at the bottom as 1 s7 1 s6 ... 1 s0 and come back as two OUT bytes.
+
+I2C_START, I2C_STOP, I2C_XFER, I2C_ACK, I2C_NACK = 0x53, 0x50, 0x58, 0x4B, 0x41  # 'S' 'P' 'X' 'K' 'A'
+SPI_END = 0xFF  # end of frame: CS high (a spread byte never has bit 6 set)
+
+
+def spread(byte):
+    """Data byte -> the two IN bytes (high, low): t7 0 t6 0 t5 0 t4 0, t3 0 t2 0 t1 0 t0 0."""
+    w = 0
+    for k in range(8):
+        w |= (byte >> k & 1) << (2 * k + 1)
+    return w >> 8, w & 0xFF
+
+
+def gather(hi, lo):
+    """The two OUT bytes after 8 bits -> the byte sampled (bits 14, 12, ..., 0 of SR)."""
+    w = hi << 8 | lo
+    return sum((w >> (2 * k) & 1) << k for k in range(8))
+
+
 def pin_config(spec):
     """'0:pp,1:od' -> {pin: (owner 1 = engine 0, mode 1 push-pull / 2 open-drain)}."""
     modes = {"pp": 1, "od": 2}
@@ -169,8 +195,21 @@ def load_packets(glob, img):
     return pkts
 
 
-def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ):
+def set_equ(source_text, equ):
+    """Override `.equ NAME value` lines, e.g. {"CPOL": 1} (each name must be defined)."""
+    import re
+
+    for name, value in (equ or {}).items():
+        pat = re.compile(rf"^(\s*\.equ\s+{re.escape(name)}\s+)\S+", re.M)
+        if not pat.search(source_text):
+            raise HostError(f".equ {name} is not defined in the source")
+        source_text = pat.sub(lambda m: m.group(1) + str(value), source_text, count=1)
+    return source_text
+
+
+def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ, equ=None):
     """Assemble firmware -> (global image, engine image, notes)."""
+    source_text = set_equ(source_text, equ)
     a = refasm.Assembler(clock_hz)
     words = a.assemble(source_text)
     return refasm.global_image(pins or {}, mux), a.image(words), a.notes
@@ -224,6 +263,7 @@ def main(argv=None):
     ld.add_argument("source")
     ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
     ld.add_argument("--run", action="store_true")
+    ld.add_argument("--equ", action="append", default=[], help="override a .equ, e.g. CPOL=1 (SPI modes 2/3)")
     args = ap.parse_args(argv)
 
     ref = Referee(args.port)
@@ -246,7 +286,8 @@ def main(argv=None):
             names = ["pass", "viol", "indet", "min", "max"]
             print({n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)})
         else:
-            glob, img, notes = build(Path(args.source).read_text(), pin_config(args.pin))
+            equ = dict(e.split("=", 1) for e in args.equ)
+            glob, img, notes = build(Path(args.source).read_text(), pin_config(args.pin), equ=equ)
             for p in load_packets(glob, img):
                 ref.must(p)
             if args.run:
