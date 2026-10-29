@@ -76,7 +76,24 @@ python3 tools/referee_host.py --port /dev/ttyUSB0 drain
 python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
 ```
 
+To drive a bus from the chip, load a bit-serial controller and talk through it. The I2C
+controller (400 kHz, open-drain SCL on `uio[2]`, SDA on `uio[3]`, clock stretching honoured)
+and the SPI controller (1 MHz, modes 0-3: `spi_cpha0.s` for modes 0/2, `spi_cpha1.s` for 1/3,
+CPOL set with `--equ`; SCK `uio[4]`, MOSI `uio[5]`, CS `uio[6]`, MISO `uio[7]`):
+
+```bash
+python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/i2c_controller.s --pin 2:od,3:od --run
+python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-write 50 10 a5 3c
+python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-read 50 10 2
+python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/spi_cpha0.s --pin 4:pp,5:pp,6:pp --equ CPOL=1 --run
+python3 tools/referee_host.py --port /dev/ttyUSB0 spi 9f 00 00 00
+```
+
+The engine has one 16-bit shift register, so the host sends each data byte spread over two IN
+bytes and gets the 8 samples back as two OUT bytes (`referee_host.spread` / `gather`).
+
 ## External hardware
 
 A 3.3 V USB-serial adapter (or the demo board's RP2350 as host) for the command port.
 To referee a bus, wire its lines to `ui_in[4..7]`, for example an I2C bus's SDA and SCL.
+To drive one, use `uio[2..3]` (I2C, with external pull-ups) or `uio[4..7]` (SPI).

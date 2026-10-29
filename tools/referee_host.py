@@ -13,6 +13,14 @@ the command-line tool, so the two can't drift apart.
     python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
 
+Bit-serial controllers (load the firmware first, then talk to the bus through it):
+
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/i2c_controller.s --pin 2:od,3:od --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-write 50 10 a5 3c      # addr, pointer, data (hex)
+    python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-read 50 10 2           # addr, pointer, count
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/spi_cpha0.s --pin 4:pp,5:pp,6:pp --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 spi 9f 00 00 00            # one CS-low frame
+
 The chip's UART starts at 115200 8N1 (ui_in[3] RX, uo_out[4] TX) at the project clock in
 info.yaml; `--fast` switches both ends to clock / 20 first (3 Mbaud at 60 MHz).
 """
@@ -247,6 +255,86 @@ class Referee:
         self.must(pkt_baud(FAST_DIV))
         self.ser.baudrate = CLOCK_HZ // FAST_DIV
 
+    # -- bit-serial firmware (i2c_controller.s, spi_cpha0.s, spi_cpha1.s) --------
+    # The same sequences as the chip tests (test/test.py: push_in, pop_out, serial_byte,
+    # i2c_write, i2c_read), for a real chip.
+
+    def push_in(self, byte, timeout=1.0):
+        """Push one byte into IN, retrying while it is full."""
+        import time
+
+        t0 = time.monotonic()
+        while not self.transact(pkt_push(byte))[0]:
+            if time.monotonic() - t0 > timeout:
+                raise HostError("IN stayed full: is the firmware running?")
+            time.sleep(0.001)
+
+    def pop_out(self, timeout=1.0):
+        """Pop one byte from OUT, waiting until the firmware has pushed it."""
+        import time
+
+        t0 = time.monotonic()
+        while True:
+            ok, byte, _ = self.transact(pkt_pop())
+            if ok:
+                return byte
+            if time.monotonic() - t0 > timeout:
+                raise HostError("no byte in OUT: is the firmware running?")
+            time.sleep(0.001)
+
+    def serial_byte(self, byte, cmd=None):
+        """One byte through the firmware: spread in, gather the 8 samples out."""
+        if cmd is not None:
+            self.push_in(cmd)
+        for b in spread(byte):
+            self.push_in(b)
+        return gather(self.pop_out(), self.pop_out())
+
+    def i2c_bit(self, cmd):
+        """I2C_NACK (SDA released, sampled) or I2C_ACK (SDA low): one clock; the SDA sample."""
+        self.push_in(cmd)
+        self.pop_out()
+        return self.pop_out() & 1
+
+    def i2c_write(self, addr, ptr, data):
+        """START, address + W, pointer, data, STOP -> the target's ACK bits (0 = ACK)."""
+        acks = []
+        self.push_in(I2C_START)
+        for b in [addr << 1, ptr] + list(data):
+            if self.serial_byte(b, I2C_XFER) != b:
+                raise HostError(f"SDA did not read back {b:#04x}: another controller, or a stuck bus")
+            acks.append(self.i2c_bit(I2C_NACK))
+            if acks[-1]:
+                break
+        self.push_in(I2C_STOP)
+        return acks
+
+    def i2c_read(self, addr, ptr, n):
+        """START, address + W, pointer, repeated START, address + R, n bytes, STOP."""
+        self.push_in(I2C_START)
+        for b in (addr << 1, ptr):
+            self.serial_byte(b, I2C_XFER)
+            if self.i2c_bit(I2C_NACK):
+                self.push_in(I2C_STOP)
+                raise HostError(f"no ACK for {b:#04x}")
+        self.push_in(I2C_START)
+        self.serial_byte(addr << 1 | 1, I2C_XFER)
+        if self.i2c_bit(I2C_NACK):
+            self.push_in(I2C_STOP)
+            raise HostError("no ACK for the read address")
+        got = []
+        for k in range(n):
+            got.append(self.serial_byte(0xFF, I2C_XFER))
+            self.i2c_bit(I2C_ACK if k < n - 1 else I2C_NACK)
+        self.push_in(I2C_STOP)
+        return got
+
+    def spi_frame(self, data):
+        """One CS-low frame, full duplex -> the bytes received."""
+        got = [self.serial_byte(b) for b in data]
+        self.push_in(SPI_END)
+        return got
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -264,6 +352,17 @@ def main(argv=None):
     ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
     ld.add_argument("--run", action="store_true")
     ld.add_argument("--equ", action="append", default=[], help="override a .equ, e.g. CPOL=1 (SPI modes 2/3)")
+    hexb = lambda x: int(x, 16)  # noqa: E731
+    iw = sub.add_parser("i2c-write", help="through i2c_controller.s: write data at a pointer")
+    iw.add_argument("addr", type=hexb)
+    iw.add_argument("ptr", type=hexb)
+    iw.add_argument("data", type=hexb, nargs="+")
+    ir = sub.add_parser("i2c-read", help="through i2c_controller.s: read n bytes from a pointer")
+    ir.add_argument("addr", type=hexb)
+    ir.add_argument("ptr", type=hexb)
+    ir.add_argument("n", type=int)
+    sp = sub.add_parser("spi", help="through spi_cpha0.s / spi_cpha1.s: one CS-low frame")
+    sp.add_argument("data", type=hexb, nargs="+")
     args = ap.parse_args(argv)
 
     ref = Referee(args.port)
@@ -281,6 +380,13 @@ def main(argv=None):
             slots = [rest[2 * i] << 8 | rest[2 * i + 1] for i in range(n)]
             for h, m in split_verdicts(slots):
                 print(h, "" if m is None else f"m = {m}")
+        elif args.cmd == "i2c-write":
+            acks = ref.i2c_write(args.addr, args.ptr, args.data)
+            print("ACK" if not any(acks) else f"NACK after {len(acks) - 1} bytes")
+        elif args.cmd == "i2c-read":
+            print(" ".join(f"{b:02x}" for b in ref.i2c_read(args.addr, args.ptr, args.n)))
+        elif args.cmd == "spi":
+            print(" ".join(f"{b:02x}" for b in ref.spi_frame(args.data)))
         elif args.cmd == "stats":
             ref.must(pkt_stats_latch(args.slot))
             names = ["pass", "viol", "indet", "min", "max"]
