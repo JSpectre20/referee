@@ -3,8 +3,9 @@
 Three side branches were pushed in October 2026 only to run the hardening flow with a
 different clock or flow configuration. None of them is for merging. **No more side-branch
 probes from now on (decided 29 Oct):** each one cost a full CI run (gds ~1-2.5 h, precheck
-~1.5 h, gl_test ~15 min), and the private repo's Actions minutes ran out in three days.
-Probes now run locally (`docs/local-flow.md`).
+~1.5 h, gl_test ~15 min), and the repo (private at the time) ran out of Actions minutes in
+three days. Since then a timing question is settled on the working branch itself: local
+synthesis first, then one hardening run dispatched by hand.
 
 Corners: slow = nom_slow_1p08V_125C, typ = nom_typ_1p20V_25C, fast = nom_fast_1p32V_m40C.
 WS = worst setup slack. **The clock is chosen by the slow corner.**
