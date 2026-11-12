@@ -91,8 +91,8 @@ Each is judged against a free bound N and a free choice of minimum or maximum bo
     assumption. Long intervals are now flagged stale instead.)
 - **Not modelled:** metastability lasting longer than one clock cycle (the second
   synchronizer flop is assumed to resolve), analog edge rates, and pad delays. These are
-  silicon characterization questions, and a loopback self-test is planned to measure them
-  (PLAN improvement 4).
+  silicon characterization questions; a loopback self-test (drive an edge at a known cycle,
+  read it back on an input) is planned to measure them.
 
 ## The snapshot lemma (ledger A16, removed 28 Oct)
 

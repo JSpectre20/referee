@@ -61,8 +61,8 @@ cd formal && sby -f seq.sby    # prove, cover, mutant (the mutant must FAIL)
 ## Area
 
 Generic Yosys synthesis: about 1,400 cells, of which 512 flip-flops and ~470 muxes are
-the 32 x 16 flip-flop program memory. That memory is the part an SRAM macro replaces
-(PLAN T5). Real numbers come from the gds run once seq is in the top module.
+the 32 x 16 flip-flop program memory. That memory is the part an SRAM macro could replace.
+Real numbers come from the gds run once seq is in the top module.
 
 ## Known limits (deliberate, for a first block)
 

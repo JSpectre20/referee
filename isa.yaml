@@ -1,4 +1,4 @@
-# Referee engine ISA, v0.3 (DRAFT for review; revised after reviews of v0.1 and v0.2).
+# Referee engine ISA, v0.3 (approved 28 Oct 2026; revised after reviews of v0.1 and v0.2).
 #
 # Single source of truth. In step 2 a generator (tools/isagen.py) produces from
 # this file: the opcode include for the RTL (src/isa_defs.vh), the assembler,

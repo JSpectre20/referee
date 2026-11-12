@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Shreyansh
  * SPDX-License-Identifier: Apache-2.0
  *
- * verdict: the referee's three-valued rule (PLAN.md 4.8), as hardware.
+ * verdict: the referee's three-valued rule (docs/verdict.md), as hardware.
  *
  * Given an interval measured from edge timestamps (m, in clock cycles), a
  * timing bound from a protocol contract (n_lo + inexact, in fixed point: cycles with

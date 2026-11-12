@@ -37,7 +37,7 @@
  * Loading rule: the program memory and the shift register can only be
  * written while halted (`run` = 0). Writes while running are ignored. This is
  * what makes the timing of a running program depend on nothing but the
- * program itself (PLAN.md 4.3, "Reload").
+ * program itself (docs/seq.md).
  *
  * Example: one UART 8N1 byte at CLKS cycles per bit (see firmware/seq/):
  *   SET tx,0 ; WAIT CLKS-1          start bit, exactly CLKS cycles

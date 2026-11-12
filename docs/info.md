@@ -14,7 +14,7 @@ This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
   exactly one cycle, except the three waits. A `set` or `sho` changes its pin exactly one
   cycle later. Two deadline registers keep schedules drift-free: DL for the schedule
   (`mark`, `waitd`) and TO for timeouts (`tmo`, `tmon`). A UART transmitter or receiver is
-  about 15 words of firmware (`firmware/engine/`).
+  16 to 18 words of firmware (`firmware/engine/`).
 - **An edge-timestamp unit** on four judge channels (default `ui_in[4..7]`, input-only pads, so
   judging them cannot disturb the bus). A **snapshot** freezes every channel's timestamps
   at one instant. The trigger edge sets that instant, and edges too close to it to order are

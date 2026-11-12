@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Shreyansh
  * SPDX-License-Identifier: Apache-2.0
  *
- * edge_ts: edge-timestamp unit for N input pins (PLAN.md 4.9).
+ * edge_ts: edge-timestamp unit for N input pins (docs/edge_ts.md).
  *
  * For each pin it keeps, every cycle and with no help from firmware:
  *   - the timestamp of the last rising edge and of the last falling edge,
@@ -28,7 +28,7 @@
  *       cycle and the timestamp latched is `now` of that cycle.
  *   So for every edge:     1 < timestamp - t <= 3          (cycles)
  *   and for any two edges: |(ts2 - ts1) - (t2 - t1)| < 2   (cycles)
- *   which is the u = 2 of the referee's three-valued rule (PLAN.md 4.8) for
+ *   which is the u = 2 of the referee's three-valued rule (docs/verdict.md) for
  *   intervals whose both ends are external edges.
  *
  *   Precondition: a pin holds each level for at least 4 cycles. Shorter
