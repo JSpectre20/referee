@@ -50,7 +50,7 @@ as numbers, and keeps the **assumption ledger** (§11).
 | --- | --- | --- |
 | STA at 60 MHz, 40 MHz fallback | Agreed | The demo board's `clock_project_PWM` uses an RP2 system clock that's a multiple of the project clock, up to twice it: 60 MHz = 120 MHz / 2 at 50% duty. 40 MHz = 120 / 3 at 33% duty, so STA must check the minimum pulse width there. The current chip has +10.7 ns setup slack at 20 ns. At 60 MHz, u = 2 cycles = 33 ns. |
 | Every non-waiting instruction takes 1 cycle, incl. taken branches and LOOP | Agreed | Flop program memory is read combinationally. Only WAITD, WAITP and WAITS stall. |
-| 64x16 flop program memory per engine | Agreed | ~55k µm² per engine. The chip today is 82k µm² = 9.1% of 6x4. SRAM clock-to-output (~6.3 ns) would sit in the 1-cycle branch path. |
+| 64x16 flop program memory per engine | Agreed | ~55k µm² per engine. When this was decided the chip (before the engine) was 82k µm², 9.1% of the 6x4 core. SRAM clock-to-output (~6.3 ns) would sit in the 1-cycle branch path. |
 | Engines | 1 in v0, 2 planned | Decided at the 8 Nov gate from the area ledger. The image format already supports 2 (§7). One shared edge_ts, with one snapshot + trigger per engine. |
 | Judge channels | 4 | Default ui_in[4..7]; each has a mux to uio_in[0..7] for active modes. Non-intrusive only when all four are on ui_in; every verdict carries NI. |
 | WAITP on judge channels | Required | Inputs 12..15 are the channels after the mux, the same synchronized signal edge_ts sees. |
@@ -437,7 +437,8 @@ This holds for any K, because bounds are in 1/16 cycle and the lemma is in cycle
 - the RTL in lockstep with the generated model, on random programs;
 - firmware: UART TX/RX, the §5.3 referee, the §5.4 target, and JUDGE on an external UART at
   in-spec and off-spec baud, on RTL and gate level;
-- harden at 6x4, close STA at 60 MHz, update the area ledger.
+- harden at 8x4 (the size confirmed for the shuttle on 9 Nov 2026; engine v0 was first
+  hardened at 6x4), close STA at 60 MHz, update the area ledger.
 
 ## 10. Open questions
 

@@ -9,8 +9,9 @@ project:
                                # Changes only together with CLOCK_PERIOD in src/config.json,
                                # CLKS_PER_BIT in src/project.v and docs/info.md (test/test.py checks)
 
-  # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "6x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  # How many tiles your design occupies? A single tile is about 202x155 uM.
+  # 8x4 is the size the organizers confirmed for the March 2027 shuttle (9 Nov 2026).
+  tiles: "8x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2, 8x2, 3x4, 4x4, 5x4, 6x4 or 8x4
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
   top_module:  "tt_um_shreyansh_referee"
