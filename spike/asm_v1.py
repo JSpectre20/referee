@@ -281,14 +281,14 @@ class Assembler:
                 values["t"], values["x16"] = units, 1
             else:
                 values["t"] = cyc
-        if mnemonic == "trig" and values.get("e") == T.ENUMS["e"]["last"]:
+        if mnemonic in ("trig", "trigq") and values.get("e") == T.ENUMS["e"]["last"]:
             raise AsmError("trig needs rise, fall or any")
-        if mnemonic == "trig" and not re.fullmatch(r"\s*CH[0-3](\s*\|\s*CH[0-3])*\s*", args[0]):
+        if mnemonic in ("trig", "trigq") and not re.fullmatch(r"\s*CH[0-3](\s*\|\s*CH[0-3])*\s*", args[0]):
             # v0.3 wrote a channel NUMBER here (trig 1, rise = channel 1); v1 takes a MASK. Only the
             # names CH0..CH3 joined by | are accepted, so an old source (or `.equ SCL 1`) cannot
             # silently select a different channel.
             raise AsmError("trig takes a channel mask in v1: write CH0, CH1, CH0|CH1 ... (not a channel number)")
-        if mnemonic == "trig" and not values.get("tm"):
+        if mnemonic in ("trig", "trigq") and not values.get("tm"):
             raise AsmError("trig needs a non-empty channel mask (CH0 | CH1 ...)")
         if mnemonic == "tsget" and values.get("e") == T.ENUMS["e"]["any"]:
             raise AsmError("tsget needs rise, fall or last")

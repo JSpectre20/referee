@@ -23,7 +23,10 @@ sys.path.insert(0, str(HERE.parent))
 import asm_v1  # noqa: E402
 from model_v1 import Model, verdict_rule, QUARTER  # noqa: E402
 
-FW = HERE.parent / "firmware" / "i2c_fm_referee.s"
+FWDIR = HERE.parent / "firmware"
+# the two variants compared: the rules each one judges
+VARIANTS = {"i2c_fm_referee_p.s": {0, 1, 3, 4, 5, 6, 7, 8},   # P only: every edge is an event
+            "i2c_fm_referee.s": {0, 3, 4, 5, 6, 7, 8}}         # P + K: SCL edges, START, STOP
 CLOCK = 60e6
 NS = CLOCK / 1e9  # cycles per ns
 RULES = {0: "tSU;DAT", 1: "tHD;DAT", 3: "tLOW", 4: "tHIGH", 5: "tHD;STA",
@@ -110,7 +113,7 @@ def oracle(sda, scl):
             start_pending, idle = True, False
         elif ds:                                            # STOP
             out.append((7, gap(c, last[("scl", 1)])))
-            idle = True
+            idle, start_pending = True, False
         out[n0:] = [(b, m, c) for b, m in out[n0:]]          # + the cycle of the edge that ends the interval
         if ds:
             last[("sda", sda[c])] = sda_any = c
@@ -121,9 +124,9 @@ def oracle(sda, scl):
 
 # ------------------------------------------------------------------ run the model
 
-def run_referee(sda, scl):
+def run_referee(sda, scl, fw="i2c_fm_referee.s"):
     a = asm_v1.Assembler(CLOCK)
-    src = re.sub(r"\bjudge (\d+)", r"judge \1, raw", FW.read_text())  # stream every verdict with its exact m
+    src = re.sub(r"\bjudge (\d+)", r"judge \1, raw", (FWDIR / fw).read_text())  # stream every verdict with its exact m
     words = a.assemble(src)
     img = a.image(words)
     md = Model(words=64)  # the Referee engine
@@ -151,17 +154,24 @@ def run_referee(sda, scl):
     for (hdr, k), (raw, _) in zip(slots[0::2], slots[1::2]):
         assert hdr >> 8 & 1, "every header announces a raw slot"
         m = raw - 0x10000 if raw & 0x8000 else raw
-        verdicts.append(((hdr >> 4) & 0xF, m, ["INDET", "PASS", "VIOL"][hdr >> 14], hdr, k))
+        verdicts.append(((hdr >> 4) & 0xF, m, ["INDET", "PASS", "VIOL"][hdr >> 14], hdr, k, hdr >> 10 & 1))
     return a, md, len(words), verdicts
 
 
 def check(a, expected, verdicts):
-    """Every verdict must match the oracle, in order; -> per-rule [judged, expected, P, V, I]."""
-    table = {b: [0, 0, 0, 0, 0] for b in RULES}
+    """Every verdict that is not poisoned must match the oracle, in order.
+    -> per-rule [judged, events, PASS, VIOL, INDET, poisoned]."""
+    table = {b: [0, 0, 0, 0, 0, 0] for b in RULES}
     for b, _, _ in expected:
         table[b][1] += 1
     i = 0
-    for b, m, v, hdr, popped in verdicts:
+    for b, m, v, hdr, popped, poisoned in verdicts:
+        if poisoned:
+            # A poisoned JUDGE may be about the wrong pair of edges: that is what the poison is
+            # for. It must claim nothing.
+            assert v == "INDET", f"a poisoned JUDGE answered {v} (rule {RULES[b]}, m = {m})"
+            table[b][5] += 1
+            continue
         # The oracle entry must be the same rule, the same interval, AND end at most LATENCY
         # cycles before the verdict came out: a verdict about the wrong pair of edges cannot
         # match a later event of the same rule by coincidence.
@@ -183,51 +193,73 @@ def check(a, expected, verdicts):
 
 
 def report(title, words, md, table):
-    print(f"\n{title}: {words} words, LOST = {md.lost}")
-    print(f"  {'rule':8} {'judged':>7} {'events':>7} {'PASS':>6} {'VIOL':>6} {'INDET':>6}")
-    for b, (j, n, p, v, i) in table.items():
-        print(f"  {RULES[b]:8} {j:7} {n:7} {p:6} {v:6} {i:6}")
+    judged, events = sum(t[0] for t in table.values()), sum(t[1] for t in table.values())
+    print(f"\n{title}: {words} words, LOST counter = {md.lost}{' (saturated)' if md.lost == 255 else ''}; "
+          f"{events - judged} of {events} events not judged ({100 * (events - judged) / events:.1f}%)")
+    print(f"  {'rule':8} {'events':>7} {'judged':>7} {'unjudged':>9} {'PASS':>6} {'VIOL':>6} {'INDET':>6} {'poisoned JUDGEs':>16}")
+    for b, (j, n, p, v, i, px) in table.items():
+        print(f"  {RULES[b]:8} {n:7} {j:7} {n - j:9} {p:6} {v:6} {i:6} {px:16}")
 
 
-def test_legal_fast_mode_traffic_every_event_judged_every_verdict_right(capsys):
+@pytest.mark.parametrize("fw", VARIANTS)
+def test_legal_fast_mode_traffic_every_event_judged_every_verdict_right(fw, capsys):
     rng = random.Random(11)
     sda, scl = i2c_wave(rng, 40, spread=0.0)
-    a, md, words, verdicts = run_referee(sda, scl)
+    a, md, words, verdicts = run_referee(sda, scl, fw)
     table = check(a, oracle(sda, scl), verdicts)
     with capsys.disabled():
-        report("legal traffic (SDA changes 300-800 ns after SCL falls)", words, md, table)
+        report(f"{fw}: legal traffic (SDA changes 300-800 ns after SCL falls)", words, md, table)
     assert words <= 64, "the Referee engine holds 64 words"
     assert md.lost == 0
-    for b, (judged, n, p, v, i) in table.items():
-        assert judged == n, f"{RULES[b]}: {n - judged} events not judged"
+    for b, (judged, n, p, v, i, px) in table.items():
+        if b not in VARIANTS[fw]:
+            assert judged == 0
+            continue
+        # the first START after power-up is judged while poisoned (the program starts with desync)
+        assert judged == n - (1 if b == 8 else 0), f"{RULES[b]}: {n - judged} events not judged"
         assert v == 0, f"{RULES[b]}: a VIOLATION on legal traffic"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING of the spike, kept as a failing test until the program is redesigned: when an interval "
-    "is short enough that its end event arrives while the previous event is still being handled, the "
-    "trigger is lost, and the two state flags (RC0 'START pending', RC1 'idle') go out of step with "
-    "the bus. The next SCL fall is then judged as tHD;STA against an SDA fall that was not a START: "
-    "a verdict about the wrong pair of edges. State kept across events is not safe when events can be "
-    "lost. See spike/README.md, 'Findings'."))
-def test_traffic_with_violations_no_wrong_verdict_and_coverage_is_reported(capsys):
-    rng = random.Random(12)
-    sda, scl = i2c_wave(rng, 60, spread=0.5)
-    a, md, words, verdicts = run_referee(sda, scl)
-    table = check(a, oracle(sda, scl), verdicts)   # asserts every verdict given is right
+@pytest.mark.parametrize("fw", VARIANTS)
+def test_traffic_with_violations_never_a_verdict_about_the_wrong_pair_of_edges(fw, capsys):
+    """Until 13 Nov this was the spike's known failure: a lost event left the program's two state
+    bits wrong and the next SCL fall was judged as tHD;STA on an SDA fall that was not a START.
+    With the poison rule every JUDGE after a lost event is CAN'T TELL until the program resyncs
+    while holding a START or a STOP. check() requires every unpoisoned verdict to be about the
+    pair of edges the oracle found for that rule at that moment, and to be the right verdict."""
+    total = [0, 0, 0]  # events of the rules this variant judges, judged, violations caught
+    for seed, spread, hd in ((12, 0.5, (300, 800)), (21, 0.3, (60, 800)), (22, 0.7, (60, 800)), (23, 0.9, (60, 800))):
+        rng = random.Random(seed)
+        sda, scl = i2c_wave(rng, 60, spread=spread, hd_dat_ns=hd)
+        a, md, words, verdicts = run_referee(sda, scl, fw)
+        table = check(a, oracle(sda, scl), verdicts)
+        with capsys.disabled():
+            report(f"{fw}: intervals down to {100 * (1 - spread):.0f}% of their minimum, "
+                   f"SDA {hd[0]}-{hd[1]} ns after SCL falls", words, md, table)
+        for b in VARIANTS[fw]:
+            total[0] += table[b][1]
+            total[1] += table[b][0]
+            total[2] += table[b][3]
     with capsys.disabled():
-        report("traffic with intervals down to half their minimum", words, md, table)
-    assert sum(t[3] for t in table.values()) > 20, "the traffic must contain violations that are caught"
+        print(f"\n{fw}: over the four mixes {total[1]} of {total[0]} events judged "
+              f"({100 * (total[0] - total[1]) / total[0]:.1f}% not judged), {total[2]} violations reported")
+    assert total[2] > 50, "the traffic must contain violations that are caught"
+    assert total[1] < total[0], "the traffic must make the chip lose events (or the test shows nothing)"
 
 
-def test_sda_changing_soon_after_scl_falls_is_a_coverage_gap_not_a_wrong_verdict(capsys):
-    """A device that changes SDA 100-200 ns after SCL falls: the chip is still handling the SCL
-    fall, so the data-change event is lost (counted in LOST). tHD;DAT / tVD;DAT lose coverage;
-    no verdict is wrong; tSU;DAT is still judged at the next SCL rise from SDA's timestamp."""
+def test_data_edges_soon_after_scl_falls_cost_coverage_only_when_they_are_events(capsys):
+    """A device that changes SDA 100-200 ns after SCL falls (many do). With every edge as an event
+    (P only) the data edge arrives while the SCL fall is being handled, is lost, and poisons the
+    rest of the transfer. With START / STOP / SCL as the only events (P + K) nothing is lost."""
     rng = random.Random(13)
     sda, scl = i2c_wave(rng, 30, spread=0.0, hd_dat_ns=(100, 200))
-    a, md, words, verdicts = run_referee(sda, scl)
-    table = check(a, oracle(sda, scl), verdicts)
-    with capsys.disabled():
-        report("SDA changes 100-200 ns after SCL falls", words, md, table)
-    assert table[0][0] == table[0][1], "tSU;DAT is still judged for every SCL rise"
+    exp = oracle(sda, scl)
+    cover = {}
+    for fw in VARIANTS:
+        a, md, words, verdicts = run_referee(sda, scl, fw)
+        table = check(a, exp, verdicts)
+        with capsys.disabled():
+            report(f"{fw}: legal traffic, SDA changes 100-200 ns after SCL falls", words, md, table)
+        cover[fw] = (table[0][0], table[0][1], md.lost)
+    assert cover["i2c_fm_referee.s"][0] == cover["i2c_fm_referee.s"][1] and cover["i2c_fm_referee.s"][2] == 0
+    assert cover["i2c_fm_referee_p.s"][0] < cover["i2c_fm_referee_p.s"][1] // 2

@@ -9,6 +9,8 @@
   D  guard band per bound: signed n_lo and a width (verdict_rule)
   E1 trigger on a set of channels, rise / fall / any
   E2 tsts: line level as of the trigger, which edge triggered, flag A (ambiguous)
+  P  poison: a lost trigger (or `desync`) forces every JUDGE to INDETERMINATE until `resync`
+  K  trigq: a second, level-qualified trigger term
 Not in the model yet: F (short-level taint), G (non-PASS pulse pin), NRZI.
 Spike simplification: Model(words=64|96|128) only sets where the pc wraps; the image keeps the
 128-word layout (bounds at word 128, RUN check 8 + 161 cycles) for every size.
@@ -142,7 +144,7 @@ class Model:
         self.check_idx = 0
         self.crc_fail = 0
         self.fifo_in, self.fifo_out, self.fifo_v = [], [], []
-        self.stats = [[0, 0, 0, None, None] for _ in range(4)]  # pass viol indet min max
+        self.stats = [[0, 0, 0, None, None, 0] for _ in range(4)]  # pass viol indet min max poisoned
         self.lost = 0
         self.sticky = {"OUT_OVF": 0, "VERDICT_OVF": 0, "IN_UNDERRUN": 0, "PIN_FAULT": 0}
         self.out_val = [1] * 15
@@ -164,6 +166,9 @@ class Model:
         self.runlen = 0  # consecutive equal stream bits (usb: consecutive ones)
         self.lastbit = 1
         self.A = 0  # v1 (E2): the last TSTS answer was ambiguous
+        self.poison = 1  # v1 (P): a trigger was lost (or desync ran) since the last resync. RUN starts
+        #                  poisoned: no verdict counts until the program has vouched for its state
+        self.read_epoch = None  # v1 (P): epoch of the snapshot the program last read (tsget / tsts)
         self.DL = self.TO = 0
         self.T = self.C = self.E = 0
         self.wd_stall = 0
@@ -174,7 +179,9 @@ class Model:
         self.cap_stage = 0  # 0 idle, 1 = trigger was last cycle, 2 = capture this cycle
         self.trig = None  # v1 (E1): (channel mask, edge kind 0 rise / 1 fall / 3 any)
         self.trig_pend = set()  # the trigger edge(s) (ch, e) reported in r, while a capture is pending
-        self.trig_armed = None  # the (mask, kind) that capture was armed with
+        self.trig_armed = set()  # every (ch, e) that capture was armed for (level qualifier ignored)
+        self.trigq = None  # v1 (K): second trigger term (mask, kind, qualifying channel, level)
+        self.lost_cur = 0  # v1 (P): a trigger was lost since the current snapshot's trigger was accepted
         self.lost_since = 0
         self.snap = None
         self.hist = [[[0, 0] for _ in range(4)] for _ in range(3)]  # pulses at c-1, c-2, c-3
@@ -256,13 +263,13 @@ class Model:
 
     def stats_latch(self, slot):
         st = self.stats[slot]
-        self.shadow = [st[0], st[1], st[2], (st[3] or 0) & M16, (st[4] or 0) & M16]
+        self.shadow = [st[0], st[1], st[2], (st[3] or 0) & M16, (st[4] or 0) & M16, st[5]]
 
     def stats_read(self, idx):
         return getattr(self, "shadow", [0] * 5)[idx]
 
     def stats_clear(self, slot):
-        self.stats[slot] = [0, 0, 0, None, None]
+        self.stats[slot] = [0, 0, 0, None, None, 0]
 
     def lost_clear(self):
         self.lost = 0
@@ -303,7 +310,7 @@ class Model:
         uio_out, uio_oe, uo = self.pins()
         return {
             "state": self.state, "pc": self.pc, "X": self.X, "Y": self.Y, "SRO": self.SRO, "SRI": self.SRI,
-            "RC0": self.RC[0], "RC1": self.RC[1], "L": self.L, "runlen": self.runlen, "A": self.A, "DL": self.DL, "TO": self.TO, "T": self.T, "C": self.C, "E": self.E,
+            "RC0": self.RC[0], "RC1": self.RC[1], "L": self.L, "runlen": self.runlen, "A": self.A, "poison": self.poison, "DL": self.DL, "TO": self.TO, "T": self.T, "C": self.C, "E": self.E,
             "S": self.S, "epoch": self.epoch, "lost": self.lost,
             "uio_out": uio_out, "uio_oe": uio_oe, "uo": uo,
             "n_in": len(self.fifo_in), "n_out": len(self.fifo_out), "n_v": len(self.fifo_v),
@@ -334,7 +341,7 @@ class Model:
             self._judge2(jp)
         # Registered state at the start of the cycle: an instruction issued in this
         # cycle (trig, halt) only takes effect from the next one.
-        was_running, trig_before = self.state == "running", self.trig
+        was_running, trig_before, trigq_before = self.state == "running", self.trig, self.trigq
         if self.state == "check":
             if self.check_idx >= 0:
                 if self.check_idx == CHECK_CYCLES - 1:
@@ -365,13 +372,21 @@ class Model:
                          "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb,
                          "level": list(ed.s3), "trig": set(self.trig_pend), "armed": self.trig_armed}
         # v1 (E1): the trigger is any selected edge of any channel in the mask
-        hits = set()
-        if was_running and trig_before is not None:
-            mask, kind = trig_before
-            for ch in range(4):
-                for e in (0, 1):
-                    if (mask >> ch) & 1 and (kind == 3 or kind == e) and pulses[ch][e]:
-                        hits.add((ch, e))
+        hits, armed = set(), set()
+        if was_running:
+            terms = []
+            if trig_before is not None:
+                terms.append((trig_before[0], trig_before[1], True))
+            if trigq_before is not None:  # v1 (K): only while the qualifying channel is at its level
+                mask, kind, qch, qlv = trigq_before
+                terms.append((mask, kind, ed.s2[qch] == qlv))
+            for mask, kind, qualified in terms:
+                for ch in range(4):
+                    for e in (0, 1):
+                        if (mask >> ch) & 1 and (kind == 3 or kind == e):
+                            armed.add((ch, e))
+                            if qualified and pulses[ch][e]:
+                                hits.add((ch, e))
         hit = bool(hits)
         lost_now = 0
         new_pending = 0
@@ -381,7 +396,8 @@ class Model:
             else:
                 new_pending = 1
                 self.trig_pend = hits
-                self.trig_armed = trig_before  # the (mask, kind) this capture was armed with
+                self.trig_armed = armed
+                self.lost_cur = 0  # v1 (P): a new event; losses from here on are "during this one"
         if snap_next is not None:
             self.snap = snap_next
             self.epoch = (self.epoch + 1) & 3
@@ -392,6 +408,7 @@ class Model:
         if lost_now:
             self.lost = min(self.lost + 1, 255)
             self.lost_since = 1
+            self.poison = self.lost_cur = 1  # v1 (P): after this cycle's instruction, so it wins over a resync
 
         if start_core:
             self.ran = 1
@@ -497,8 +514,16 @@ class Model:
                 ones = M16 & ~((self.POLY & -self.POLY) - 1) if self.POLY else M16
                 self.L = ones if f["init"] == E["init"]["ones"] else 0
                 self.runlen, self.lastbit = 0, 1
+        elif m == "resync":  # v1 (P): only while holding the snapshot it vouches for (the one it
+            # last read, not a newer one that arrived after a rel), and only if nothing was lost
+            # since that snapshot's trigger
+            if self.S and self.read_epoch == self.epoch and not self.lost_cur:
+                self.poison = 0
+        elif m == "desync":
+            self.poison = 1
         elif m == "tsts":  # v1 (E2)
             sn = self.snap
+            self.read_epoch = self.epoch if (sn is not None and self.valid) else None
             if sn is None or not self.valid:
                 self.C, self.A = 0, 1
             elif f["w"] == E["w"]["level"]:
@@ -513,9 +538,7 @@ class Model:
                 self.C = int(edge in sn["trig"])
                 # ambiguous: several trigger edges in the trigger cycle, or another edge the
                 # trigger was armed for sits in the ORD window (it may truly have come first)
-                mask, kind = sn["armed"]
-                near = any(sn["ord"][c][e] for c in range(4) for e in (0, 1)
-                           if (mask >> c) & 1 and (kind == 3 or kind == e))
+                near = any(sn["ord"][c][e] for c, e in sn["armed"])
                 self.A = int(len(sn["trig"]) > 1 or near)
         elif m == "cmp":
             byte = (self.SRI >> 8) & 0xFF if f["hi"] else self.SRI & 0xFF
@@ -536,6 +559,9 @@ class Model:
                 self.sticky["OUT_OVF"] = 1
         elif m == "trig":
             self.trig = (f["tm"], f["e"])  # v1 (E1): channel mask, rise / fall / any
+            self.trigq = None  # v1 (K): TRIG clears the second term
+        elif m == "trigq":
+            self.trigq = (f["tm"], f["e"], f["ch"], f["lv"])
         elif m == "rel":
             rel = 1
         elif m == "tsget":
@@ -549,6 +575,7 @@ class Model:
                 F = int(sn["stale"][ch][edge] or sn["missed"][ch] or not self.valid)
                 O = sn["ord"][ch][edge]
             reg = "Y" if f["r"] else "X"
+            self.read_epoch = self.epoch if sn is not None else None  # v1 (P)
             setattr(self, reg, val)
             self.tag[reg] = [F, O, self.epoch]
         elif m == "judge":
@@ -594,7 +621,8 @@ class Model:
         b = f["b"]
         self.j_pend = {
             "m": s16(self.Y - self.X), "fx": fx, "fy": fy, "ord": int(ox or oy), "tagbad": int(ex != ey),
-            "invalid": int(fx or fy or ox or oy or ex != ey), "b": b, "raw": f["raw"], "push": f["push"],
+            "invalid": int(fx or fy or ox or oy or ex != ey or self.poison), "poison": self.poison,
+            "b": b, "raw": f["raw"], "push": f["push"],
             "w_hi": self.img[PROGRAM_WORDS + 2 * b], "w_lo": self.img[PROGRAM_WORDS + 1 + 2 * b],
             "ni": self.non_intrusive(),
         }
@@ -611,7 +639,7 @@ class Model:
         v = verdict_rule(m, n_lo, width, is_max, invalid)
         if b < 4:
             st = self.stats[b]
-            k = {"PASS": 0, "VIOL": 1, "INDET": 2}[v]
+            k = 5 if jp["poison"] else {"PASS": 0, "VIOL": 1, "INDET": 2}[v]  # v1 (P): own counter
             st[k] = min(st[k] + 1, M16)
             if not invalid:
                 st[3] = m if st[3] is None else min(st[3], m)
@@ -623,7 +651,7 @@ class Model:
             if len(self.fifo_v) + self._popped_v + need <= 8:
                 vcode = {"INDET": 0, "PASS": 1, "VIOL": 2}[v]
                 msat = max(-4, min(3, m)) & 7
-                hdr = (vcode << 14 | jp["fx"] << 13 | jp["fy"] << 12 | jp["tagbad"] << 11 | self.lost_since << 10
+                hdr = (vcode << 14 | jp["fx"] << 13 | jp["fy"] << 12 | jp["tagbad"] << 11 | jp["poison"] << 10
                        | jp["ni"] << 9 | jp["raw"] << 8 | b << 4 | jp["ord"] << 3 | msat)
                 self.fifo_v.append(hdr)
                 if jp["raw"]:
