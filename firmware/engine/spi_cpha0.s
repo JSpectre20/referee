@@ -11,6 +11,11 @@
 ; CPHA = 0: MOSI is set half a period before each leading edge; both ends sample on the
 ; leading edge and shift on the trailing edge. The target puts its first bit on MISO
 ; when CS falls.
+; SCK timing, in engine cycles, H = HALF (>= 4 cycles): each `set 4` issues right after a
+; `waitd`, so within a byte every SCK high and low time is exactly H (the `loop` and `sho`
+; after the trailing edge fit inside the next `waitd`). CS falls 2H + 1 before the first
+; leading edge. Between bytes SCK rests at CPOL for 2H + 12 from the last trailing edge to the
+; next leading edge (the program fetches the next byte and re-marks; longer if the host is late).
 ; Clock-independent: time literals are converted at the chip's clock (info.yaml).
 .equ CPOL 0                      ; idle SCK level (referee_host.py --equ CPOL=1: mode 2)
 .equ HALF 500ns                  ; half an SCK period

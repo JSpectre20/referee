@@ -209,6 +209,7 @@ class SPITarget:
         cs, sck, mosi = int(d.spi_cs.value), int(d.spi_sck.value), int(d.spi_mosi.value)
         t_edge = t_cs = t_mosi = t_sample = None
         cur, bitn, shift, tx = None, 0, 0, 0
+        nedge, t_half = 0, None  # SCK edges since CS fell; the last half period within this byte
         # a sampling edge's MOSI must be stable for this long before and after it: the
         # firmware gives half a period; allow 4 cycles for instruction slots
         margin = self.half - 4 * self.cyc
@@ -227,7 +228,7 @@ class SPITarget:
                 if nsck != self.cpol:
                     self._bad(f"SCK = {nsck} (not CPOL {self.cpol}) when CS {'falls' if ncs == 0 else 'rises'}")
                 if ncs == 0:
-                    cur, bitn, shift, t_cs, t_edge = [], 0, 0, now, None
+                    cur, bitn, shift, t_cs, t_edge, nedge = [], 0, 0, now, None, 0
                     self.reply = self.replies.pop(0) if self.replies else []
                     if self.cpha == 0:  # the first bit goes out when CS falls
                         tx = self._next_tx()
@@ -243,6 +244,17 @@ class SPITarget:
                 ref = t_edge if t_edge is not None else t_cs
                 if now - ref < self.half - self.cyc:
                     self._bad(f"SCK half-period / CS setup {now - ref:.0f} ns")
+                # Within a byte (16 edges, the first a leading edge) SCK must be symmetric:
+                # each half period equals the one before, to within half a clock cycle (the
+                # pads change on clock edges, so a real difference is a whole cycle).
+                if nedge % 16 == 0:
+                    t_half = None  # the first edge of a byte: the gap before it may differ
+                else:
+                    h = now - t_edge
+                    if t_half is not None and abs(h - t_half) > self.cyc / 2:
+                        self._bad(f"SCK half periods {t_half:.0f} / {h:.0f} ns within a byte")
+                    t_half = h
+                nedge += 1
                 t_edge = now
                 if leading == (self.cpha == 0):  # sampling edge
                     if t_mosi is not None and now - t_mosi < margin:
