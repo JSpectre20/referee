@@ -63,7 +63,9 @@ are free. Operand space: 11 bits.
 | E1 | **Trigger on a set of edges.** `trig` takes a channel mask and an edge kind (rise / fall / any) | operand bits of `trig` | about 6 flops (Referee only) |
 | E2 | **Snapshot tests.** `tsts ch, what`: C <- the level of channel `ch` after its last edge in the snapshot, or "the trigger was this channel's rise / fall"; A <- 1 if that answer is ambiguous (the edge is order-ambiguous with the trigger, or flagged). New branch condition A | opcode 0x1C | about 12 flops (Referee only): the levels and trigger edges kept in the snapshot, and A |
 | J | **A verdict as a branch condition** (finding 3): `judge b, flag` | the unused fourth value of JUDGE's push field | 2 flops (Referee only). Not in the model yet |
-| K | **Level-qualified trigger** (finding 3) | operand bits of `trig` | about 4 flops (Referee only). Not in the model yet |
+| K | **Level-qualified trigger** (finding 3): a second trigger term, `trigq mask, edge, ch, level` | opcode 0x1D | about 10 flops (Referee only). Not in the model yet |
+| L | **"A trigger was lost" as a branch condition** (finding 3) | branch conditions 14 / 15 | none (the bit exists). Not in the model yet |
+| M | **Stale earlier edge = PASS for a minimum bound** (finding 3) | none | 1 tag bit per register. Not in the model yet; needs a soundness argument first |
 | F | Short-level taint: a timestamp next to a level that, as sampled, lasted 5 cycles or less is flagged, which forces CAN'T TELL | none (part of the timestamp flags) | about 4 flops per channel. **Not an instruction, so the two-program rule does not decide it:** it is a soundness mechanism, and the owner decides |
 | G | Non-PASS pulse on a chosen output pin | global config word 7 | a few flops. Host configuration, not an instruction: the owner decides |
 | H | Timestamp prescaler | - | default cut (decided on 23 Nov) |
@@ -96,6 +98,15 @@ are free. Operand space: 11 bits.
    - **K: a level-qualified trigger.** Trigger on an edge of one channel only while another
      channel is at a given level (SDA edges while SCL is high = START and STOP). Data edges then
      never trigger, so they cannot push out the SCL rise that ends tSU;DAT.
+   - **L: "a trigger was lost" as a branch condition.** The hardware already keeps this bit
+     for the verdict header. If firmware can branch on it, a program that does keep state can
+     throw the state away after a loss and wait for the next START before it judges anything
+     that depends on it.
+   - **M: an old earlier edge is an answer, not a blank.** Today a timestamp older than 273 us
+     forces CAN'T TELL. For a minimum bound that is far shorter than 273 us the true answer is
+     PASS (tBUF after a long idle bus is the everyday case). This needs the "stale" flag kept
+     apart from the "missed" flag, and care right after reset, where "stale" does not yet mean
+     "old".
 4. **Stats slots.** There are four, and the report needs nine rules: either three passes over the
    traffic with different rule groups, or count-only slots for bounds 4 and up. To decide in the
    spec diff.
