@@ -31,6 +31,7 @@ FIELDS = {
     'st': (5, 4),
     'inv': (6, 6),
     'tm': (7, 4),
+    'lv': (8, 8),
     'w': (3, 2),
 }
 
@@ -62,6 +63,9 @@ INSTR = {
     'cmp': {'name': 'CMP', 'opcode': 0x17, 'operands': [('imm', False), ('hi', True)], 'cycles': 1, 'waits': False},
     'crcp': {'name': 'CRCP', 'opcode': 0x18, 'operands': [('imm', False), ('hi', True)], 'cycles': 1, 'waits': False},
     'bsc': {'name': 'BSC', 'opcode': 0x19, 'operands': [('tap', False), ('init', True), ('st', True), ('inv', True)], 'cycles': 1, 'waits': False},
+    'trigq': {'name': 'TRIGQ', 'opcode': 0x1f, 'operands': [('tm', False), ('e', False), ('ch', False), ('lv', False)], 'cycles': 1, 'waits': False},
+    'resync': {'name': 'RESYNC', 'opcode': 0x1d, 'operands': [], 'cycles': 1, 'waits': False},
+    'desync': {'name': 'DESYNC', 'opcode': 0x1e, 'operands': [], 'cycles': 1, 'waits': False},
     'tsts': {'name': 'TSTS', 'opcode': 0x1c, 'operands': [('ch', False), ('w', False)], 'cycles': 1, 'waits': False},
 }
 

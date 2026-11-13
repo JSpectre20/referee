@@ -283,3 +283,78 @@ def test_tsts_reports_ambiguity_when_edges_are_too_close_to_order():
     apart = [0] * 10 + [ch0] * 8 + [ch0 | ch1] * 30     # 8 cycles apart: the second is a lost trigger, no ambiguity
     assert tsts_after(apart, "tsts 0, trise") == (1, 0)
     assert tsts_after(apart, "tsts 1, level") == (0, 0)
+
+
+# ---------------------------------------------------------------- P: poison, resync, desync
+
+def verdict_headers(md):
+    out = []
+    while True:
+        v = md.verdict_pop()
+        if v is None:
+            return out
+        out.append(v)
+
+
+def test_poison_forces_cant_tell_until_a_resync_that_holds_a_clean_snapshot():
+    """Event 1 is being handled when another trigger arrives and is lost. A resync during event 1
+    must NOT clear the poison (the lost event came after the one the program is vouching for);
+    a JUDGE then answers INDETERMINATE with header bit 10 set and counts as poisoned. A resync
+    while holding the next, clean event clears it."""
+    src = """
+.bound 0, max, 10us
+        trig CH0, rise
+        tmon 1023, x16
+        waits                ; event 1
+        mark
+        waitd 40             ; still handling it when the next rise arrives: lost
+        resync               ; no effect: an event was lost during this one
+        tsget X, 0, fall
+        tsget Y, 0, rise
+        judge 0              ; poisoned
+        rel
+        tmon 1023, x16
+        waits                ; the next event, nothing lost since
+        tsget X, 0, fall
+        tsget Y, 0, rise
+        resync               ; clears the poison (it has read the snapshot it vouches for)
+        judge 0              ; a real verdict again
+        halt
+"""
+    md = run_program(src)
+    ch0 = 1 << 4
+    wave = [0] * 10 + [ch0] * 10 + [0] * 10 + [ch0] * 10 + [0] * 90 + [ch0] * 60
+    for ui in wave:
+        md.step(ui, 0)
+    assert md.state == "halted" and md.lost == 1
+    first, second = verdict_headers(md)
+    assert first >> 14 == 0 and first >> 10 & 1 == 1      # INDETERMINATE, poisoned
+    assert second >> 14 == 1 and second >> 10 & 1 == 0    # PASS (90 cycles low < 10 us), not poisoned
+    assert md.stats[0][:3] == [1, 0, 0] and md.stats[0][5] == 1
+
+
+def test_resync_without_a_snapshot_and_desync():
+    md = run_program("resync\n halt")                      # RUN starts poisoned; no snapshot held:
+    assert md.poison == 1                                  # resync has no effect
+    md = run_program("trig CH0, rise\n tmon 1023, x16\n waits\n resync\n halt")
+    for ui in [0] * 10 + [1 << 4] * 30:
+        md.step(ui, 0)
+    assert md.state == "halted" and md.poison == 1        # a snapshot it has not read: no effect
+    md = run_program("trig CH0, rise\n desync\n tmon 1023, x16\n waits\n tsts 0, trise\n resync\n halt")
+    for ui in [0] * 10 + [1 << 4] * 30:
+        md.step(ui, 0)
+    assert md.state == "halted" and md.poison == 0        # holding a clean event: cleared
+
+
+# ---------------------------------------------------------------- K: level-qualified trigger
+
+def test_trigq_triggers_only_while_the_qualifying_channel_is_at_its_level():
+    src = "trig CH2, rise\n trigq CH0, any, 1, 1\n tmon 1023, x16\n waits\n halt"
+    ch0, ch1 = 1 << 4, 1 << 5
+    md = run_program(src)                                  # CH1 low: a CH0 edge is not an event
+    for ui in [0] * 10 + [ch0] * 60:
+        md.step(ui, 0)
+    assert md.state == "running" and md.S == 0 and md.lost == 0
+    for ui in [ch0 | ch1] * 20 + [ch1] * 30:               # CH1 high (its own rise is not armed): CH0's fall is
+        md.step(ui, 0)
+    assert md.state == "halted" and md.T == 0 and md.snap["trig"] == {(0, 1)}

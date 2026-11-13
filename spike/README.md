@@ -62,9 +62,10 @@ are free. Operand space: 11 bits.
 | D | **Per-bound guard band.** Bound word 2 becomes `{n_lo[3:0], 0, is_max, width[9:0]}`; `n_lo` is signed. PASS and VIOLATION test against `n_lo` and `n_lo + width` (the v0.3 `inexact` bit is `width = 1`). The assembler computes both from the rule and one declaration per bus | bound table layout; assembler directives `.bus`, `.bound ... from/to` | 10 flops in the JUDGE pipeline (Referee only) |
 | E1 | **Trigger on a set of edges.** `trig` takes a channel mask and an edge kind (rise / fall / any) | operand bits of `trig` | about 6 flops (Referee only) |
 | E2 | **Snapshot tests.** `tsts ch, what`: C <- the level of channel `ch` after its last edge in the snapshot, or "the trigger was this channel's rise / fall"; A <- 1 if that answer is ambiguous (the edge is order-ambiguous with the trigger, or flagged). New branch condition A | opcode 0x1C | about 12 flops (Referee only): the levels and trigger edges kept in the snapshot, and A |
-| J | **A verdict as a branch condition** (finding 3): `judge b, flag` | the unused fourth value of JUDGE's push field | 2 flops (Referee only). Not in the model yet |
-| K | **Level-qualified trigger** (finding 3): a second trigger term, `trigq mask, edge, ch, level` | opcode 0x1D | about 10 flops (Referee only). Not in the model yet |
-| L | **"A trigger was lost" as a branch condition** (finding 3) | branch conditions 14 / 15 | none (the bit exists). Not in the model yet |
+| J | **A verdict as a branch condition** (finding 3): `judge b, flag` | the unused fourth value of JUDGE's push field | 2 flops (Referee only). Not in the model yet. Needed to judge tHD;DAT once data edges are no longer events (finding 10) |
+| **P** | **Poison** (the soundness fix, findings 1 and 10): a lost trigger sets `poisoned`; while it is set every JUDGE answers CAN'T TELL. `resync` clears it, but only while the program holds a snapshot and nothing was lost since that snapshot's trigger; `desync` sets it | opcodes 0x1D, 0x1E (could share one) | 2 flops (Referee only). **In the model** |
+| K | **Level-qualified trigger** (findings 2 and 10): a second trigger term, `trigq mask, edge, ch, level` | opcode 0x1F | about 10 flops (Referee only). **In the model** |
+| L | "A trigger was lost" as a branch condition | - | **dropped: P does the same job in hardware, and firmware cannot forget to check it** |
 | M | **Stale earlier edge = PASS for a minimum bound** (finding 3) | none | 1 tag bit per register. Not in the model yet; needs a soundness argument first |
 | F | Short-level taint: a timestamp next to a level that, as sampled, lasted 5 cycles or less is flagged, which forces CAN'T TELL | none (part of the timestamp flags) | about 4 flops per channel. **Not an instruction, so the two-program rule does not decide it:** it is a soundness mechanism, and the owner decides |
 | G | Non-PASS pulse on a chosen output pin | global config word 7 | a few flops. Host configuration, not an instruction: the owner decides |
@@ -80,8 +81,8 @@ are free. Operand space: 11 bits.
    (`tests/test_ref_i2c.py`, first test). But one event takes about 14 cycles (230 ns) to handle,
    and an event that arrives inside that window is lost (the chip counts it). After a lost START or
    SCL fall the state is out of step, and the next SCL fall is judged as tHD;STA against an SDA
-   fall that was not a START: a verdict about the wrong pair of edges. The second test shows it and
-   is marked as an expected failure until the program is redesigned.
+   fall that was not a START: a verdict about the wrong pair of edges. Fixed by finding 10; the
+   test that showed it now has to pass.
 2. **Short intervals are exactly the ones whose end event gets lost.** With SDA edges as triggers,
    an SCL rise that follows an SDA change by less than the handling time is lost, so a tSU;DAT
    violation is the case least likely to be judged. A device that changes SDA 100-200 ns after SCL
@@ -133,6 +134,48 @@ are free. Operand space: 11 bits.
    cycle apart; `trig 1, rise` silently changed meaning from v0.3 (now refused); the guard-band
    test would not have caught a rounding error on the far end of the band.
 
+10. **The soundness fix: a lost event poisons the referee (13 Nov, the owner's rule).** One bit
+    in hardware: every lost trigger sets it, and while it is set every JUDGE answers CAN'T TELL
+    (reported and counted apart from ordinary CAN'T TELL). Firmware clears it with `resync`, which
+    is its statement that its state now depends only on the event it is holding; for I2C that is a
+    START or a STOP. Two details the tests forced:
+    - `resync` must not forgive an event lost *while the current one was being handled* (the
+      first version did, and the wrong-pair tHD;STA verdict came back). So it only clears while a
+      snapshot is held and nothing was lost since that snapshot's trigger was accepted.
+    - a referee must start poisoned (`desync` first): it may be switched on mid-transfer.
+
+    With P, the test that was the known failure passes for both program variants on four traffic
+    mixes with violations: **no verdict that is not marked poisoned is about the wrong pair of
+    edges.** What P costs is coverage, and that depends on which edges are events:
+
+    | Traffic | P only: every SDA and SCL edge is an event (52 words, 8 rules) | P + K: SCL edges, START, STOP (49 words, 7 rules) |
+    | --- | --- | --- |
+    | legal, SDA changes 300-800 ns after SCL falls | all judged | all judged |
+    | legal, SDA changes 100-200 ns after SCL falls (many real devices) | **92.5% of events not judged** (every data edge is lost and poisons the rest of the transfer) | all judged, nothing lost |
+    | intervals drawn down to 70% of their minimum | 54.7% not judged, 328 violations reported | all judged, 691 violations reported |
+    | down to 50% of their minimum | 46.9% not judged, 515 reported | 2.7% not judged, 968 reported |
+    | down to 30% of their minimum | 88.0% not judged, 135 reported | 64.3% not judged, 428 reported |
+    | down to 10% of their minimum | 94.8% not judged, 70 reported | 88.3% not judged, 159 reported |
+
+    (Each percentage is of the events of the rules that variant judges; "all judged" leaves out
+    the first START after power-up, which is poisoned by design. tHD;DAT is not judged by P + K
+    yet: it needs candidate J. Numbers from `tests/test_ref_i2c.py`, fixed seeds.) The loss that remains with P + K comes from intervals shorter than the
+    handling time, about 250 ns: gross violations, under 40% of a 600 ns minimum. They are counted
+    (LOST) and never misjudged, but they are not reported as VIOLATION either. Lowering that is
+    the performance goal: a shorter path from edge to `rel`, and a resync point more often than
+    START / STOP.
+    Also by construction: RUN starts poisoned (a program that never says `resync` never gives a
+    verdict), and `resync` only counts for the snapshot the program last read. In the table,
+    "judged" includes ordinary CAN'T TELL answers (too close to the bound, or edges too close to
+    order). A known coverage gap of P + K: a data hold time under about 2 cycles (33 ns, which is
+    legal) makes the SCL fall ambiguous with the SDA edge, and the program then stays poisoned
+    until the next START or STOP; the test traffic uses 60 ns or more and does not show it.
+    The second reviewer fuzzed both programs with 300 random and glitchy waveforms each (intervals
+    down to 1% of their minimum) and found no unpoisoned PASS or VIOLATION that contradicts the oracle.
+    Smallest sound design: **P alone is enough for soundness (2 flops, 2 instructions) and replaces
+    L. K is what makes the instrument useful on real buses. J is needed for tHD;DAT. M is still
+    open.**
+
 ## Results
 
 (filled in as programs pass their tests on the model)
@@ -145,7 +188,8 @@ are free. Operand space: 11 bits.
 | UART RX, 8E1 (`uart_rx_8e1.s`) | - | 42 (about 7 of them work around finding 7) | C2, C1 (branch on Z) |
 | SPI controller, modes 0-3 (`spi_controller.s`) | 29 + 29 (one file per CPHA) | 26 (one file) | A |
 | SPI target, modes 0-3 (`spi_target.s`), up to 4.29 MHz SCK | - | 39 | A |
-| I2C Fast-mode referee, eight of nine rules, first version (to be redesigned: findings 1, 2, 5) | - (one rule: 10) | 47 of 64 | B, E1, E2 |
+| I2C Fast-mode referee, P only (`i2c_fm_referee_p.s`): eight of nine rules, every edge an event | - (one rule: 10) | 52 of 64 | B, E1, E2, P |
+| I2C Fast-mode referee, P + K (`i2c_fm_referee.s`): seven of nine rules, events = SCL edges, START, STOP | - | 49 of 64 | B, E1, E2, P, K |
 
 Every row passes a bus-level test in `tests/` against a device model written from the protocol,
 not from the firmware, with negative controls (a bit time 3% off, the wrong clock phase, an SCK
@@ -155,10 +199,12 @@ to engine on two models wired together.
 | Candidate | Used by (so far) | Verdict (so far) |
 | --- | --- | --- |
 | A separate shift registers | SPI controller, SPI target | two programs: stays, but needs the fix of finding 7. No program needs more than 8 bits of SRO |
-| B second loop counter | I2C referee (as two state flags) | one program: not yet; none of the UART / SPI programs wanted it |
+| B second loop counter | I2C referee (as two state flags; both variants are one program for this rule) | one program: not yet; none of the UART / SPI programs wanted it |
 | C1 wider branch field | UART RX 8E1 (Z), I2C referee (A) | new conditions are used; no program needs an address above 63 yet |
 | C2 CRC / parity register | UART TX 8E1, UART RX 8E1 | two programs: stays |
 | C3 bit stuffing | none yet (CAN not written) | open |
 | D guard band | none yet (no program declares a guard) | open |
 | E1 trigger on a set of edges | I2C referee | one program: not yet |
 | E2 snapshot tests | I2C referee | one program: not yet |
+| P poison, resync, desync | I2C referee | soundness mechanism for any referee that keeps state: the owner's rule, not subject to the count |
+| K level-qualified trigger | I2C referee | one program: not yet (an SPI referee would qualify SCK edges by CS) |
