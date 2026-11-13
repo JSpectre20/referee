@@ -115,7 +115,19 @@ are free. Operand space: 11 bits.
    SDA edge the program cannot know which it is, so the first version does not judge the rule at
    all (eight of nine). A stateless design can judge it one event later, once the SCL high period
    that follows has ended without a START or STOP.
-6. **Bugs the review of this folder found in the first version of the model** (all fixed, each with a
+6. **Candidate A as first modelled breaks two things v0.3 can do** (found by writing the UART and
+   SPI programs). `cmp` and `push` read SRI, which only `shi` writes, so a program can no longer
+   branch on a byte from the host (`pull; cmp 0x53`, the I2C controller's command dispatch) or
+   push a constant to the host (`ldsr 0xFF, hi; push hi`). The 8E1 receiver builds its 00 / FF
+   status bytes from line samples to get around it (about 7 words). Fix to try: a source flag on
+   `cmp` and `push` (read SRO instead of SRI).
+7. **Smaller things the firmware wanted:** a loop counter loaded from an IN byte (a frame length
+   from the host); a way to add a sampled bit to the parity register without shifting SRI (the
+   parity check costs 4 branch words without it); `^` in assembler expressions.
+8. **A v0.3 firmware bug found on the way:** the SPI controller's `waitd HALF; loop` makes SCK one
+   cycle asymmetric (8 high / 6 low at a 7-cycle half period). Fixed in the spike's controller;
+   the v0.3 files in `firmware/engine/` still have it.
+9. **Bugs the review of this folder found in the first version of the model** (all fixed, each with a
    test): `bsc off` could not be assembled (YAML reads `off` as false); "preset to ones" was wrong
    for CRCs narrower than 16 bits; `tsts` could report "not ambiguous" for two trigger edges one
    cycle apart; `trig 1, rise` silently changed meaning from v0.3 (now refused); the guard-band
@@ -127,7 +139,26 @@ are free. Operand space: 11 bits.
 
 | Program | v0.3 words | v1 words | Candidates used |
 | --- | --- | --- | --- |
+| UART TX, 8N1 (`uart_tx.s`) | 18 | 18 | none |
+| UART RX, 8N1 (`uart_rx.s`) | 16 | 16 | none |
+| UART TX, 8E1 (`uart_tx_8e1.s`) | - | 22 | C2 |
+| UART RX, 8E1 (`uart_rx_8e1.s`) | - | 42 (about 7 of them work around finding 7) | C2, C1 (branch on Z) |
+| SPI controller, modes 0-3 (`spi_controller.s`) | 29 + 29 (one file per CPHA) | 26 (one file) | A |
+| SPI target, modes 0-3 (`spi_target.s`), up to 4.29 MHz SCK | - | 39 | A |
 | I2C Fast-mode referee, eight of nine rules, first version (to be redesigned: findings 1, 2, 5) | - (one rule: 10) | 47 of 64 | B, E1, E2 |
 
-| Candidate | Used by | Verdict |
+Every row passes a bus-level test in `tests/` against a device model written from the protocol,
+not from the firmware, with negative controls (a bit time 3% off, the wrong clock phase, an SCK
+just above the stated limit, each of which must fail), and the UART and SPI pairs also run engine
+to engine on two models wired together.
+
+| Candidate | Used by (so far) | Verdict (so far) |
 | --- | --- | --- |
+| A separate shift registers | SPI controller, SPI target | two programs: stays, but needs the fix of finding 7. No program needs more than 8 bits of SRO |
+| B second loop counter | I2C referee (as two state flags) | one program: not yet; none of the UART / SPI programs wanted it |
+| C1 wider branch field | UART RX 8E1 (Z), I2C referee (A) | new conditions are used; no program needs an address above 63 yet |
+| C2 CRC / parity register | UART TX 8E1, UART RX 8E1 | two programs: stays |
+| C3 bit stuffing | none yet (CAN not written) | open |
+| D guard band | none yet (no program declares a guard) | open |
+| E1 trigger on a set of edges | I2C referee | one program: not yet |
+| E2 snapshot tests | I2C referee | one program: not yet |
