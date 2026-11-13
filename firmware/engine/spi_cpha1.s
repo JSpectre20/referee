@@ -10,6 +10,12 @@
 ;
 ; CPHA = 1: both ends shift on the leading edge (MOSI is set just after it) and sample
 ; on the trailing edge, half a period later.
+; SCK timing, in engine cycles, H = HALF (>= 4 cycles): each `set 4` issues right after a
+; `waitd`, so within a byte every SCK high and low time is exactly H. (Before 13 Nov the loop
+; ended `waitd HALF; loop bit`: the `loop` cycle came after the wait, so the active half was
+; H - 1 and the idle half H + 1.) CS falls H + 1 before the first leading edge. Between bytes
+; SCK rests at CPOL for H + 13 from the last trailing edge to the next leading edge (the
+; program fetches the next byte and re-marks; longer if the host is late).
 ; Clock-independent: time literals are converted at the chip's clock (info.yaml).
 .equ CPOL 0                      ; idle SCK level (referee_host.py --equ CPOL=1: mode 3)
 .equ HALF 500ns                  ; half an SCK period
@@ -24,15 +30,14 @@ lo:     pull                     ; low half (the host sends it right after)
         je   lo
         set  6, 0                ; CS low (already low after the first byte)
         mark
-        waitd HALF               ; CS setup (and a gap between bytes)
         ldrc 7
-bit:    set  4, 1-CPOL           ; leading edge: both ends shift
+bit:    waitd HALF               ; idle half (first bit: CS setup, and the gap between bytes)
+        set  4, 1-CPOL           ; leading edge: both ends shift
         sho  5, msb              ; MOSI <- next bit
         waitd HALF
         set  4, CPOL             ; trailing edge: both ends sample
         shi  7, msb              ; MISO (synchronized: its value just before the edge)
-        waitd HALF
-        loop bit
+        loop bit                 ; before the waitd, so both SCK edges issue right after one
         push hi                  ; the byte received, spread: 1 r7 1 r6 ... 1 r0
         push
         jmp  frame

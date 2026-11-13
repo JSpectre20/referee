@@ -645,7 +645,8 @@ async def i2c_controller_clock_stretching(dut):
 async def spi_controller_modes(dut):
     """firmware/engine/spi_cpha0.s / spi_cpha1.s in all four modes (CPOL by .equ) against an
     SPI target model: multi-byte full-duplex frames with CS held low; the model checks the
-    clock idle level, half-periods, CS setup / hold and MOSI setup / hold."""
+    clock idle level, half-periods (minimum, and equal within a byte), CS setup / hold and
+    MOSI setup / hold."""
     h = await start(dut)
     rng = random.Random(4)
     half_ns = 500

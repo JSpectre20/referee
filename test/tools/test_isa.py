@@ -191,3 +191,44 @@ def test_model_uart_tx_edges_at_t0_plus_2_plus_k_bit():
         c0 = mark_cycle + 2 + k * 521
         assert trace[c0 - 1] == lvl, f"bit {k} at cycle {c0}"
         assert trace[c0 - 2] != lvl or k == 0 or bits[k - 1] == lvl, f"edge of bit {k} not exactly at {c0}"
+
+
+@pytest.mark.parametrize("half,cycles", [("500ns", 30), ("7", 7), ("4", 4)])
+@pytest.mark.parametrize("cpol", [0, 1])
+@pytest.mark.parametrize("cpha", [0, 1])
+def test_model_spi_sck_half_periods_exact(cpha, cpol, half, cycles):
+    """spi_cpha0.s / spi_cpha1.s: within a byte, all 15 intervals between its 16 SCK edges are
+    exactly HALF cycles, in all four modes. (spi_cpha1.s used to end its bit loop with
+    `waitd HALF; loop bit`, which made the active half HALF - 1 and the idle half HALF + 1.)
+    Between bytes SCK rests at CPOL, for at least HALF."""
+    import referee_host as host
+
+    src = host.set_equ((FW / f"spi_cpha{cpha}.s").read_text(), {"CPOL": cpol, "HALF": half})
+    md = load_and_run(src, {4: (1, 1), 5: (1, 1), 6: (1, 1)})  # SCK, MOSI, CS: push-pull
+    data = [0xA5, 0x3C, 0x00]
+    feed = [x for b in data for x in host.spread(b)] + [host.SPI_END]  # a host that keeps IN full
+    edges, prev, cs_seen_low = [], None, False  # (cycle, SCK level after the edge) while CS low
+    for c in range(400 + len(data) * 20 * cycles):
+        if feed and md.in_push(feed[0]):
+            feed.pop(0)
+        md.out_pop()
+        md.step(0, 0)
+        uio = md.pins()[0]
+        sck, cs = uio >> 4 & 1, uio >> 6 & 1
+        if cs == 0 and md.ran:
+            cs_seen_low = True
+            if prev is not None and sck != prev:
+                edges.append((c, sck))
+        prev = sck
+    assert cs_seen_low and cs == 1 and sck == cpol, "frame did not end with CS high, SCK idle"
+    assert len(edges) == 16 * len(data), f"{len(edges)} SCK edges for {len(data)} bytes"
+    for k in range(len(data)):
+        byte = edges[16 * k:16 * (k + 1)]
+        assert byte[0][1] != cpol, f"byte {k}: first edge is not a leading edge"
+        phases = [b[0] - a[0] for a, b in zip(byte, byte[1:])]
+        assert phases == [cycles] * 15, (
+            f"mode {2 * cpol + cpha} HALF {cycles}: byte {k} SCK phases {phases} "
+            f"({'high' if cpol == 0 else 'low'} first)")
+        if k:
+            gap = byte[0][0] - edges[16 * k - 1][0]
+            assert gap >= cycles, f"byte {k}: gap {gap} < HALF"
