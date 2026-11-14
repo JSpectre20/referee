@@ -8,8 +8,8 @@ That proof exists today for two kinds of interval, under assumptions that are wr
 The table under "The error budget" says exactly which, and what is still open.
 
 Referee is an entry for the Jane Street protocol-emulator ASIC competition: a chip for
-[Tiny Tapeout](https://tinytapeout.com) on IHP SG13CMOS5L, with a 60 MHz clock and 24 digital
-pins.
+[Tiny Tapeout](https://tinytapeout.com) on IHP SG13CMOS5L, 8x4 tiles, with a 60 MHz clock and 24
+digital pins.
 
 ## What the chip is
 
@@ -64,7 +64,7 @@ start bit), so until the proof for falling edges is done they rest on the eviden
 not on the proof. Rules with intervals over 273 µs (a 1-Wire reset pulse, infrared remote
 codes) wait for long-interval timestamps.
 
-## Status (12 November 2026)
+## Status (13 November 2026)
 
 | Part | State |
 | --- | --- |
@@ -73,7 +73,7 @@ codes) wait for long-interval timestamps.
 | Not there yet | I2C and SPI targets, parity and CRC (so no UART parity, CAN or USB yet), the full set of I2C timing rules, the per-bus guard band |
 | Tests | 14 chip-level tests through the pins (cocotb), including an independent oracle that checks every verdict against the interval it generated; 24 unit tests, including the engine RTL run in lockstep with a reference model (the model's tables and the RTL's are generated from the same ISA file). One of the 24 covers `seq`, an earlier sequencer that is no longer in the chip |
 | Proofs | verdict soundness, edge timestamps, engine properties, UART; each has negative controls that must fail |
-| Hardening | One engine met 60 MHz at the slow corner on 6x4 tiles (+1.4 ns, 44% utilization) in October, on a probe branch (`sta-rtl`, commit `801e728` plus the flow settings now in `src/config.json`); the RTL has changed since. The competition's final size is 8x4: the switch and its first hardening run are in progress, and until they land `info.yaml` here says 6x4 |
+| Hardening | One engine on 8x4 tiles, the competition's final size: hardening, the Tiny Tapeout precheck and the gate-level tests pass (13 November). 60 MHz is met at the slow corner with +2.7 ns (typical +7.8 ns), hold is clean, and the design uses 34.5% of the core (25,392 cells). The first 8x4 run missed the slow corner by 0.41 ns on one group of paths; an RTL change (instruction fetch got its own read path) fixed it |
 | Real hardware | none yet: no chip, no FPGA run, no bench measurement |
 
 ## Try it
@@ -129,7 +129,7 @@ python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
 
 ## Plan
 
-1. **Now:** harden the current design at 8x4.
+1. **Done (13 November):** the current design hardens at 8x4 and meets 60 MHz.
 2. **November:** size the next ISA by writing the firmware first, on the reference model:
    I2C and SPI targets, UART with parity, CAN, and the full I2C Fast-mode rule set. An
    instruction-set addition that fewer than two real programs use is dropped.
