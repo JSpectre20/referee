@@ -1,27 +1,55 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Host side of Referee's UART command port (src/host_port.v).
+"""Host side of Referee's UART command port v2 (src/host_port.v, docs/isa-timing.md section 7).
 
-Packets are 4 bytes, CMD A B C; every packet gets a 2-byte reply, STATUS DATA.
-The packet builders here are shared by the cocotb tests (test/test.py) and
+Packets are 4 bytes, CMD A B C; every reply starts STATUS DATA (ACK 0x06 / NAK 0x15).
+The packet builders here are shared by the cocotb chip tests (test/test.py) and
 the command-line tool, so the two can't drift apart.
 
     python3 tools/referee_host.py --port /dev/ttyUSB0 id
-    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/seq/uart_tx.s --sr 0x41 --oe 0x01 --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/uart_tx.s --pin 0:pp --run
     python3 tools/referee_host.py --port /dev/ttyUSB0 status
+    python3 tools/referee_host.py --port /dev/ttyUSB0 drain
+    python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
 
-The chip's UART is 115200 8N1 at the 40 MHz project clock (ui_in[3] RX,
-uo_out[4] TX).
+Bit-serial controllers (load the firmware first, then talk to the bus through it):
+
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/i2c_controller.s --pin 2:od,3:od --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-write 50 10 a5 3c      # addr, pointer, data (hex)
+    python3 tools/referee_host.py --port /dev/ttyUSB0 i2c-read 50 10 2           # addr, pointer, count
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load firmware/engine/spi_cpha0.s --pin 4:pp,5:pp,6:pp --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 spi 9f 00 00 00            # one CS-low frame
+
+The chip's UART starts at 115200 8N1 (ui_in[3] RX, uo_out[4] TX) at the project clock in
+info.yaml; `--fast` switches both ends to clock / 20 first (3 Mbaud at 60 MHz).
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import refasm  # noqa: E402
+
 ACK, NAK, ID = 0x06, 0x15, 0x52
+
+
+def _clock_hz():
+    """The project clock: info.yaml is the single source (the demo board sets the clock from it)."""
+    import re
+
+    text = (Path(__file__).resolve().parent.parent / "info.yaml").read_text()
+    return int(re.search(r"^\s*clock_hz:\s*(\d+)", text, re.M).group(1))
+
+
+CLOCK_HZ = _clock_hz()
 BAUD = 115200
-PROG_WORDS = 32
+POWER_UP_DIV = round(CLOCK_HZ / BAUD)  # the chip's power-up bit period (src/project.v CLKS_PER_BIT)
+FAST_DIV = 20  # clock / 20: 3 Mbaud at 60 MHz
+ENGINE_WORDS = refasm.IMAGE_WORDS  # 97
+GLOBAL_WORDS = refasm.GLOBAL_WORDS  # 8
+VERDICT = {0: "INDETERMINATE", 1: "PASS", 2: "VIOLATION", 3: "?"}
 
 
 class HostError(Exception):
@@ -29,53 +57,170 @@ class HostError(Exception):
 
 
 # ----------------------------------------------------------------------------
-# Packets
+# Packets (one builder per command of src/host_port.v)
 # ----------------------------------------------------------------------------
 
 
+def _p(*b):
+    return bytes(x & 0xFF for x in (list(b) + [0, 0, 0, 0])[:4])
+
+
 def pkt_id():
-    return bytes([0x49, 0, 0, 0])
+    return _p(0x49)
 
 
-def pkt_write(addr, word):
-    return bytes([0x57, addr & 0xFF, (word >> 8) & 0xFF, word & 0xFF])
+def pkt_write_global(addr, word):
+    return _p(0x47, addr, word >> 8, word)
 
 
-def pkt_sr(byte):
-    return bytes([0x53, byte & 0xFF, 0, 0])
+def pkt_write_engine(addr, word, e=0):
+    return _p(0x57, (e << 7) | addr, word >> 8, word)
 
 
-def pkt_run(on):
-    return bytes([0x52, 1 if on else 0, 0, 0])
+def pkt_read(sel, addr, part):
+    """sel 0 global / 1 engine 0; addr 0x80 = computed CRC; part 0 low / 1 high byte."""
+    return _p(0x72, sel, addr, part)
 
 
-def pkt_oe(mask):
-    return bytes([0x4F, mask & 0xFF, 0, 0])
+def pkt_crc(sel, crc):
+    return _p(0x43, sel, crc >> 8, crc)
 
 
-def pkt_status():
-    return bytes([0x51, 0, 0, 0])
+def pkt_run(on, e=0):
+    return _p(0x52, e, 1 if on else 0)
+
+
+def pkt_push(byte, e=0):
+    return _p(0x50, e, byte)
+
+
+def pkt_pop(e=0):
+    return _p(0x70, e)
+
+
+def pkt_drain(maxn=8, e=0):
+    return _p(0x44, e, maxn)
+
+
+def pkt_stats_latch(slot, e=0):
+    return _p(0x53, e, slot)
+
+
+def pkt_stats_read(idx, part, e=0):
+    return _p(0x73, e, idx, part)
+
+
+def pkt_stats_clear(slot, e=0):
+    return _p(0x5A, e, slot)
+
+
+def pkt_lost(clear=False, e=0):
+    return _p(0x4C, e, 1 if clear else 0)
+
+
+def pkt_baud(div):
+    return _p(0x42, div >> 8, div)
+
+
+def pkt_status(port=False, e=0):
+    return _p(0x51, e, 1 if port else 0)
 
 
 def decode_status(data):
-    """DATA byte of a 'Q' reply -> dict."""
-    return {"running": bool(data & 0x80), "overrun": bool(data & 0x40), "pc": data & 0x1F}
+    """DATA of 'Q' e 0 -> dict (reading it cleared the sticky bits)."""
+    names = ["running", "S", "crc_fail", "pin_fault", "in_underrun", "verdict_ovf", "out_ovf", "ni"]
+    return {n: bool(data >> (7 - i) & 1) for i, n in enumerate(names)}
 
 
-def load_packets(words, sr=None, oe=None, run=False):
-    """Packets that halt, load a program (padded with `jump 0`), and optionally start it."""
-    if len(words) > PROG_WORDS:
-        raise HostError(f"program has {len(words)} words; seq holds {PROG_WORDS}")
-    jump0 = 0xC000
-    padded = list(words) + [jump0] * (PROG_WORDS - len(words))
-    pkts = [pkt_run(False)] + [pkt_write(a, w) for a, w in enumerate(padded)]
-    if sr is not None:
-        pkts.append(pkt_sr(sr))
-    if oe is not None:
-        pkts.append(pkt_oe(oe))
-    if run:
-        pkts.append(pkt_run(True))
+def decode_verdict(hdr):
+    """A VERDICT header slot -> dict (src/engine.v `vhdr`)."""
+    msat = hdr & 7
+    return {
+        "verdict": VERDICT[hdr >> 14], "FX": hdr >> 13 & 1, "FY": hdr >> 12 & 1, "TAG": hdr >> 11 & 1,
+        "L": hdr >> 10 & 1, "NI": hdr >> 9 & 1, "raw": hdr >> 8 & 1, "b": hdr >> 4 & 0xF,
+        "ORD": hdr >> 3 & 1, "m3": msat - 8 if msat & 4 else msat,
+    }
+
+
+def split_verdicts(slots):
+    """Drained 16-bit slots -> list of (header dict, raw m or None), pairing raw slots."""
+    out, i = [], 0
+    while i < len(slots):
+        h = decode_verdict(slots[i])
+        m = None
+        if h["raw"] and i + 1 < len(slots):
+            m = slots[i + 1] - 0x10000 if slots[i + 1] & 0x8000 else slots[i + 1]
+            i += 1
+        out.append((h, m))
+        i += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Bit-serial firmware (i2c_controller.s, spi_cpha0.s, spi_cpha1.s)
+# ----------------------------------------------------------------------------
+# SR is the engine's only shift register and each bit needs a shift out (sho) and a
+# shift in (shi). The host spreads each data byte over 16 bits with a 0 after every
+# data bit, so two shifts per bit bring the next data bit to SR[15]; the 8 samples
+# collect at the bottom as 1 s7 1 s6 ... 1 s0 and come back as two OUT bytes.
+
+I2C_START, I2C_STOP, I2C_XFER, I2C_ACK, I2C_NACK = 0x53, 0x50, 0x58, 0x4B, 0x41  # 'S' 'P' 'X' 'K' 'A'
+SPI_END = 0xFF  # end of frame: CS high (a spread byte never has bit 6 set)
+
+
+def spread(byte):
+    """Data byte -> the two IN bytes (high, low): t7 0 t6 0 t5 0 t4 0, t3 0 t2 0 t1 0 t0 0."""
+    w = 0
+    for k in range(8):
+        w |= (byte >> k & 1) << (2 * k + 1)
+    return w >> 8, w & 0xFF
+
+
+def gather(hi, lo):
+    """The two OUT bytes after 8 bits -> the byte sampled (bits 14, 12, ..., 0 of SR)."""
+    w = hi << 8 | lo
+    return sum((w >> (2 * k) & 1) << k for k in range(8))
+
+
+def pin_config(spec):
+    """'0:pp,1:od' -> {pin: (owner 1 = engine 0, mode 1 push-pull / 2 open-drain)}."""
+    modes = {"pp": 1, "od": 2}
+    pins = {}
+    for item in filter(None, (spec or "").split(",")):
+        p, m = item.split(":")
+        pins[int(p)] = (1, modes[m])
+    return pins
+
+
+def load_packets(glob, img):
+    """Halt, write the global config and the engine image, and both expected CRCs."""
+    if len(glob) != GLOBAL_WORDS or len(img) != ENGINE_WORDS:
+        raise HostError(f"image sizes {len(glob)}/{len(img)}, expected {GLOBAL_WORDS}/{ENGINE_WORDS}")
+    pkts = [pkt_run(False)]
+    pkts += [pkt_write_global(a, w) for a, w in enumerate(glob)]
+    pkts += [pkt_write_engine(a, w) for a, w in enumerate(img)]
+    pkts += [pkt_crc(0, refasm.crc16(glob)), pkt_crc(1, refasm.crc16(img))]
     return pkts
+
+
+def set_equ(source_text, equ):
+    """Override `.equ NAME value` lines, e.g. {"CPOL": 1} (each name must be defined)."""
+    import re
+
+    for name, value in (equ or {}).items():
+        pat = re.compile(rf"^(\s*\.equ\s+{re.escape(name)}\s+)\S+", re.M)
+        if not pat.search(source_text):
+            raise HostError(f".equ {name} is not defined in the source")
+        source_text = pat.sub(lambda m: m.group(1) + str(value), source_text, count=1)
+    return source_text
+
+
+def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ, equ=None):
+    """Assemble firmware -> (global image, engine image, notes)."""
+    source_text = set_equ(source_text, equ)
+    a = refasm.Assembler(clock_hz)
+    words = a.assemble(source_text)
+    return refasm.global_image(pins or {}, mux), a.image(words), a.notes
 
 
 # ----------------------------------------------------------------------------
@@ -90,58 +235,173 @@ class Referee:
         self.ser = serial.Serial(port, baud, timeout=timeout)
         self.ser.reset_input_buffer()
 
-    def transact(self, pkt):
+    def transact(self, pkt, extra=0):
         self.ser.write(pkt)
         reply = self.ser.read(2)
-        if len(reply) != 2:
-            raise HostError(f"no reply to {pkt.hex()} (got {reply.hex() or 'nothing'})")
-        status, data = reply
-        if status not in (ACK, NAK):
-            raise HostError(f"bad reply {reply.hex()} to {pkt.hex()}")
-        return status == ACK, data
+        if len(reply) != 2 or reply[0] not in (ACK, NAK):
+            raise HostError(f"bad reply {reply.hex() or 'nothing'} to {pkt.hex()}")
+        rest = b""
+        if reply[0] == ACK and pkt[0] == 0x44:
+            rest = self.ser.read(2 * reply[1])
+        return reply[0] == ACK, reply[1], rest
 
     def must(self, pkt):
-        ok, data = self.transact(pkt)
+        ok, data, rest = self.transact(pkt)
         if not ok:
             raise HostError(f"NAK for {pkt.hex()}")
-        return data
+        return (data, rest) if pkt[0] == 0x44 else data
+
+    def fast(self):
+        self.must(pkt_baud(FAST_DIV))
+        self.ser.baudrate = CLOCK_HZ // FAST_DIV
+
+    # -- bit-serial firmware (i2c_controller.s, spi_cpha0.s, spi_cpha1.s) --------
+    # The same sequences as the chip tests (test/test.py: push_in, pop_out, serial_byte,
+    # i2c_write, i2c_read), for a real chip.
+
+    def push_in(self, byte, timeout=1.0):
+        """Push one byte into IN, retrying while it is full."""
+        import time
+
+        t0 = time.monotonic()
+        while not self.transact(pkt_push(byte))[0]:
+            if time.monotonic() - t0 > timeout:
+                raise HostError("IN stayed full: is the firmware running?")
+            time.sleep(0.001)
+
+    def pop_out(self, timeout=1.0):
+        """Pop one byte from OUT, waiting until the firmware has pushed it."""
+        import time
+
+        t0 = time.monotonic()
+        while True:
+            ok, byte, _ = self.transact(pkt_pop())
+            if ok:
+                return byte
+            if time.monotonic() - t0 > timeout:
+                raise HostError("no byte in OUT: is the firmware running?")
+            time.sleep(0.001)
+
+    def serial_byte(self, byte, cmd=None):
+        """One byte through the firmware: spread in, gather the 8 samples out."""
+        if cmd is not None:
+            self.push_in(cmd)
+        for b in spread(byte):
+            self.push_in(b)
+        return gather(self.pop_out(), self.pop_out())
+
+    def i2c_bit(self, cmd):
+        """I2C_NACK (SDA released, sampled) or I2C_ACK (SDA low): one clock; the SDA sample."""
+        self.push_in(cmd)
+        self.pop_out()
+        return self.pop_out() & 1
+
+    def i2c_write(self, addr, ptr, data):
+        """START, address + W, pointer, data, STOP -> the target's ACK bits (0 = ACK)."""
+        acks = []
+        self.push_in(I2C_START)
+        for b in [addr << 1, ptr] + list(data):
+            if self.serial_byte(b, I2C_XFER) != b:
+                raise HostError(f"SDA did not read back {b:#04x}: another controller, or a stuck bus")
+            acks.append(self.i2c_bit(I2C_NACK))
+            if acks[-1]:
+                break
+        self.push_in(I2C_STOP)
+        return acks
+
+    def i2c_read(self, addr, ptr, n):
+        """START, address + W, pointer, repeated START, address + R, n bytes, STOP."""
+        self.push_in(I2C_START)
+        for b in (addr << 1, ptr):
+            self.serial_byte(b, I2C_XFER)
+            if self.i2c_bit(I2C_NACK):
+                self.push_in(I2C_STOP)
+                raise HostError(f"no ACK for {b:#04x}")
+        self.push_in(I2C_START)
+        self.serial_byte(addr << 1 | 1, I2C_XFER)
+        if self.i2c_bit(I2C_NACK):
+            self.push_in(I2C_STOP)
+            raise HostError("no ACK for the read address")
+        got = []
+        for k in range(n):
+            got.append(self.serial_byte(0xFF, I2C_XFER))
+            self.i2c_bit(I2C_ACK if k < n - 1 else I2C_NACK)
+        self.push_in(I2C_STOP)
+        return got
+
+    def spi_frame(self, data):
+        """One CS-low frame, full duplex -> the bytes received."""
+        got = [self.serial_byte(b) for b in data]
+        self.push_in(SPI_END)
+        return got
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", required=True)
+    ap.add_argument("--fast", action="store_true", help="switch to clock / 20 baud first")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("id")
     sub.add_parser("status")
     sub.add_parser("halt")
-    sub.add_parser("run")
-    ld = sub.add_parser("load", help="assemble and load a seq program")
+    sub.add_parser("drain")
+    st = sub.add_parser("stats")
+    st.add_argument("slot", type=int)
+    ld = sub.add_parser("load", help="assemble firmware, load it with a pin config, optionally run")
     ld.add_argument("source")
-    ld.add_argument("--sr", type=lambda s: int(s, 0), help="shift-register byte")
-    ld.add_argument("--oe", type=lambda s: int(s, 0), help="uio output-enable mask")
+    ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
     ld.add_argument("--run", action="store_true")
+    ld.add_argument("--equ", action="append", default=[], help="override a .equ, e.g. CPOL=1 (SPI modes 2/3)")
+    hexb = lambda x: int(x, 16)  # noqa: E731
+    iw = sub.add_parser("i2c-write", help="through i2c_controller.s: write data at a pointer")
+    iw.add_argument("addr", type=hexb)
+    iw.add_argument("ptr", type=hexb)
+    iw.add_argument("data", type=hexb, nargs="+")
+    ir = sub.add_parser("i2c-read", help="through i2c_controller.s: read n bytes from a pointer")
+    ir.add_argument("addr", type=hexb)
+    ir.add_argument("ptr", type=hexb)
+    ir.add_argument("n", type=int)
+    sp = sub.add_parser("spi", help="through spi_cpha0.s / spi_cpha1.s: one CS-low frame")
+    sp.add_argument("data", type=hexb, nargs="+")
     args = ap.parse_args(argv)
 
     ref = Referee(args.port)
     try:
+        if args.fast:
+            ref.fast()
         if args.cmd == "id":
-            data = ref.must(pkt_id())
-            print("Referee" if data == ID else f"unexpected id {data:#04x}")
+            print("Referee" if ref.must(pkt_id()) == ID else "unexpected id")
         elif args.cmd == "status":
             print(decode_status(ref.must(pkt_status())))
         elif args.cmd == "halt":
             ref.must(pkt_run(False))
-        elif args.cmd == "run":
-            ref.must(pkt_run(True))
+        elif args.cmd == "drain":
+            n, rest = ref.must(pkt_drain())
+            slots = [rest[2 * i] << 8 | rest[2 * i + 1] for i in range(n)]
+            for h, m in split_verdicts(slots):
+                print(h, "" if m is None else f"m = {m}")
+        elif args.cmd == "i2c-write":
+            acks = ref.i2c_write(args.addr, args.ptr, args.data)
+            print("ACK" if not any(acks) else f"NACK after {len(acks) - 1} bytes")
+        elif args.cmd == "i2c-read":
+            print(" ".join(f"{b:02x}" for b in ref.i2c_read(args.addr, args.ptr, args.n)))
+        elif args.cmd == "spi":
+            print(" ".join(f"{b:02x}" for b in ref.spi_frame(args.data)))
+        elif args.cmd == "stats":
+            ref.must(pkt_stats_latch(args.slot))
+            names = ["pass", "viol", "indet", "min", "max"]
+            print({n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)})
         else:
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
-            import seqasm
-
-            words = seqasm.assemble(Path(args.source).read_text())
-            for p in load_packets(words, args.sr, args.oe, args.run):
+            equ = dict(e.split("=", 1) for e in args.equ)
+            glob, img, notes = build(Path(args.source).read_text(), pin_config(args.pin), equ=equ)
+            for p in load_packets(glob, img):
                 ref.must(p)
-            print(f"loaded {len(words)} words" + (", running" if args.run else ""))
-    except HostError as e:
+            if args.run:
+                ok, _, _ = ref.transact(pkt_run(True))
+                if not ok:
+                    raise HostError(f"RUN refused: {decode_status(ref.must(pkt_status()))}")
+            print("\n".join(notes) + ("\nloaded, running" if args.run else "\nloaded"))
+    except (HostError, refasm.AsmError) as e:
         sys.exit(str(e))
 
 

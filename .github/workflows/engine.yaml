@@ -1,0 +1,93 @@
+# Engine v0: ISA toolchain (generator, assembler, model), RTL lockstep against the
+# model, and the engine + snapshot formal properties (formal/engine.sby).
+name: engine
+
+# CI runs by hand (workflow_dispatch, on any branch) or when a pull request to main is
+# opened, reopened or marked ready (and, where this workflow has a path filter, touches
+# those paths); not on every push. Day-to-day work is verified locally with the commands
+# in README.md ("Try it"); CI is the record at each milestone, and a hardening run takes
+# several hours.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
+    paths:
+      - "isa.yaml"
+      - "tools/**"
+      - "firmware/engine/**"
+      - "src/engine*.v"
+      - "src/snapshot.v"
+      - "src/edge_ts.v"
+      - "src/verdict.v"
+      - "test/tools/**"
+      - "test/engine/**"
+      - "formal/engine*"
+      - "formal/snapshot_formal.sv"
+      - "docs/isa-timing.md"
+      - ".github/workflows/engine.yaml"
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      - name: Generated files are up to date with isa.yaml
+        run: python3 tools/isagen.py --check
+
+      - name: Generator, assembler and model tests
+        run: cd test && pytest tools -v
+
+  lockstep:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install iverilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      - name: Engine RTL vs reference model, cycle by cycle (random programs + firmware)
+        run: cd test && timeout 1500 pytest engine -v
+
+  formal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # avoid the anonymous API rate limit
+
+      - name: Engine and snapshot properties, covers, and negative controls (must fail)
+        run: |
+          cd formal
+          sby -f engine.sby
+          # sby exits 0 for the negative controls only because of `expect fail`;
+          # check each task's status explicitly so a silent change is caught.
+          for t in prove cover snap snap_cover; do
+            grep -q '^PASS' engine_$t/status || { echo "engine_$t: $(cat engine_$t/status)"; exit 1; }
+          done
+          for t in snap_early tie_timeout; do
+            grep -q '^FAIL' engine_$t/status || { echo "engine_$t should FAIL: $(cat engine_$t/status)"; exit 1; }
+          done

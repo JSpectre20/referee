@@ -1,15 +1,30 @@
-# Verdict soundness (src/verdict.v on src/edge_ts.v): SymbiYosys at tick resolution.
+# Verdict soundness (src/verdict.v on src/edge_ts.v, judged through src/snapshot.v):
+# SymbiYosys at tick resolution, plus the combinational theorem on verdict.v alone.
 name: verdict
 
+# CI runs by hand (workflow_dispatch, on any branch) or when a pull request to main is
+# opened, reopened or marked ready (and, where this workflow has a path filter, touches
+# those paths); not on every push. Day-to-day work is verified locally with the commands
+# in README.md ("Try it"); CI is the record at each milestone, and a hardening run takes
+# several hours.
+
 on:
-  push:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
     paths:
       - "src/verdict.v"
       - "src/edge_ts.v"
+      - "src/snapshot.v"
       - "formal/verdict.sby"
       - "formal/verdict_formal.sv"
+      - "formal/verdict_comb.sv"
       - ".github/workflows/verdict.yaml"
-  workflow_dispatch:
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: verdict-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   formal:
@@ -19,15 +34,18 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # avoid the anonymous API rate limit
 
-      - name: Soundness proofs, covers, and the negative controls u1 and glitch (must fail)
+      - name: Soundness proofs, snapshot lemma, combinational theorem, covers, negative controls (must fail)
         run: |
           cd formal
           sby -f verdict.sby
           # sby exits 0 for u1 only because of `expect fail`;
           # check each task's status explicitly so a silent change is caught.
-          for t in bmc4 prove4 prove8 cover4 sharp4 sharp8; do
+          for t in bmc4 prove4 prove8 cover4 sharp4 sharp8 comb comb_cover; do
             grep -q '^PASS' verdict_$t/status || { echo "verdict_$t: $(cat verdict_$t/status)"; exit 1; }
           done
-          grep -q '^FAIL' verdict_u1/status
-          grep -q '^FAIL' verdict_glitch/status
+          for t in u1 glitch comb_onesided comb_u1; do
+            grep -q '^FAIL' verdict_$t/status || { echo "verdict_$t should FAIL: $(cat verdict_$t/status)"; exit 1; }
+          done

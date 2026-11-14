@@ -23,14 +23,15 @@ module uart_loopback #(
 
   wire line, busy;
   wire start = rst_n && want && !busy;
+  localparam [15:0] DIV = CLKS;  // the runtime bit period, fixed here
   uart_tx #(.CLKS_PER_BIT(CLKS)) u_tx (
-      .clk(clk), .rst_n(rst_n), .data(wdata), .start(start), .tx(line), .busy(busy)
+      .clk(clk), .rst_n(rst_n), .div(DIV), .data(wdata), .start(start), .tx(line), .busy(busy)
   );
 
   wire [7:0] rdata;
   wire rvalid, ferr;
-  uart_rx #(.CLKS_PER_BIT(CLKS)) u_rx (
-      .clk(clk), .rst_n(rst_n), .rx(line), .data(rdata), .valid(rvalid), .frame_err(ferr)
+  uart_rx u_rx (
+      .clk(clk), .rst_n(rst_n), .div(DIV), .rx(line), .data(rdata), .valid(rvalid), .frame_err(ferr)
   );
 
   // Scoreboard: at most two bytes can be in flight (one on the line, one

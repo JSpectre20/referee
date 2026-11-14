@@ -1,0 +1,80 @@
+# Engine v0 formal (docs/isa-timing.md section 9). Properties live next to the
+# RTL they talk about: src/engine.v and src/engine_sys.v (`ifdef FORMAL`),
+# src/snapshot.v (`ifdef SNAPSHOT_PROPS`).
+#
+#   prove        engine_sys, every input free, arbitrary program: 1-cycle issue,
+#                WAITD = max(t+1, DL), DL/TO writers, event wins a tie, pads only
+#                after SET/SHO to owned pins, image/config writes only while halted,
+#                no issue without a passed RUN check (and the registered RUN start
+#                equals the last-cycle check), JUDGE inputs and its cycle-2 effects
+#                (push / FIFO-full / VERDICT_OVF / stats / L clear, back to back),
+#                the four pc copies equal pc, LOST, HALT releases open-drain pins
+#                (k-induction, unbounded)
+#   cover        the interesting cases of those are reachable. Starts in the
+#                post-RUN state (ENGINE_FORMAL_START_RUNNING) instead of a 106-cycle
+#                RUN check: claims constrained valid, and the first cycle must
+#                satisfy f_post_run, the predicate `prove` asserts after every real RUN
+#   snap         snapshot alone, every input free: capture == edge_ts state as of
+#                the end of r+1, visible in r+3; ORD exactly r-1..r+1 except the
+#                trigger edge; constant while S; lost triggers (k-induction)
+#   snap_cover   ORD from r-1 / r+1, the trigger edge without ORD, a lost trigger
+#   snap_early   negative control: capture at r+1 (v0.3 timing).
+#                EXPECTED TO FAIL.
+#   tie_timeout  negative control: the timeout wins a WAITP tie (starts running).
+#                EXPECTED TO FAIL.
+[tasks]
+prove
+cover
+snap
+snap_cover
+snap_early
+tie_timeout
+
+[options]
+multiclock off
+prove: mode prove
+prove: depth 6
+cover: mode cover
+cover: depth 40
+snap: mode prove
+snap: depth 8
+snap_cover: mode cover
+snap_cover: depth 12
+snap_early: mode bmc
+snap_early: depth 8
+snap_early: expect fail
+tie_timeout: mode bmc
+tie_timeout: depth 30
+tie_timeout: expect fail
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+prove:       read_verilog -formal -DFORMAL edge_ts.v snapshot.v verdict.v engine.v engine_sys.v
+cover:       read_verilog -formal -DFORMAL -DENGINE_FORMAL_START_RUNNING edge_ts.v snapshot.v verdict.v engine.v engine_sys.v
+tie_timeout: read_verilog -formal -DFORMAL -DENGINE_MUTANT_TIMEOUT_WINS -DENGINE_FORMAL_START_RUNNING edge_ts.v snapshot.v verdict.v engine.v engine_sys.v
+prove:       read_verilog -formal -sv engine_formal.sv
+cover:       read_verilog -formal -sv engine_formal.sv
+tie_timeout: read_verilog -formal -sv engine_formal.sv
+snap:        read_verilog -formal -DFORMAL -DSNAPSHOT_PROPS snapshot.v
+snap_cover:  read_verilog -formal -DFORMAL -DSNAPSHOT_PROPS snapshot.v
+snap_early:  read_verilog -formal -DFORMAL -DSNAPSHOT_PROPS -DSNAPSHOT_MUTANT_EARLY snapshot.v
+snap:        read_verilog -formal -sv snapshot_formal.sv
+snap_cover:  read_verilog -formal -sv snapshot_formal.sv
+snap_early:  read_verilog -formal -sv snapshot_formal.sv
+prove:       prep -top engine_formal
+cover:       prep -top engine_formal
+tie_timeout: prep -top engine_formal
+snap:        prep -top snapshot_formal
+snap_cover:  prep -top snapshot_formal
+snap_early:  prep -top snapshot_formal
+
+[files]
+../src/edge_ts.v
+../src/snapshot.v
+../src/verdict.v
+../src/engine.v
+../src/engine_sys.v
+engine_formal.sv
+snapshot_formal.sv

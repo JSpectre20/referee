@@ -1,0 +1,283 @@
+# Referee engine ISA, v1 CANDIDATES (spike; not approved). A copy of isa.yaml (v0.3) with the
+# candidate changes of spike/README.md. Only the parts the generator reads (fields, enums,
+# flags_kw, aliases, reserved_opcodes, instructions) are kept current here; the descriptive
+# sections above them still describe v0.3 except where marked v1.
+#
+# Single source of truth. In step 2 a generator (tools/isagen.py) produces from
+# this file: the opcode include for the RTL (src/isa_defs.vh), the assembler,
+# the cycle-level reference model, and the instruction table in
+# docs/isa-timing.md. Nothing else may define an opcode, a field or a cycle cost.
+#
+# Conventions
+#   - Words are 16 bits. Bits [15:11] are the opcode; [10:0] hold the operands.
+#   - Field ranges are [msb, lsb] within the word; unused bits must be 0
+#     (the assembler guarantees it, the hardware ignores them).
+#   - `cycles` is the issue cost when the instruction does not wait.
+#     `waits: true` marks the only instructions that can stall: WAITD, WAITP, WAITS.
+#   - Timing contract and assumption ledger: docs/isa-timing.md.
+
+isa: referee-engine
+version: "1.0-spike"
+word_bits: 16
+opcode_bits: [15, 11]
+
+clock:
+  target_hz: 60000000    # STA target; demo board: RP2 sysclk 120 MHz / 2, 50% duty
+  fallback_hz: 40000000  # 120 MHz / 3 (33% duty: STA must check minimum pulse width)
+  # Contracts are written in ns; the assembler converts them with the clock the
+  # image is built for (.clock_hz / --clock-hz). See bounds_table.
+
+engines:
+  v0: 1
+  planned: 2             # decided at the 8 Nov gate from the area ledger
+  shared: "one edge_ts (4 channels), one host port, the global config"
+  per_engine: "program, bounds, registers, flags, FIFOs, snapshot + trigger, stats, lost-trigger counter"
+
+machine:                 # per engine
+  pc_bits: 7             # v1 (C1)
+  program_words: 128     # v1: the maximum (Player 96 or 128; the Referee engine 64). pc wraps at the engine's own size
+  registers:
+    X:   {bits: 16, doc: "general; first timestamp for JUDGE (+ 2-bit epoch tag EX, flag FX)"}
+    Y:   {bits: 16, doc: "general; second timestamp for JUDGE (+ EY, FY)"}
+    SR:  {bits: 16, doc: "shift register (SHO/SHI/PULL/PUSH/LDSR/CMP)"}
+    RC:  {bits: 8,  doc: "repeat counter for LOOP; one level, no nesting in v0"}
+    DL:  {bits: 16, doc: "SCHEDULE deadline. Changed only by MARK and WAITD."}
+    TO:  {bits: 16, doc: "TIMEOUT deadline for WAITP/WAITS. Changed only by TMO and TMON."}
+  flags:                 # all testable with BR
+    T:  "1 if the last WAITP/WAITS ended by its timeout, 0 if by its event"
+    C:  "last bit sampled by SHI or TSTP, or the result of CMP"
+    E:  "1 if the last PULL found the IN FIFO empty (SR unchanged)"
+    S:  "a snapshot is pending (taken, not yet released by REL)"
+  timestamp_tags:        # copied by TSGET
+    FX: "X's timestamp is unusable: stale | missed | no valid snapshot yet"
+    OX: "X's edge is order-ambiguous with the trigger (latched in cycles r-1..r+1, r = the trigger's report cycle; never the trigger edge itself)"
+    EX: "2-bit epoch of the snapshot X came from"
+    FY: "same for Y"
+    OY: "same for Y"
+    EY: "same for Y"
+  counters:
+    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was held or a capture pending; saturating; host-readable; host-clearable only"}
+  sticky_status:         # host-visible; cleared by the host status read or a new RUN
+    OUT_OVF:     "PUSH found OUT full; byte dropped"
+    VERDICT_OVF: "JUDGE found VERDICT full; entry dropped"
+    IN_UNDERRUN: "a PULL found IN empty"
+    PIN_FAULT:   "SET/SHO addressed a pin this engine doesn't own (no effect)"
+    CRC_FAIL:    "the last RUN was refused: checksum or pin-claim check failed"
+  now: {bits: 16, doc: "free-running cycle counter shared with edge_ts; read-only"}
+
+pins:
+  outputs:               # SET / SHO pin numbers (p, 4 bits)
+    count: 15
+    map: {0-7: "uio[0..7]", 8-14: "uo_out[0,1,2,3,5,6,7]", 15: reserved}
+    note: "uo_out[4] is the host UART TX (Tiny Tapeout UART pinout), so it is never an engine output"
+    modes: {uio: [input, push_pull, open_drain], uo_out: [push_pull]}
+    ownership: "global config: owner engine (or none) and mode per output pin; SET/SHO to an unowned pin has no effect and sets PIN_FAULT"
+  inputs:                # WAITP / TSTP / SHI pin numbers (q, 4 bits), all through 2-flop synchronizers
+    count: 16
+    map: {0-7: "uio_in[0..7]", 8-11: "ui_in[0..3]", 12-15: "judge channels 0..3 (after the mux)"}
+  judge_channels:
+    count: 4
+    default_source: "ui_in[4..7]"        # input-only pads: cannot disturb the bus
+    mux: "per channel: ui_in[4+ch] (default) or uio_in[0..7]; global config"
+    non_intrusive: "true only when all four channels select ui_in; reported as NI in every verdict"
+    waitp: "required: inputs 12..15 are the channels, the same synchronized signal edge_ts sees"
+  out_of_v0: [10BASE-T]
+
+edge_ts_snapshot:        # one edge_ts; one snapshot + trigger per engine
+  tracks_last_edge: "per channel, which of rise/fall was latched last (for TSGET e = last)"
+  trigger: "per engine, set by TRIG ch, e (default: disabled)"
+  on_trigger: >-
+    if !S and no capture pending: snapshot <- every channel's {rise_ts, fall_ts, last_edge, rise_stale,
+    fall_stale, missed} AS LATCHED AT THE END OF CYCLE r+1 (r = the trigger's report cycle; copied at the
+    end of r+2 from the edge_ts registers, so S, epoch and valid are visible from r+3), plus per edge an ORD
+    bit = "latched in cycle r-1, r or r+1", except the trigger edge itself (order relative to the trigger is
+    ambiguous: report latencies differ by < 2 cycles in either direction); epoch <- epoch + 1; S <- 1; valid <- 1.
+    The one-cycle delay guarantees every edge that truly happened before the trigger edge is in the
+    snapshot, so no earlier edge can be missed (that would allow a false PASS).
+    If S or a capture is pending (r..r+2): snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
+    lost_since_verdict <- 1. A lost trigger does NOT force INDETERMINATE.
+  read_by: TSGET
+  released_by: REL
+  formal: "after an accepted trigger, snapshot == edge_ts state as of the end of cycle r+1; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in cycles r-1..r+1 other than the trigger edge itself; any edge latched at r-2 or earlier is truly before the trigger; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S or a capture is pending, and saturates"
+
+fifos:                   # per engine
+  IN:      {width: 8,  depth: 4, dir: host_to_engine, engine_side: "PULL: never stalls; empty -> E <- 1, SR unchanged, IN_UNDERRUN"}
+  OUT:     {width: 8,  depth: 4, dir: engine_to_host, engine_side: "PUSH: never stalls; full -> drop, OUT_OVF"}
+  VERDICT: {width: 16, depth: 8, dir: engine_to_host, engine_side: "JUDGE: never stalls; 1 slot, or 2 with raw; full -> drop all, VERDICT_OVF"}
+
+verdict_entry:           # VERDICT FIFO slot 1 (header); slot 2 only with `raw`
+  header:
+    "15:14": "verdict: 00 INDETERMINATE, 01 PASS, 10 VIOLATION"
+    "13": FX
+    "12": FY
+    "11": "TAG: X and Y came from different snapshots (EX != EY)"
+    "10": "v1 (P): poisoned: a trigger was lost (or DESYNC ran) since the last RESYNC; the verdict is INDETERMINATE and claims nothing (v0.3: L, a trigger was lost since the previous JUDGE)"
+    "9":  "NI: non-intrusive (all judge channels on ui_in)"
+    "8":  "R: a raw slot follows"
+    "7:4": "bound index b"
+    "3":  "ORD: an edge was order-ambiguous with the trigger (OX | OY)"
+    "2:0": "m saturated to -4..+3 cycles (coarse; use raw for the exact value)"
+  raw: "slot 2: m[15:0], the measured interval in cycles, signed"
+
+stats:                   # per engine, bound slots b = 0..3, updated by every JUDGE b (any push mode)
+  slots: 4
+  per_slot:
+    n_pass:  {bits: 16, saturating: true}
+    n_viol:  {bits: 16, saturating: true}
+    n_indet: {bits: 16, saturating: true}
+    m_min:   {bits: 16, signed: true, doc: "over judgments that were not invalid"}
+    m_max:   {bits: 16, signed: true, doc: "same"}
+  reserved_for_later: {sum_m: 32, sum_m2: 48}   # vernier statistics; address space reserved now
+  host: "latch one slot into a shadow (atomic), then read it byte by byte; clear per slot"
+
+bounds_table:            # per engine
+  entries: 16
+  entry:
+    n_lo:    {bits: 20, frac_bits: 4, doc: "bound in cycles, rounded DOWN to 1/16 cycle"}
+    inexact: {bits: 1, doc: "1 if the conversion was not exact; then n_hi = n_lo + 1/16"}
+    is_max:  {bits: 1}
+  source: "assembler: .bound b, min|max, <time> with the image's clock (.clock_hz)"
+  rule: "PASS tests against the rounded-up bound, VIOLATION against the rounded-down one: sound for any clock"
+
+images:
+  global:
+    words: 8
+    layout:
+      0:   "magic 0x5246 ('RF') "
+      1:   "format version (3) | engine count"
+      2-5: "output pins 0..14 (+1 reserved): 4 bits each = {owner[1:0] (0 none, 1 engine 0, 2 engine 1), mode[1:0]}"
+      6:   "judge channel mux: 4 bits per channel (0 = ui_in default, 1..8 = uio_in[0..7])"
+      7:   "reserved (0)"
+    crc: "CRC-16/CCITT-FALSE over words 0..7"
+    written: "only while ALL engines are halted"
+  per_engine:
+    words: 97
+    layout:
+      0-63:  "program"
+      64-95: "bounds 0..15, 2 words each: n_lo[19:4]; {n_lo[3:0], inexact, is_max, 10 zeros}"
+      96:    "claimed output pins: 15-bit mask (bit 15 = 0), computed by the assembler from SET/SHO"
+    crc: "CRC-16/CCITT-FALSE over words 0..96"
+    written: "only while that engine is halted"
+  run_checks: >-
+    RUN(e) reads the global image and engine e's image through the engines' read ports
+    (8 + 97 = 105 cycles), and starts only if both CRCs match the host's expected values AND
+    every pin engine e claims is owned by e in the global config (so two engines can never
+    drive one pin). Otherwise e stays halted and CRC_FAIL is set.
+  readback: "every word of every image and the computed CRCs, while halted"
+  writes_only_while_halted: "enforced in hardware (write enables gated), not only by the host port"
+
+host_uart:
+  default_baud: 115200   # at power-up, so any terminal or the demo board can connect
+  fast: "a host command sets the divisor (applied after its reply): 1, 2 or 3 Mbaud at 60 MHz = 60, 30, 20 cycles per bit"
+  drain: "a bulk read returns up to 8 VERDICT slots in one reply (count + 2 bytes per slot)"
+
+fields:
+  p:    {bits: [3, 0],  doc: "output pin 0..14 (see pins.outputs)"}
+  q:    {bits: [3, 0],  doc: "input pin 0..15"}
+  v:    {bits: [4, 4],  doc: "level 0/1"}
+  msb:  {bits: [4, 4],  doc: "1: MSB first (shift left), 0: LSB first (shift right)"}
+  raw:  {bits: [4, 4],  doc: "JUDGE: also push the exact m"}
+  push: {bits: [6, 5],  doc: "JUDGE push mode: 0 all, 1 nonpass, 2 none (stats only)"}
+  hi:   {bits: [8, 8],  doc: "1: bits [15:8], 0: bits [7:0] (of SRO, SRI or POLY)"}
+  n:    {bits: [10, 0], doc: "unsigned cycles 0..2047; the assembler splits longer waits"}
+  t:    {bits: [9, 0],  doc: "timeout count 0..1023, in units of 1 or 16 cycles (x16)"}
+  x16:  {bits: [10, 10], doc: "1: t counts 16-cycle units (timeouts up to 16368 cycles)"}
+  a:    {bits: [6, 0],  doc: "v1: program address 0..127 (Player up to 128 words; Referee uses 0..63)"}
+  c:    {bits: [10, 7], doc: "v1: branch condition, 4 bits: 0 T, 1 !T, 2 C, 3 !C, 4 E, 5 !E, 6 S, 7 !S, 8 Z, 9 !Z, 10 U, 11 !U, 12 A, 13 !A; 14 and 15 reserved (never / always)"}
+  imm:  {bits: [7, 0],  doc: "8-bit immediate"}
+  r:    {bits: [5, 5],  doc: "0: X, 1: Y"}
+  ch:   {bits: [1, 0],  doc: "judge channel 0..3"}
+  e:    {bits: [3, 2],  doc: "0: rising edge, 1: falling edge, 2: last edge (whichever was latched later; TSGET only), 3: v1: any edge (TRIG only)"}
+  b:    {bits: [3, 0],  doc: "bounds-table entry 0..15 (stats for 0..3)"}
+  # v1 candidates
+  rc1:  {bits: [8, 8],  doc: "B: 1 = the second loop counter RC1 (LDRC / LOOP)"}
+  sm:   {bits: [6, 5],  doc: "C2/C3: SHO / SHI mode: 0 data, 1 crc (SHO only), 2 stuff; other values reserved (as data)"}
+  tap:  {bits: [1, 0],  doc: "C2: bit stream the CRC register and the run counter follow: 0 off, 1 the bits SHO sends, 2 the bits SHI samples"}
+  init: {bits: [3, 2],  doc: "C2: 0 keep L, 1 L <- 0, 2 L <- all ones in the CRC's own bits (bit 15 down to POLY's lowest set bit; load POLY first); 1 and 2 also clear the run counter"}
+  st:   {bits: [5, 4],  doc: "C3: stuffing rule: 0 none, 1 can (after 5 equal bits), 2 usb (after 6 ones). Only while tap is sho or shi: with tap off the run counter stands still and U is 0"}
+  inv:  {bits: [6, 6],  doc: "C2: for CRCs sent inverted (USB): invert the CRC bits `sho p, crc` sends, and the tapped bits on their way into L. Firmware sets it (with init keep) only for the CRC field, never for the data"}
+  tm:   {bits: [7, 4],  doc: "E1: judge-channel mask (bit i = channel i)"}
+  lv:   {bits: [8, 8],  doc: "K: the level the qualifying channel must have"}
+  w:    {bits: [3, 2],  doc: "E2: what TSTS reads: 0 level, 1 the trigger was this channel's rise, 2 ... fall, 3 reserved (as 2)"}
+
+enums:             # operand keywords (structured form of the field docs above)
+  c:    {T: 0, nT: 1, C: 2, nC: 3, E: 4, nE: 5, S: 6, nS: 7, Z: 8, nZ: 9, U: 10, nU: 11, A: 12, nA: 13}
+  e:    {rise: 0, fall: 1, last: 2, any: 3}   # last: TSGET only; any: TRIG only
+  r:    {X: 0, Y: 1}
+  push: {all: 0, nonpass: 1, none: 2}
+  sm:   {crc: 1, stuff: 2}
+  tap:  {"off": 0, sho: 1, shi: 2}   # quoted: YAML 1.1 reads a bare off as False
+  init: {keep: 0, zeros: 1, ones: 2}
+  st:   {nostuff: 0, can: 1, usb: 2}
+  w:    {level: 0, trise: 1, tfall: 2}
+flags_kw: [msb, hi, raw, x16, rc1, inv]   # 1-bit operands written as a bare keyword: `sho 0, msb`
+aliases:           # assembler aliases for BR
+  jt: T
+  jnt: nT
+  jc: C
+  jnc: nC
+  je: E
+  jne: nE
+  js: S
+  jns: nS
+  jz: Z
+  jnz: nZ
+  ju: U
+  jnu: nU
+  ja: A
+  jna: nA
+
+reserved_opcodes:
+  0x1A: "v1 bitstream unit (not needed so far)"
+  0x1B: "v1 bitstream unit (not needed so far)"
+
+instructions:
+  - {name: NOP,   opcode: 0x00, syntax: "nop",            cycles: 1, semantics: "nothing"}
+  - {name: HALT,  opcode: 0x01, syntax: "halt",           cycles: 1,
+     semantics: "stop. Push-pull pins keep their level; open-drain pins are RELEASED (a held-low SDA would hang the bus)."}
+  - {name: SET,   opcode: 0x02, syntax: "set p, v",       cycles: 1, pad_latency: 1,
+     semantics: "pin p <- v if this engine owns p (else no effect, PIN_FAULT). Push-pull: drive v. Open-drain: v=0 drives low, v=1 releases."}
+  - {name: SHO,   opcode: 0x03, syntax: "sho p[, msb][, sm]",   cycles: 1, pad_latency: 1,
+     semantics: "v1 (A): pin p <- msb ? SRO[15] : SRO[0] (ownership as SET); SRO shifts that bit out, refilling with 1. (C2) sm = crc: pin p <- L[15] (^ inv), L shifts left. (C3) sm = stuff: pin p <- the complement of the last stream bit (usb: 0); SRO and L untouched; the run counter restarts"}
+  - {name: SHI,   opcode: 0x04, syntax: "shi q[, msb][, sm]",   cycles: 1,
+     semantics: "v1 (A): C <- in[q]; SRI <- msb ? {SRI[14:0], in[q]} : {in[q], SRI[15:1]}. (C3) sm = stuff: sample a stuff bit: SRI and L untouched; C <- 1 if it breaks the stuffing rule (can: equals the last stream bit; usb: is 1); the run counter restarts"}
+  - {name: TSTP,  opcode: 0x05, syntax: "tstp q",         cycles: 1, semantics: "C <- in[q]"}
+  - {name: MARK,  opcode: 0x06, syntax: "mark",           cycles: 1, semantics: "DL <- NOW"}
+  - {name: TMO,   opcode: 0x07, syntax: "tmo t[, x16]",   cycles: 1, semantics: "TO <- DL + t * (x16 ? 16 : 1) (timeout relative to the schedule)"}
+  - {name: WAITD, opcode: 0x08, syntax: "waitd n",        cycles: 1, waits: true,
+     semantics: "DL <- DL + n; the next instruction issues at max(t + 1, DL)"}
+  - {name: WAITP, opcode: 0x09, syntax: "waitp q, v",     cycles: 1, waits: true,
+     semantics: "until in[q] == v (T <- 0) or NOW - TO >= 0 (T <- 1); pin event wins a tie; DL and TO unchanged"}
+  - {name: WAITS, opcode: 0x0A, syntax: "waits",          cycles: 1, waits: true,
+     semantics: "until S (T <- 0) or NOW - TO >= 0 (T <- 1); snapshot wins a tie; DL and TO unchanged"}
+  - {name: JMP,   opcode: 0x0B, syntax: "jmp a",          cycles: 1, semantics: "pc <- a"}
+  - {name: BR,    opcode: 0x0C, syntax: "br c, a",        cycles: 1,
+     semantics: "if condition c: pc <- a. Aliases: jt jnt jc jnc je jne js jns, v1: jz jnz ju jnu ja jna"}
+  - {name: LOOP,  opcode: 0x0D, syntax: "loop a[, rc1]",  cycles: 1, semantics: "v1 (B): with RC = rc1 ? RC1 : RC0: if RC != 0: RC <- RC - 1, pc <- a; else fall through"}
+  - {name: LDRC,  opcode: 0x0E, syntax: "ldrc imm[, rc1]", cycles: 1, semantics: "v1 (B): RC0 (or RC1) <- imm"}
+  - {name: LDSR,  opcode: 0x0F, syntax: "ldsr imm[, hi]", cycles: 1, semantics: "v1 (A): SRO[7:0] (or SRO[15:8]) <- imm"}
+  - {name: PULL,  opcode: 0x10, syntax: "pull[ hi]",      cycles: 1,
+     semantics: "v1 (A): if IN non-empty: SRO byte <- IN, E <- 0; else E <- 1, SRO unchanged, IN_UNDERRUN <- 1. Never stalls."}
+  - {name: PUSH,  opcode: 0x11, syntax: "push[ hi]",      cycles: 1,
+     semantics: "v1 (A): OUT <- SRI byte; never stalls; full -> drop, OUT_OVF <- 1"}
+  - {name: TRIG,  opcode: 0x12, syntax: "trig tm, e",     cycles: 1, semantics: "v1 (E1): this engine's snapshot trigger <- any channel in the mask tm, edge e (rise, fall or any); clears the second term (TRIGQ). The assembler defines CH0..CH3 = 1, 2, 4, 8"}
+  - {name: REL,   opcode: 0x13, syntax: "rel",            cycles: 1, semantics: "S <- 0 (release the snapshot; the next trigger may replace it)"}
+  - {name: TSGET, opcode: 0x14, syntax: "tsget r, ch, e", cycles: 1,
+     semantics: "r <- snapshot timestamp of channel ch, edge e (rise, fall or last); F(r) <- its stale | missed | !valid; O(r) <- its ORD bit; E(r) <- snapshot epoch"}
+  - {name: JUDGE, opcode: 0x15, syntax: "judge b[, raw][, push]", cycles: 1,
+     semantics: "m <- Y - X; v <- verdict(m, bounds[b], invalid = FX | FY | OX | OY | (EX != EY) | poisoned); update stats[b] if b < 4 (a poisoned JUDGE counts in its own counter, not as INDETERMINATE); push per mode (all / nonpass / none), header (+ m if raw), all or nothing. v1 (P): `poisoned` is set by RUN, by every lost trigger and by DESYNC, cleared only by RESYNC; while it is set every JUDGE answers INDETERMINATE, so no verdict can depend on state that a lost event made stale. Header bit 10 reports it"}
+  - {name: TMON,  opcode: 0x16, syntax: "tmon t[, x16]",  cycles: 1, semantics: "TO <- NOW + t * (x16 ? 16 : 1) (timeout relative to now, e.g. after an input-paced wait)"}
+  - {name: CMP,   opcode: 0x17, syntax: "cmp imm[, hi]",  cycles: 1, semantics: "v1 (A): C <- (SRI[7:0] (or SRI[15:8]) == imm)"}
+  # ---- v1 candidates: new opcodes ----
+  - {name: CRCP,  opcode: 0x18, syntax: "crcp imm[, hi]", cycles: 1,
+     semantics: "C2: POLY[7:0] (or POLY[15:8]) <- imm. POLY is the generator polynomial without its top term, left-aligned in 16 bits (CRC-15 0x4599 -> 0x8B32; parity -> 0x8000)"}
+  - {name: BSC,   opcode: 0x19, syntax: "bsc tap[, init][, st][, inv]", cycles: 1,
+     semantics: "C2/C3: bitstream control. tap: the stream (off, the bits SHO sends, the bits SHI samples). Each data bit b of the stream: fb = L[15] ^ b ^ inv; L <- (L << 1) ^ (fb ? POLY : 0); the run counter follows data and crc bits. init: keep, zeros or ones (L; also clears the run counter; ones uses POLY, so load it with crcp first). st: the stuffing rule. Flags: Z = (L == 0); U = the run has reached its limit (a stuff bit is due)"}
+  - {name: TRIGQ, opcode: 0x1F, syntax: "trigq tm, e, ch, lv", cycles: 1,
+     semantics: "K: a second trigger term, level-qualified: any channel in the mask tm, edge e (rise, fall or any), but only if channel ch is at level lv in the cycle the edge is reported. TRIG clears this term. (I2C: `trig CH1, any` + `trigq CH0, any, 1, 1` = every SCL edge, and SDA edges only while SCL is high: START and STOP. Data edges never trigger.) An edge within a cycle of a change on the qualifying channel is only reported as ambiguous if that channel's edges are armed too, or the program tests `tsts ch, level`: arm the qualifying channel"}
+  - {name: RESYNC, opcode: 0x1D, syntax: "resync",        cycles: 1,
+     semantics: "P: the firmware's statement that its state is fully determined by the event whose snapshot it holds, whatever came before (for I2C: a START or a STOP). poisoned <- 0 only if a snapshot is held (S), it is the snapshot the program last read with TSGET or TSTS (same epoch: not a newer one that arrived after a REL), and no trigger has been lost since that snapshot's trigger was accepted; otherwise no effect (an event lost while this one was being handled is one the new state does not account for)"}
+  - {name: DESYNC, opcode: 0x1E, syntax: "desync",        cycles: 1,
+     semantics: "P: poisoned <- 1. For a program that has itself lost track (an event it could not classify), and as the first instruction of a referee that starts in the middle of bus traffic"}
+  - {name: TSTS,  opcode: 0x1C, syntax: "tsts ch, w",     cycles: 1,
+     semantics: "E2: test the snapshot. w = level: C <- channel ch's level after every edge of ch that the snapshot holds (those latched up to one cycle after the trigger's report cycle, the trigger edge included); A <- 1 if an edge of ch is order-ambiguous with the trigger (ORD), or ch is a trigger edge and another trigger edge was reported in the same cycle, or ch is flagged missed, or there is no valid snapshot. w = trise / tfall: C <- 1 if ch's rising / falling edge is a trigger edge of this snapshot; A <- 1 if more than one trigger edge was reported in the trigger cycle, or any other edge the trigger was armed for is order-ambiguous with it (ORD), or there is no valid snapshot"}

@@ -6,7 +6,9 @@ is `tools/referee_host.py`, and the datasheet (`docs/info.md`) lists the command
 
 ## Transmitter (`uart_tx`)
 
-- 8N1, LSB first, `CLKS_PER_BIT` cycles per bit (347 = 115200 baud at 40 MHz, 0.06% fast).
+- 8N1, LSB first, `div` cycles per bit: a runtime input (the host port's 'B' command sets it
+  between frames). Power-up value 521 = 115200 baud at the 60 MHz project clock; 20 = 3 Mbaud. The formal
+  proofs fix `div` = `CLKS_PER_BIT` (they hold for any one value).
 - Pulse `start` while `busy` is low; `data` is copied in that cycle. A `start` while busy
   is ignored, not queued.
 - Contract: a start accepted in cycle t puts the frame on `tx` in cycles

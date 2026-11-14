@@ -33,20 +33,22 @@
 `default_nettype none
 
 module uart_rx #(
-    parameter integer CLKS_PER_BIT = 347  // 40 MHz / 115200 baud; minimum 6
+    parameter integer DIV_W = 16  // width of the runtime bit period
 ) (
     input  wire       clk,
     input  wire       rst_n,      // synchronous, active low
+    input  wire [DIV_W-1:0] div,  // bit period in cycles (>= 6); change it only while idle
     input  wire       rx,         // asynchronous serial input
     output reg  [7:0] data,       // last good byte (held until the next one)
     output reg        valid,      // one-cycle pulse: `data` is new
     output reg        frame_err   // one-cycle pulse: stop bit was low
 );
 
-  localparam integer CW = $clog2(CLKS_PER_BIT);
-  localparam [CW-1:0] LAST = CLKS_PER_BIT[CW-1:0] - 1'b1;
-  localparam integer MIDI = (CLKS_PER_BIT + 1) / 2;
-  localparam [CW-1:0] MID = MIDI[CW-1:0];
+  // Runtime bit period (host port command 'B'): last cycle of a bit and the
+  // mid-bit sample point, rounded up as before.
+  localparam integer CW = DIV_W;
+  wire [CW-1:0] last = div - 1'b1;
+  wire [CW-1:0] mid = (div + 1'b1) >> 1;
 
   // Synchronizer, then two more history flops for the 3-sample vote.
   // Reset to 1: the idle level, so leaving reset is not a start bit.
@@ -64,8 +66,8 @@ module uart_rx #(
   reg [   2:0] idx;    // data bit being received
   reg [   7:0] shreg;
 
-  wire bit_end = (cnt == LAST);
-  wire at_mid = (cnt == MID);
+  wire bit_end = (cnt == last);
+  wire at_mid = (cnt == mid);
 
   always @(posedge clk) begin
     valid     <= 1'b0;  // pulses: low unless set below

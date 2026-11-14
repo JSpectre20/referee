@@ -17,7 +17,19 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "CLOCK_PERIOD": 20,
+  "CLOCK_PERIOD": 16.6,
+
+  "//": "Referee: 16.6 ns, a little tighter than 60 MHz (16.667 ns), the clock in info.yaml (one",
+  "//": "clock, docs/isa-timing.md 0b diff 12). STA is judged at the slow corner (nom_slow_1p08V_125C);",
+  "//": "change this together with info.yaml. test/test.py checks they agree.",
+
+  "//": "Referee timing flow (docs/timing-probes.md): repair timing again after global routing,",
+  "//": "timing-driven placement, synthesis for delay. Without these, routing added ~7 ns after the",
+  "//": "last repair and 60 MHz missed the slow corner; with them (and the 801e728 RTL) it closes.",
+  "RUN_POST_GRT_RESIZER_TIMING": 1,
+  "RUN_POST_GRT_DESIGN_REPAIR": 1,
+  "PL_TIMING_DRIVEN": 1,
+  "SYNTH_STRATEGY": "DELAY 4",
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,

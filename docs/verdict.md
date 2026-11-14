@@ -43,7 +43,10 @@ T is the true interval in ticks, counted by the harness from the free inputs, in
 the design. Two kinds of interval are judged:
 - a pulse width on one pin (rise to fall);
 - the time from a rising edge on pin 0 to a rising edge on pin 1 (e.g. data edge to clock
-  edge, for a setup time).
+  edge, for a setup time), **judged through the engine's snapshot** (`src/snapshot.v`), the way
+  firmware does it: `trig 1, rise; waits; tsget X, 0, rise; tsget Y, 1, rise; judge`. X and Y
+  come from the snapshot taken on pin 1's rise, in the cycle it becomes visible; ORD on either
+  forces INDETERMINATE; REL is a free input, so snapshots can be held and triggers lost.
 
 Each is judged against a free bound N and a free choice of minimum or maximum bound.
 
@@ -52,10 +55,14 @@ Each is judged against a free bound N and a free choice of minimum or maximum bo
 | `prove4` | u = 2, K = 4 ticks per cycle, unbounded, original (non-sharp) rule | PASS |
 | `prove8` | u = 2, K = 8, unbounded, original rule | PASS |
 | `sharp4`, `sharp8` | the sharp VIOLATION rule (the default), K = 4 and K = 8, unbounded | PASS |
-| `cover4` | every verdict, for min and max bounds; INDETERMINATE with the true interval on both sides of the bound; a measured error above one cycle in both directions; a long pulse flagged stale | all 13 reached |
+| `cover4` | every verdict, for min and max bounds; INDETERMINATE with the true interval on both sides of the bound; a measured error above one cycle in both directions; a long pulse flagged stale | all 17 reached (incl. ORD on both sides of the trigger, a pin-0 rise too late for the snapshot, a lost trigger) |
 | `u1` | negative control: u = 1 | **FAILS**, as it must; counterexample in `docs/results/verdict_u1_counterexample.md` |
 | `glitch` | negative control: no hold precondition (levels may last one tick) | **FAILS**, as it must; counterexample in `docs/results/glitch_counterexample.md` |
 | `bmc4` | bounded cross-check, 96 ticks (also passed at 160, which takes 11 min) | PASS |
+| `comb` | the combinational theorem: `verdict.v` alone, engine parameters, every m, n_lo, inexact, is_max and true T with \|m - T\| < 2 cycles | PASS |
+| `comb_cover` | every verdict reachable in that theorem, with inexact bounds | all reached |
+| `comb_onesided` | negative control: the block sees only the rounded-down bound | **FAILS**, as it must: two-sided rounding is needed |
+| `comb_u1` | negative control: u = 1 in the theorem | **FAILS**, as it must |
 
 ## The model (what the proof assumes)
 
@@ -84,8 +91,34 @@ Each is judged against a free bound N and a free choice of minimum or maximum bo
     assumption. Long intervals are now flagged stale instead.)
 - **Not modelled:** metastability lasting longer than one clock cycle (the second
   synchronizer flop is assumed to resolve), analog edge rates, and pad delays. These are
-  silicon characterization questions, and a loopback self-test is planned to measure them
-  (PLAN improvement 4).
+  silicon characterization questions; a loopback self-test (drive an edge at a known cycle,
+  read it back on an input) is planned to measure them.
+
+## The snapshot lemma (ledger A16, removed 28 Oct)
+
+Until engine-v0 CP2 the cross interval was judged in the cycle pin 1's rise was reported, and
+only if pin 0's rise "had been reported already" (`!pend_r0 || rise[0]`). That was a condition
+on the harness, not something hardware enforced, and it hid a real gap: report latencies differ
+by up to 1 + 2/K cycles, so an earlier edge can be latched a cycle *after* the trigger.
+
+Now the interval is judged from the engine's snapshot and there is no such condition. The
+harness proves, in the cycle the snapshot becomes visible:
+
+- **Y is the trigger edge**: its timestamp belongs to pin 1's last true rise, it is fresh, and
+  it is **never ORD**. (Writing this proof found that the RTL flagged the trigger edge itself
+  as ORD, which made every judgment that uses it INDETERMINATE. Fixed in `src/snapshot.v`;
+  see `docs/isa-timing.md` §0b.)
+- **Completeness**: X is never older than pin 0's last true rise at or before the trigger. Every
+  edge that truly came before the trigger is in the snapshot.
+- **Order**: if X is not ORD, X *is* that rise. An edge latched at r - 2 or earlier truly came
+  before the trigger.
+- If pin 0 never rose before the trigger, X is stale or ORD, so the verdict is INDETERMINATE.
+- With these, the cross verdict is sound against the true interval (min and max bounds).
+
+The cycle-level facts the lemma rests on (the capture equals the edge_ts state as of the end of
+cycle r + 1; ORD is exactly the reports in r - 1..r + 1 other than the trigger edge; the
+snapshot is constant while S) are proved separately with every input free (`formal/engine.sby`,
+task `snap`).
 
 ## Why the harness's 3-tick look-ahead doesn't bias intervals
 
@@ -129,6 +162,9 @@ Inductive strengthening invariants in `formal/verdict_formal.sv` relate the sync
 pipeline and the latched timestamps to the ghost history:
 - the per-edge latency D is between K+2 and 2K+4 ticks;
 - the ghost intervals are equal to differences of per-pin ages;
+- for the snapshot: pin 0's previous rise is still latched while its newest one is unreported,
+  two rises of one pin are at least 2H ticks apart, and the trigger rise is recent while a
+  capture is in flight;
 - the delay-line and synchronizer state is fixed once a pin has been stable long enough.
 
 Each invariant is itself asserted and proved, so none of them weakens the result.

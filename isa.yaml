@@ -1,4 +1,4 @@
-# Referee engine ISA, v0.3 (DRAFT for review; revised after reviews of v0.1 and v0.2).
+# Referee engine ISA, v0.3 (approved 28 Oct 2026; revised after reviews of v0.1 and v0.2).
 #
 # Single source of truth. In step 2 a generator (tools/isagen.py) produces from
 # this file: the opcode include for the RTL (src/isa_defs.vh), the assembler,
@@ -14,7 +14,7 @@
 #   - Timing contract and assumption ledger: docs/isa-timing.md.
 
 isa: referee-engine
-version: "0.3-draft"
+version: "0.3"   # approved 28 Oct; later diffs listed in docs/isa-timing.md section 0b
 word_bits: 16
 opcode_bits: [15, 11]
 
@@ -47,13 +47,13 @@ machine:                 # per engine
     S:  "a snapshot is pending (taken, not yet released by REL)"
   timestamp_tags:        # copied by TSGET
     FX: "X's timestamp is unusable: stale | missed | no valid snapshot yet"
-    OX: "X's edge is order-ambiguous with the trigger (latched in the trigger's report cycle or the next)"
+    OX: "X's edge is order-ambiguous with the trigger (latched in cycles r-1..r+1, r = the trigger's report cycle; never the trigger edge itself)"
     EX: "2-bit epoch of the snapshot X came from"
     FY: "same for Y"
     OY: "same for Y"
     EY: "same for Y"
   counters:
-    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was pending; saturating; host-readable; host-clearable only"}
+    LOST: {bits: 8, doc: "triggers that arrived while a snapshot was held or a capture pending; saturating; host-readable; host-clearable only"}
   sticky_status:         # host-visible; cleared by the host status read or a new RUN
     OUT_OVF:     "PUSH found OUT full; byte dropped"
     VERDICT_OVF: "JUDGE found VERDICT full; entry dropped"
@@ -84,17 +84,18 @@ edge_ts_snapshot:        # one edge_ts; one snapshot + trigger per engine
   tracks_last_edge: "per channel, which of rise/fall was latched last (for TSGET e = last)"
   trigger: "per engine, set by TRIG ch, e (default: disabled)"
   on_trigger: >-
-    if !S: ONE CYCLE AFTER the trigger's report cycle, snapshot <- every channel's {rise_ts, fall_ts,
-    last_edge, rise_stale, fall_stale, missed} as latched then, plus per edge an ORD bit = "latched in
-    the trigger's report cycle or the next" (order relative to the trigger is ambiguous: the per-edge
-    report latency varies by up to 1 + 2/K cycles); epoch <- epoch + 1; S <- 1; valid <- 1.
+    if !S and no capture pending: snapshot <- every channel's {rise_ts, fall_ts, last_edge, rise_stale,
+    fall_stale, missed} AS LATCHED AT THE END OF CYCLE r+1 (r = the trigger's report cycle; copied at the
+    end of r+2 from the edge_ts registers, so S, epoch and valid are visible from r+3), plus per edge an ORD
+    bit = "latched in cycle r-1, r or r+1", except the trigger edge itself (order relative to the trigger is
+    ambiguous: report latencies differ by < 2 cycles in either direction); epoch <- epoch + 1; S <- 1; valid <- 1.
     The one-cycle delay guarantees every edge that truly happened before the trigger edge is in the
     snapshot, so no earlier edge can be missed (that would allow a false PASS).
-    If S: snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
+    If S or a capture is pending (r..r+2): snapshot unchanged (it is still one consistent instant), LOST <- LOST + 1 (saturating),
     lost_since_verdict <- 1. A lost trigger does NOT force INDETERMINATE.
   read_by: TSGET
   released_by: REL
-  formal: "after an accepted trigger, snapshot == edge_ts latched state one cycle after the trigger's report; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in the two-cycle window; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S"
+  formal: "after an accepted trigger, snapshot == edge_ts state as of the end of cycle r+1; every edge truly before the trigger edge is in it; ORD marks exactly the edges latched in cycles r-1..r+1 other than the trigger edge itself; any edge latched at r-2 or earlier is truly before the trigger; snapshot and epoch constant while S; LOST increments iff a trigger arrives while S or a capture is pending, and saturates"
 
 fifos:                   # per engine
   IN:      {width: 8,  depth: 4, dir: host_to_engine, engine_side: "PULL: never stalls; empty -> E <- 1, SR unchanged, IN_UNDERRUN"}
@@ -185,6 +186,28 @@ fields:
   ch:   {bits: [1, 0],  doc: "judge channel 0..3"}
   e:    {bits: [3, 2],  doc: "0: rising edge, 1: falling edge, 2: last edge (whichever was latched later), 3: reserved"}
   b:    {bits: [3, 0],  doc: "bounds-table entry 0..15 (stats for 0..3)"}
+
+enums:             # operand keywords (structured form of the field docs above)
+  c:    {T: 0, nT: 1, C: 2, nC: 3, E: 4, nE: 5, S: 6, nS: 7}
+  e:    {rise: 0, fall: 1, last: 2}
+  r:    {X: 0, Y: 1}
+  push: {all: 0, nonpass: 1, none: 2}
+flags_kw: [msb, hi, raw, x16]   # 1-bit operands written as a bare keyword: `sho 0, msb`
+aliases:           # assembler aliases for BR
+  jt: T
+  jnt: nT
+  jc: C
+  jnc: nC
+  je: E
+  jne: nE
+  js: S
+  jns: nS
+
+reserved_opcodes:
+  0x18: "v1 bitstream unit (LFSR CRC/parity tapping SHO/SHI bits)"
+  0x19: "v1 bitstream unit"
+  0x1A: "v1 bitstream unit (bit stuffing)"
+  0x1B: "v1 bitstream unit (NRZI)"
 
 instructions:
   - {name: NOP,   opcode: 0x00, syntax: "nop",            cycles: 1, semantics: "nothing"}

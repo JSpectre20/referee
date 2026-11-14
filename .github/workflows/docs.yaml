@@ -1,8 +1,20 @@
 name: docs
 
+# CI runs by hand (workflow_dispatch, on any branch) or when a pull request to main is
+# opened, reopened or marked ready (and, where this workflow has a path filter, touches
+# those paths); not on every push. Day-to-day work is verified locally with the commands
+# in README.md ("Try it"); CI is the record at each milestone, and a hardening run takes
+# several hours.
+
 on:
-  push:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review]
+
+concurrency:  # a newer run of the same workflow on the same ref cancels the older one
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docs:
@@ -14,4 +26,4 @@ jobs:
           submodules: recursive
 
       - name: Build docs
-        uses: TinyTapeout/tt-gds-action/docs@ihp-cmos5l
+        uses: TinyTapeout/tt-gds-action/docs@ttihp27a
