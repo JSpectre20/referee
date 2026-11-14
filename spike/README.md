@@ -62,6 +62,7 @@ are free. Operand space: 11 bits.
 | D | **Per-bound guard band.** Bound word 2 becomes `{n_lo[3:0], 0, is_max, width[9:0]}`; `n_lo` is signed. PASS and VIOLATION test against `n_lo` and `n_lo + width` (the v0.3 `inexact` bit is `width = 1`). The assembler computes both from the rule and one declaration per bus | bound table layout; assembler directives `.bus`, `.bound ... from/to` | 10 flops in the JUDGE pipeline (Referee only) |
 | E1 | **Trigger on a set of edges.** `trig` takes a channel mask and an edge kind (rise / fall / any) | operand bits of `trig` | about 6 flops (Referee only) |
 | E2 | **Snapshot tests.** `tsts ch, what`: C <- the level of channel `ch` after its last edge in the snapshot, or "the trigger was this channel's rise / fall"; A <- 1 if that answer is ambiguous (the edge is order-ambiguous with the trigger, or flagged). New branch condition A | opcode 0x1C | about 12 flops (Referee only): the levels and trigger edges kept in the snapshot, and A |
+| **Q** | **Snapshot queue** (finding 11): depth 2 or 4; `rel` pops; a loss marks the next snapshot (gap), which poisons when it is reached | none (hardware only) | one snapshot register set per extra entry, about 14,000 um2. **In the model**; review pending |
 | J | **A verdict as a branch condition** (finding 3): `judge b, flag` | the unused fourth value of JUDGE's push field | 2 flops (Referee only). Not in the model yet. Needed to judge tHD;DAT once data edges are no longer events (finding 10) |
 | **P** | **Poison** (the soundness fix, findings 1 and 10): a lost trigger sets `poisoned`; while it is set every JUDGE answers CAN'T TELL. `resync` clears it, but only while the program holds a snapshot and nothing was lost since that snapshot's trigger; `desync` sets it | opcodes 0x1D, 0x1E (could share one) | 2 flops (Referee only). **In the model** |
 | K | **Level-qualified trigger** (findings 2 and 10): a second trigger term, `trigq mask, edge, ch, level` | opcode 0x1F | about 10 flops (Referee only). **In the model** |
@@ -175,6 +176,42 @@ are free. Operand space: 11 bits.
     Smallest sound design: **P alone is enough for soundness (2 flops, 2 instructions) and replaces
     L. K is what makes the instrument useful on real buses. J is needed for tHD;DAT. M is still
     open.**
+
+11. **Legal traffic must never poison; event loss measured against a gate (14 Nov). WORK IN
+    PROGRESS: the second review of this step was interrupted and is still owed, and the
+    hardware-rule-slots comparison is not finished.**
+    - **A data hold time of 0 ns is legal in I2C**, and to the chip it is an SDA edge and an SCL
+      edge too close to order. The program now follows the I2C receiver rule: UM10204 requires
+      every device to hold SDA internally for at least 300 ns "to bridge the undefined region of
+      the falling edge of SCL" (note to tHD;DAT in the bus-line characteristics table), so an
+      SDA edge next to SCL's fall is a data change, never a START or STOP. The protocol state
+      moves on; the one verdict that uses the ambiguous edge may be CAN'T TELL. Measured on
+      legal traffic with data hold 0, 0-33, 0-100 and 0-800 ns: no lost event and no poisoned
+      JUDGE (apart from the first START after RUN, which is poisoned by design).
+    - **"Lost" now means "in no snapshot".** An armed edge reported one cycle after an accepted
+      trigger is inside that snapshot (flagged as too close to order), so it is not lost and
+      does not poison; the program sees it through flag A.
+    - **Candidate Q, a snapshot queue.** Events that arrive while the previous one is being
+      handled wait instead of being lost. A loss (queue full) marks the next snapshot; the
+      poison starts when that snapshot is reached, so verdicts about earlier events stay valid.
+      The gate is "under 5% of violating intervals of at least 5 cycles get no verdict":
+
+      | Mix (data hold 0-800 ns) | depth 1 (no queue) | depth 2 | depth 4 |
+      | --- | --- | --- | --- |
+      | intervals down to 70% of their minimum | 0 of 742 | 0 | 0 |
+      | down to 50% | 0 of 1043 | 0 | 0 |
+      | down to 30% | 347 of 1302 (26.7%) | 0 | 0 |
+      | down to 10% | 1178 of 1541 (76.4%) | 0 | 0 |
+      | down to 2% (165 intervals under 4 cycles in this mix) | 1046 of 1281 (81.7%) | 67 of 1281 (5.2%) | 0 |
+      | **all mixes** | **43.5%** | **1.1%** | **0%** |
+
+      One extra snapshot (depth 2, about 14,000 um2, 1.2% of the core) passes the gate overall and
+      on every mix down to 10% of the minimum; depth 4 (about 43,000 um2, 3.6%) leaves nothing
+      unjudged in these mixes. Intervals under 4 clock cycles are below the minimum level length
+      the proofs assume: no sampled design can judge them, and the tables list them separately.
+      (The model, being cycle-exact, does judge them; the chip must not claim to.)
+    - Hardware rule slots (every rule checked in hardware on every event) are being modelled for
+      the same table; `spike/rule_slots.py` is not in the repository yet.
 
 ## Results
 

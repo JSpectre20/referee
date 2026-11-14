@@ -11,6 +11,7 @@
   E2 tsts: line level as of the trigger, which edge triggered, flag A (ambiguous)
   P  poison: a lost trigger (or `desync`) forces every JUDGE to INDETERMINATE until `resync`
   K  trigq: a second, level-qualified trigger term
+  Q  snapshot queue (Model(depth=2|4)): events wait in a queue instead of being lost
 Not in the model yet: F (short-level taint), G (non-PASS pulse pin), NRZI.
 Spike simplification: Model(words=64|96|128) only sets where the pc wraps; the image keeps the
 128-word layout (bounds at word 128, RUN check 8 + 161 cycles) for every size.
@@ -128,8 +129,9 @@ class EdgeTs:
 
 
 class Model:
-    def __init__(self, words=PROGRAM_WORDS):
-        assert words in (64, 96, 128)
+    def __init__(self, words=PROGRAM_WORDS, depth=1):
+        assert words in (64, 96, 128) and depth in (1, 2, 4)
+        self.depth = depth  # v1 (Q): snapshot queue depth (1 = v0.3's single snapshot)
         self.words = words  # v1: this engine's program size (Referee 64, Player 96 or 128); pc wraps here
         self.now = 0
         self.glob = [0] * GLOBAL_WORDS
@@ -176,12 +178,12 @@ class Model:
         self.S = 0
         self.valid = 0
         self.epoch = 0
-        self.cap_stage = 0  # 0 idle, 1 = trigger was last cycle, 2 = capture this cycle
+        self.cap1 = self.cap2 = None  # v1 (Q): capture pipeline: {"trig": edges at r, "armed": edges armed}
+        self.snapq = []  # v1 (Q): queued snapshots, oldest first; self.snap is the head (kept after rel)
+        self.epoch_ctr = 0  # epoch of the last capture (self.epoch is the head's)
+        self.gap_pending = 0  # v1 (P): a trigger was lost since the last capture that got a slot
         self.trig = None  # v1 (E1): (channel mask, edge kind 0 rise / 1 fall / 3 any)
-        self.trig_pend = set()  # the trigger edge(s) (ch, e) reported in r, while a capture is pending
-        self.trig_armed = set()  # every (ch, e) that capture was armed for (level qualifier ignored)
         self.trigq = None  # v1 (K): second trigger term (mask, kind, qualifying channel, level)
-        self.lost_cur = 0  # v1 (P): a trigger was lost since the current snapshot's trigger was accepted
         self.lost_since = 0
         self.snap = None
         self.hist = [[[0, 0] for _ in range(4)] for _ in range(3)]  # pulses at c-1, c-2, c-3
@@ -362,15 +364,19 @@ class Model:
         # of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses 3, 2, 1 cycles ago),
         # except the trigger edge's own report in r: its order relative to the trigger
         # is known (it is the trigger).
-        snap_next = None
-        if self.cap_stage == 2:
-            ordb = [[int(self.hist[0][i][e] or (self.hist[1][i][e] and (i, e) not in self.trig_pend)
+        # v1 (Q): the capture is a two-stage pipeline (cap1: the trigger was last cycle; cap2:
+        # capture this cycle), and snapshots go into a queue of `self.depth` entries that `rel`
+        # pops (depth 1 = the single snapshot register of v0.3).
+        captured = None
+        if self.cap2 is not None:
+            tp = self.cap2["trig"]
+            ordb = [[int(self.hist[0][i][e] or (self.hist[1][i][e] and (i, e) not in tp)
                          or self.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
             # v1 (E2): "level" is each channel's level after every edge latched up to the end of
             # r+1 (= s3 in this cycle, r+2); "trig" is the set of trigger edges reported in r.
-            snap_next = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
-                         "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb,
-                         "level": list(ed.s3), "trig": set(self.trig_pend), "armed": self.trig_armed}
+            captured = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
+                        "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb,
+                        "level": list(ed.s3), "trig": set(tp), "armed": self.cap2["armed"]}
         # v1 (E1): the trigger is any selected edge of any channel in the mask
         hits, armed = set(), set()
         if was_running:
@@ -387,28 +393,39 @@ class Model:
                             armed.add((ch, e))
                             if qualified and pulses[ch][e]:
                                 hits.add((ch, e))
-        hit = bool(hits)
+        # A trigger hit one cycle after an accepted trigger (cap1 busy) starts no capture of its
+        # own: its edge is latched by the end of r+1, so it IS in that snapshot, flagged ORD, and
+        # the program sees it through flag A. It is not lost. (v0.3 counted it as lost.)
+        new_pending = {"trig": hits, "armed": armed} if hits and self.cap1 is None else None
+        if rel and self.snapq:
+            self.snapq.pop(0)
         lost_now = 0
-        new_pending = 0
-        if hit:
-            if self.S or self.cap_stage:
+        if captured is not None:
+            if len(self.snapq) < self.depth:
+                self.epoch_ctr = (self.epoch_ctr + 1) & 3
+                captured["epoch"] = self.epoch_ctr
+                # v1 (P): "gap" = an armed edge was lost (it is in no snapshot) between the
+                # previous snapshot and this one
+                captured["gap"], self.gap_pending = self.gap_pending, 0
+                self.snapq.append(captured)
+                self.valid = 1
+            else:  # no room: this event is in no snapshot
                 lost_now = 1
-            else:
-                new_pending = 1
-                self.trig_pend = hits
-                self.trig_armed = armed
-                self.lost_cur = 0  # v1 (P): a new event; losses from here on are "during this one"
-        if snap_next is not None:
-            self.snap = snap_next
-            self.epoch = (self.epoch + 1) & 3
-            self.S, self.valid = 1, 1
-        elif rel:
-            self.S = 0
-        self.cap_stage = 1 if new_pending else (2 if self.cap_stage == 1 else 0)
+        self.cap2, self.cap1 = self.cap1, new_pending
         if lost_now:
             self.lost = min(self.lost + 1, 255)
             self.lost_since = 1
-            self.poison = self.lost_cur = 1  # v1 (P): after this cycle's instruction, so it wins over a resync
+            self.gap_pending = 1
+        # The head of the queue is the snapshot the program sees. When a snapshot with a gap
+        # before it becomes the head, the referee is poisoned: from here on the program's state
+        # may be missing an event. (Verdicts about earlier snapshots were about events before the
+        # loss, and stay valid.) After this cycle's instruction, so it wins over a resync.
+        head = self.snapq[0] if self.snapq else None
+        if head is not None and head is not self.snap:
+            self.snap, self.epoch = head, head["epoch"]
+            if head["gap"]:
+                self.poison = 1
+        self.S = int(head is not None)
 
         if start_core:
             self.ran = 1
@@ -514,10 +531,10 @@ class Model:
                 ones = M16 & ~((self.POLY & -self.POLY) - 1) if self.POLY else M16
                 self.L = ones if f["init"] == E["init"]["ones"] else 0
                 self.runlen, self.lastbit = 0, 1
-        elif m == "resync":  # v1 (P): only while holding the snapshot it vouches for (the one it
-            # last read, not a newer one that arrived after a rel), and only if nothing was lost
-            # since that snapshot's trigger
-            if self.S and self.read_epoch == self.epoch and not self.lost_cur:
+        elif m == "resync":  # v1 (P): only while holding the snapshot it vouches for (the head of
+            # the queue, and the one the program last read). A loss AFTER this snapshot does not
+            # block it: that loss poisons again when the first snapshot after it becomes the head.
+            if self.S and self.read_epoch == self.epoch:
                 self.poison = 0
         elif m == "desync":
             self.poison = 1

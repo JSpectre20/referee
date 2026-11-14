@@ -358,3 +358,66 @@ def test_trigq_triggers_only_while_the_qualifying_channel_is_at_its_level():
     for ui in [ch0 | ch1] * 20 + [ch1] * 30:               # CH1 high (its own rise is not armed): CH0's fall is
         md.step(ui, 0)
     assert md.state == "halted" and md.T == 0 and md.snap["trig"] == {(0, 1)}
+
+
+# ---------------------------------------------------------------- Q: snapshot queue, gap, folded hits
+
+QPROG = """
+.bound 0, max, 10us
+        trig CH0, rise
+        ldrc 1
+loop:   tmon 1023, x16
+        waits
+        jt   loop
+        tsget X, 0, fall
+        tsget Y, 0, rise
+        loop once            ; only the first event resyncs
+        jmp  j
+once:   resync
+j:      mark
+        waitd 40             ; a slow handler: the next rise arrives while this snapshot is held
+        judge 0
+        rel
+        jmp  loop
+"""
+
+
+def q_run(depth):
+    a = asm_v1.Assembler(60e6)
+    img = a.image(a.assemble(QPROG))
+    md = Model(64, depth)
+    g = asm_v1.global_image({})
+    for i, w in enumerate(g):
+        md.write_global(i, w)
+    for i, w in enumerate(img):
+        md.write_engine(i, w)
+    md.set_crc(0, asm_v1.crc16(g))
+    md.set_crc(1, asm_v1.crc16(img))
+    assert md.run()
+    for _ in range(300):
+        md.step(0, 0)
+    ch0 = 1 << 4
+    for ui in [0] * 10 + [ch0] * 10 + [0] * 10 + [ch0] * 10 + [0] * 90 + [ch0] * 200:
+        md.step(ui, 0)
+    return md, verdict_headers(md)
+
+
+def test_queue_depth_2_keeps_the_event_that_depth_1_loses_and_a_gap_poisons():
+    md, hdrs = q_run(1)
+    # depth 1: the second rise finds the only slot taken: lost. The third event's snapshot has a
+    # gap before it, so it poisons the referee (this program resyncs only once).
+    assert md.lost == 1 and [h >> 10 & 1 for h in hdrs] == [0, 1]
+    md, hdrs = q_run(2)
+    # depth 2: the second rise waits in the queue; nothing is lost, nothing is poisoned
+    assert md.lost == 0 and [h >> 10 & 1 for h in hdrs] == [0, 0, 0]
+    assert [h >> 14 for h in hdrs] == [0, 1, 1]  # first: no fall yet (stale -> INDETERMINATE); then two PASSes
+
+
+def test_an_edge_one_cycle_after_the_trigger_is_in_the_snapshot_not_lost():
+    ch0, ch1 = 1 << 4, 1 << 5
+    md = run_program("trig CH0|CH1, any\n tmon 1023, x16\n waits\n tsts 1, level\n halt")
+    for ui in [0] * 10 + [ch0] + [ch0 | ch1] * 30:   # CH1 rises one cycle after CH0
+        md.step(ui, 0)
+    assert md.state == "halted" and md.lost == 0
+    assert md.C == 1 and md.A == 1                   # CH1's new level is in the snapshot, marked ambiguous
+    assert md.snap["trig"] == {(0, 0)} and md.snap["ord"][1][0] == 1 and len(md.snapq) == 1

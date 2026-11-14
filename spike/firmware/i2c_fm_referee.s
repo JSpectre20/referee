@@ -12,8 +12,11 @@
 ;                              answers CAN'T TELL to every JUDGE until the program says `resync`,
 ;                              which it does while it holds a START (RC0 = 1, RC1 = 0) or a STOP
 ;                              (RC0 = 0, RC1 = 1), where its state is known whatever came before.
-;                              `desync` at power-up (the bus may be mid-transfer) and when two
-;                              edges are too close to say which one the event is.
+;                              `desync` when two edges next to an SCL RISE are too close to
+;                              order. (RUN starts poisoned: the bus may be mid-transfer.)
+;   receiver rule              an SDA edge within a cycle of SCL's FALL is read as data, as the
+;                              I2C specification tells receivers to (see `near:` below): a legal
+;                              hold time of 0 ns must not stop the referee.
 ;   D   guard band             per bound (none declared here: g = 0)
 ;
 ; Every interval is "X = earlier edge, Y = the edge that just happened"; JUDGE computes Y - X.
@@ -42,13 +45,12 @@
 
         trig  CH1, any       ; every SCL edge
         trigq CH0, any, 1, 1 ; SDA edges while SCL is high: START and STOP
-        desync               ; no verdict until the first START or STOP
-next:   rel
+next:   rel                  ; (RUN starts poisoned: no verdict until the first START or STOP)
 wait:   tmon 1023, x16       ; 273 us without an event: wait again
         waits
         jt   wait
         tsts 1, tfall        ; SCL fell?
-        ja   lost            ; two events too close to say which one this is
+        ja   near            ; another SDA or SCL edge within a cycle of this event
         jc   scl_fall
         tsts 1, trise        ; SCL rose?
         jc   scl_rise
@@ -95,5 +97,16 @@ hd_sta: tsget X, 0, fall
         judge 5              ; tHD;STA
         jmp  wait
 
+; Two edges too close to order. If SCL is low after them, SCL fell and SDA changed next to it.
+; I2C lets a data hold time be 0 ns, and tells every receiver how to read this: UM10204 requires
+; a device to hold SDA internally for at least 300 ns "to bridge the undefined region of the
+; falling edge of SCL" (note to tHD;DAT in the bus-line characteristics table). So an SDA edge
+; next to SCL's fall is a data change, never a START or STOP: the event is an SCL fall, and the
+; protocol state moves on as for any SCL fall. The verdict that uses the ambiguous SCL edge is
+; CAN'T TELL by the ORD flag; nothing is poisoned.
+near:   tsts 1, level
+        jnc  scl_fall
+; SCL is high after them: an SDA edge next to SCL's RISE (a START or STOP with no setup time, or
+; data changing as SCL rises: both illegal, and not tellable apart), or a glitch.
 lost:   desync               ; lost track: CAN'T TELL until the next START or STOP
         jmp  next
