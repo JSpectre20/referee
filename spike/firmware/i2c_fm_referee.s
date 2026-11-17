@@ -14,9 +14,10 @@
 ;                              (RC0 = 0, RC1 = 1), where its state is known whatever came before.
 ;                              `desync` when two edges next to an SCL RISE are too close to
 ;                              order. (RUN starts poisoned: the bus may be mid-transfer.)
-;   receiver rule              an SDA edge within a cycle of SCL's FALL is read as data, as the
-;                              I2C specification tells receivers to (see `near:` below): a legal
-;                              hold time of 0 ns must not stop the referee.
+;   receiver rule              when the event is SCL's FALL, an SDA edge at or after it (within a
+;                              cycle) is read as data, as the I2C specification tells receivers
+;                              to (see `near:` below): a legal hold time of 0 ns must not stop the
+;                              referee.
 ;   D   guard band             per bound (none declared here: g = 0)
 ;
 ; Every interval is "X = earlier edge, Y = the edge that just happened"; JUDGE computes Y - X.
@@ -97,14 +98,20 @@ hd_sta: tsget X, 0, fall
         judge 5              ; tHD;STA
         jmp  wait
 
-; Two edges too close to order. If SCL is low after them, SCL fell and SDA changed next to it.
-; I2C lets a data hold time be 0 ns, and tells every receiver how to read this: UM10204 requires
-; a device to hold SDA internally for at least 300 ns "to bridge the undefined region of the
-; falling edge of SCL" (note to tHD;DAT in the bus-line characteristics table). So an SDA edge
-; next to SCL's fall is a data change, never a START or STOP: the event is an SCL fall, and the
-; protocol state moves on as for any SCL fall. The verdict that uses the ambiguous SCL edge is
-; CAN'T TELL by the ORD flag; nothing is poisoned.
-near:   tsts 1, level
+; Two edges too close to order. If the event is SCL's fall (C, from `tsts 1, tfall`) and SCL is
+; low after them, SCL fell and SDA changed next to it. I2C lets a data hold time be 0 ns, and
+; tells every receiver how to read this: UM10204 requires a device to hold SDA internally for at
+; least 300 ns "to bridge the undefined region of the falling edge of SCL" (note to tHD;DAT in
+; the bus-line characteristics table). So an SDA edge at or after SCL's fall is a data change,
+; never a START or STOP: the event is an SCL fall, and the protocol state moves on as for any SCL
+; fall. The verdict that uses the ambiguous SCL edge is CAN'T TELL by the ORD flag; nothing is
+; poisoned.
+; If the event is NOT SCL's fall, it is an SDA edge the chip saw while SCL was still high (a START
+; or STOP as far as the chip can tell) with SCL falling within a cycle of it. Reading that as data
+; would drop a START or STOP from the program's state, and a later START would be judged as the
+; wrong rule (found by the fourth review, 17 Nov). So: lost track.
+near:   jnc  lost            ; C still holds `tsts 1, tfall`: the receiver rule only for SCL's own fall
+        tsts 1, level
         jnc  scl_fall
 ; SCL is high after them: an SDA edge next to SCL's RISE (a START or STOP with no setup time, or
 ; data changing as SCL rises: both illegal, and not tellable apart), or a glitch.

@@ -344,6 +344,78 @@ def test_data_edges_soon_after_scl_falls_cost_coverage_only_when_they_are_events
     assert cover["i2c_fm_referee_p.s"][0] < cover["i2c_fm_referee_p.s"][1] // 2
 
 
+class _Wave:
+    """Hand-built waveforms, one level per clock cycle."""
+
+    def __init__(self):
+        self.sda, self.scl = [1], [1]
+
+    def hold(self, n):
+        for _ in range(n):
+            self.sda.append(self.sda[-1])
+            self.scl.append(self.scl[-1])
+
+    def set(self, sda=None, scl=None):
+        if sda is not None:
+            self.sda[-1] = sda
+        if scl is not None:
+            self.scl[-1] = scl
+
+    def bit(self, b, low=100, high=50, hd=20):
+        self.set(scl=0); self.hold(hd); self.set(sda=b); self.hold(low - hd); self.set(scl=1); self.hold(high)
+
+    def stop(self):
+        self.set(scl=0); self.hold(20); self.set(sda=0); self.hold(80); self.set(scl=1); self.hold(50); self.set(sda=1)
+
+
+def _start_then_scl_fall_one_cycle_later(w):
+    """A START (SDA falls, SCL high) with SCL falling one cycle later: the SDA edge is the trigger,
+    the SCL fall is reported in the next cycle (inside the snapshot, ORD). Before the fix of
+    17 Nov the program applied the receiver rule (reading it as an SCL fall with a data change
+    next to it), never saw the START, kept "bus idle", and judged the later repeated START as
+    tBUF PASS: a verdict about the wrong pair of edges, not poisoned."""
+    w.set(sda=0); w.hold(50)
+    for b in (1, 0, 1):
+        w.bit(b)
+    w.stop(); w.hold(200)                                  # bus idle, poison cleared by the STOP
+    w.set(sda=0); w.hold(1); w.set(scl=0); w.hold(19); w.set(sda=1); w.hold(80); w.set(scl=1); w.hold(50)
+    for b in (0, 1, 1):
+        w.bit(b)
+    w.set(scl=0); w.hold(20); w.set(sda=1); w.hold(80); w.set(scl=1); w.hold(50); w.set(sda=0); w.hold(50)  # repeated START
+    for b in (1, 0):
+        w.bit(b)
+    w.stop()
+
+
+def _stop_then_scl_fall_one_cycle_later(w):
+    """The same with a STOP: the program never set "bus idle", and judged the next START as
+    tSU;STA instead of tBUF."""
+    w.set(sda=0); w.hold(50)
+    for b in (1, 0, 1):
+        w.bit(b)
+    w.set(scl=0); w.hold(20); w.set(sda=0); w.hold(80); w.set(scl=1); w.hold(50)
+    w.set(sda=1); w.hold(1); w.set(scl=0); w.hold(99); w.set(scl=1); w.hold(200)  # STOP, SCL falls 1 cycle later
+    w.set(sda=0); w.hold(50)                                                      # START after an idle bus
+    for b in (1, 0):
+        w.bit(b)
+    w.stop()
+
+
+@pytest.mark.parametrize("fw", VARIANTS)
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("build", [_start_then_scl_fall_one_cycle_later, _stop_then_scl_fall_one_cycle_later])
+def test_start_or_stop_with_scl_falling_one_cycle_later_never_a_wrong_pair(fw, depth, build):
+    """Found by the fourth review (17 Nov): the receiver rule may only be applied when SCL's fall is
+    itself the event; when the event is an SDA edge seen while SCL was high, a START or STOP may
+    be missing from the program's state, so it must lose track (poison) instead."""
+    w = _Wave()
+    w.hold(200)
+    build(w)
+    w.hold(300)
+    a, md, words, verdicts = run_referee(w.sda, w.scl, fw, depth)
+    check(a, oracle(w.sda, w.scl), verdicts, VARIANTS[fw], latency=LATENCY * (2 * depth - 1))
+
+
 def test_snapshot_queue_depth_against_the_gate(capsys):
     """Candidate Q: a queue of snapshots, so an event that arrives while the previous one is being
     handled waits instead of being lost. Measured against the gate: violating intervals of at least

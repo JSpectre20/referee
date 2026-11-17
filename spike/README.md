@@ -12,6 +12,8 @@ Status: **work in progress, not a spec.** Nothing here is in the chip. The RTL, 
 | `bench.py` | pure-Python test bench: models, wires, bus devices, one clock cycle at a time |
 | `firmware/` | the programs, written against the model |
 | `tests/` | `python3 -m pytest spike/tests -q` |
+| `rule_slots.py` | hardware rule slots, the measured alternative to the snapshot queue (finding 11) |
+| `ISA-V1-DIFF.md` | the spec diff the spike produces, for the 23 Nov review |
 
 The output of the spike is the ISA v1 spec diff (for `docs/isa-timing.md` section 0b), the
 firmware, and the two tables at the end of this file.
@@ -31,7 +33,7 @@ Emulation (the "Player" side):
 | --- | --- | --- |
 | UART TX / RX, 8N1 | yes (18 / 16 words) | nothing new |
 | UART TX / RX, 8E1 | no | parity |
-| SPI controller, modes 0-3 | yes (29 words each for CPHA 0 / 1) | separate shift registers (no byte spreading) |
+| SPI controller, modes 0-3 | yes (29 / 28 words for CPHA 0 / 1) | separate shift registers (no byte spreading) |
 | SPI target, modes 0-3 | no | separate shift registers |
 | I2C controller (100 / 400 kHz, repeated START, stretching) | yes (63 of 64 words) | separate shift registers, second loop counter |
 | I2C target (24C02-style EEPROM) | no | separate shift registers |
@@ -44,7 +46,7 @@ Referee side:
 | I2C tSU;DAT | yes (10 words) | guard band |
 | I2C Fast-mode, all nine rules (tSU;DAT, tHD;DAT min and max, tLOW, tHIGH, tHD;STA, tSU;STA, tSU;STO, tBUF) | no | trigger on any edge of a set of channels, which edge triggered, line level at the trigger, guard band |
 | UART bit timing (start-bit width, bit-to-bit edges against the baud tolerance) | no | trigger on any edge, guard band |
-| SPI timing (CS-to-SCK setup, data setup and hold against SCK) | no | which edge triggered, guard band |
+| SPI timing (CS-to-SCK setup, SCK high and low, data setup, CS hold and deselect) | no (`spi_referee.s` since 17 Nov) | trigger on any edge, level-qualified trigger, which edge triggered, guard band |
 
 ## Candidates
 
@@ -62,9 +64,9 @@ are free. Operand space: 11 bits.
 | D | **Per-bound guard band.** Bound word 2 becomes `{n_lo[3:0], 0, is_max, width[9:0]}`; `n_lo` is signed. PASS and VIOLATION test against `n_lo` and `n_lo + width` (the v0.3 `inexact` bit is `width = 1`). The assembler computes both from the rule and one declaration per bus | bound table layout; assembler directives `.bus`, `.bound ... from/to` | 10 flops in the JUDGE pipeline (Referee only) |
 | E1 | **Trigger on a set of edges.** `trig` takes a channel mask and an edge kind (rise / fall / any) | operand bits of `trig` | about 6 flops (Referee only) |
 | E2 | **Snapshot tests.** `tsts ch, what`: C <- the level of channel `ch` after its last edge in the snapshot, or "the trigger was this channel's rise / fall"; A <- 1 if that answer is ambiguous (the edge is order-ambiguous with the trigger, or flagged). New branch condition A | opcode 0x1C | about 12 flops (Referee only): the levels and trigger edges kept in the snapshot, and A |
-| **Q** | **Snapshot queue** (finding 11): depth 2 or 4; `rel` pops; a loss marks the next snapshot (gap), which poisons when it is reached | none (hardware only) | one snapshot register set per extra entry, about 14,000 um2. **In the model**; review pending |
+| **Q** | **Snapshot queue** (finding 11): depth 2 or 4; `rel` pops; a loss marks the next snapshot (gap), which poisons when it is reached | none (hardware only) | one snapshot register set per extra entry, about 14,000 um2. **In the model, reviewed; depth 2 chosen** (finding 11) |
 | J | **A verdict as a branch condition** (finding 3): `judge b, flag` | the unused fourth value of JUDGE's push field | 2 flops (Referee only). Not in the model yet. Needed to judge tHD;DAT once data edges are no longer events (finding 10) |
-| **P** | **Poison** (the soundness fix, findings 1 and 10): a lost trigger sets `poisoned`; while it is set every JUDGE answers CAN'T TELL. `resync` clears it, but only while the program holds a snapshot and nothing was lost since that snapshot's trigger; `desync` sets it | opcodes 0x1D, 0x1E (could share one) | 2 flops (Referee only). **In the model** |
+| **P** | **Poison** (the soundness fix, findings 1, 10 and 11): a lost trigger sets `poisoned` (when the first snapshot after the loss is reached); while it is set every JUDGE answers CAN'T TELL. `resync` clears it, but only while the program holds the snapshot it last read; `desync` sets it | opcodes 0x1D, 0x1E (could share one) | 2 flops (Referee only). **In the model** |
 | K | **Level-qualified trigger** (findings 2 and 10): a second trigger term, `trigq mask, edge, ch, level` | opcode 0x1F | about 10 flops (Referee only). **In the model** |
 | L | "A trigger was lost" as a branch condition | - | **dropped: P does the same job in hardware, and firmware cannot forget to check it** |
 | M | **Stale earlier edge = PASS for a minimum bound** (finding 3) | none | 1 tag bit per register. Not in the model yet; needs a soundness argument first |
@@ -73,7 +75,7 @@ are free. Operand space: 11 bits.
 | H | Timestamp prescaler | - | default cut (decided on 23 Nov) |
 | I | `call` / `ret` | 2 opcodes | only if two programs overflow without it |
 
-## Findings so far (13 Nov)
+## Findings so far (13-17 Nov)
 
 1. **State kept across bus events is unsafe when events can be lost.** The first I2C Fast-mode
    referee (`firmware/i2c_fm_referee.s`, 47 words) triggers on every edge of SDA and SCL and keeps
@@ -142,7 +144,10 @@ are free. Operand space: 11 bits.
     START or a STOP. Two details the tests forced:
     - `resync` must not forgive an event lost *while the current one was being handled* (the
       first version did, and the wrong-pair tHD;STA verdict came back). So it only clears while a
-      snapshot is held and nothing was lost since that snapshot's trigger was accepted.
+      snapshot is held and nothing was lost since that snapshot's trigger was accepted. (Since
+      finding 11 the rule is a gap mark instead: a loss marks the next snapshot that gets a slot,
+      and the poison starts when that snapshot is reached; `resync` vouches only for the snapshot
+      the program last read.)
     - a referee must start poisoned (`desync` first): it may be switched on mid-transfer.
 
     With P, the test that was the known failure passes for both program variants on four traffic
@@ -158,9 +163,10 @@ are free. Operand space: 11 bits.
     | down to 30% of their minimum | 88.0% not judged, 135 reported | 64.3% not judged, 428 reported |
     | down to 10% of their minimum | 94.8% not judged, 70 reported | 88.3% not judged, 159 reported |
 
-    (Each percentage is of the events of the rules that variant judges; "all judged" leaves out
-    the first START after power-up, which is poisoned by design. tHD;DAT is not judged by P + K
-    yet: it needs candidate J. Numbers from `tests/test_ref_i2c.py`, fixed seeds.) The loss that remains with P + K comes from intervals shorter than the
+    (Measured on 13 Nov, before finding 11 changed what "lost" means and added the receiver rule:
+    the current numbers are in finding 11. Each percentage is of the events of the rules that
+    variant judges; "all judged" leaves out the first START after power-up, which is poisoned by
+    design. tHD;DAT is not judged by P + K yet: it needs candidate J.) The loss that remains with P + K comes from intervals shorter than the
     handling time, about 250 ns: gross violations, under 40% of a 600 ns minimum. They are counted
     (LOST) and never misjudged, but they are not reported as VIOLATION either. Lowering that is
     the performance goal: a shorter path from edge to `rel`, and a resync point more often than
@@ -168,24 +174,26 @@ are free. Operand space: 11 bits.
     Also by construction: RUN starts poisoned (a program that never says `resync` never gives a
     verdict), and `resync` only counts for the snapshot the program last read. In the table,
     "judged" includes ordinary CAN'T TELL answers (too close to the bound, or edges too close to
-    order). A known coverage gap of P + K: a data hold time under about 2 cycles (33 ns, which is
-    legal) makes the SCL fall ambiguous with the SDA edge, and the program then stays poisoned
-    until the next START or STOP; the test traffic uses 60 ns or more and does not show it.
+    order). (A coverage gap noted here on 13 Nov, a data hold under about 2 cycles poisoning the
+    program, was closed by the receiver rule of finding 11.)
     The second reviewer fuzzed both programs with 300 random and glitchy waveforms each (intervals
     down to 1% of their minimum) and found no unpoisoned PASS or VIOLATION that contradicts the oracle.
     Smallest sound design: **P alone is enough for soundness (2 flops, 2 instructions) and replaces
     L. K is what makes the instrument useful on real buses. J is needed for tHD;DAT. M is still
     open.**
 
-11. **Legal traffic must never poison; event loss measured against a gate (14 Nov). WORK IN
-    PROGRESS: the second review of this step was interrupted and is still owed, and the
-    hardware-rule-slots comparison is not finished.**
+11. **Legal traffic must never poison; event loss measured against a gate (14-17 Nov).**
     - **A data hold time of 0 ns is legal in I2C**, and to the chip it is an SDA edge and an SCL
       edge too close to order. The program now follows the I2C receiver rule: UM10204 requires
       every device to hold SDA internally for at least 300 ns "to bridge the undefined region of
       the falling edge of SCL" (note to tHD;DAT in the bus-line characteristics table), so an
-      SDA edge next to SCL's fall is a data change, never a START or STOP. The protocol state
-      moves on; the one verdict that uses the ambiguous edge may be CAN'T TELL. Measured on
+      SDA edge at or after SCL's fall is a data change, never a START or STOP. So when the event
+      is SCL's fall and an SDA edge sits next to it, the protocol state moves on; the one verdict
+      that uses the ambiguous edge may be CAN'T TELL. When the event is an SDA edge the chip saw
+      while SCL was still high, with SCL falling a cycle later, the program loses track instead
+      (poison until the next START or STOP): the fourth review (17 Nov) found that reading this
+      case as data too dropped a START or STOP from the program's state and gave a later START
+      the wrong rule; a regression test now covers it. Measured on
       legal traffic with data hold 0, 0-33, 0-100 and 0-800 ns: no lost event and no poisoned
       JUDGE (apart from the first START after RUN, which is poisoned by design).
     - **"Lost" now means "in no snapshot".** An armed edge reported one cycle after an accepted
@@ -206,12 +214,18 @@ are free. Operand space: 11 bits.
       | **all mixes** | **43.5%** | **1.1%** | **0%** |
 
       One extra snapshot (depth 2, about 14,000 um2, 1.2% of the core) passes the gate overall and
-      on every mix down to 10% of the minimum; depth 4 (about 43,000 um2, 3.6%) leaves nothing
+      on every mix down to 10% of the minimum; depth 4 (about 42,000 um2, 3.5%) leaves nothing
       unjudged in these mixes. Intervals under 4 clock cycles are below the minimum level length
       the proofs assume: no sampled design can judge them, and the tables list them separately.
       (The model, being cycle-exact, does judge them; the chip must not claim to.)
-    - Hardware rule slots (every rule checked in hardware on every event) are being modelled for
-      the same table; `spike/rule_slots.py` is not in the repository yet.
+    - **Hardware rule slots** (`rule_slots.py`; every rule checked in hardware on every edge, no
+      firmware) leave nothing unjudged on any mix and also judge tHD;DAT, but 8 slots cost about
+      83,000-218,000 um2 (6.9-18% of the core; some sizes assumed). **Chosen: the queue at depth 2,
+      the smallest design that passes the gate over all mixes**; depth 4 if the gate is read per mix
+      (the owner decides on 23 Nov).
+    - **Throughput is a second limit** (found with the SPI referee): every SCK edge is an event,
+      and the program keeps up with SCK half periods of 14 cycles or more (about 2.1 MHz), at depth
+      1 and 2 alike. A queue absorbs bursts, not a faster steady rate.
 
 ## Results
 
@@ -222,11 +236,12 @@ are free. Operand space: 11 bits.
 | UART TX, 8N1 (`uart_tx.s`) | 18 | 18 | none |
 | UART RX, 8N1 (`uart_rx.s`) | 16 | 16 | none |
 | UART TX, 8E1 (`uart_tx_8e1.s`) | - | 22 | C2 |
-| UART RX, 8E1 (`uart_rx_8e1.s`) | - | 42 (about 7 of them work around finding 7) | C2, C1 (branch on Z) |
-| SPI controller, modes 0-3 (`spi_controller.s`) | 29 + 29 (one file per CPHA) | 26 (one file) | A |
+| UART RX, 8E1 (`uart_rx_8e1.s`) | - | 42 (about 7 of them work around finding 6) | C2, C1 (branch on Z) |
+| SPI controller, modes 0-3 (`spi_controller.s`) | 29 + 28 (one file per CPHA) | 26 (one file) | A |
 | SPI target, modes 0-3 (`spi_target.s`), up to 4.29 MHz SCK | - | 39 | A |
 | I2C Fast-mode referee, P only (`i2c_fm_referee_p.s`): eight of nine rules, every edge an event | - (one rule: 10) | 52 of 64 | B, E1, E2, P |
-| I2C Fast-mode referee, P + K (`i2c_fm_referee.s`): seven of nine rules, events = SCL edges, START, STOP | - | 49 of 64 | B, E1, E2, P, K |
+| I2C Fast-mode referee, P + K (`i2c_fm_referee.s`): seven of nine rules, events = SCL edges, START, STOP | - | 51 of 64 | B, E1, E2, P, K |
+| SPI timing referee (`spi_referee.s`), modes 0 and 3: tSU, tCH, tCL, tCSS, tCSH, tCSD; SCK up to about 2.1 MHz | - | 50 of 64 | E1, E2, K, P |
 
 Every row passes a bus-level test in `tests/` against a device model written from the protocol,
 not from the firmware, with negative controls (a bit time 3% off, the wrong clock phase, an SCK
@@ -235,13 +250,13 @@ to engine on two models wired together.
 
 | Candidate | Used by (so far) | Verdict (so far) |
 | --- | --- | --- |
-| A separate shift registers | SPI controller, SPI target | two programs: stays, but needs the fix of finding 7. No program needs more than 8 bits of SRO |
+| A separate shift registers | SPI controller, SPI target | two programs: stays, but needs the fix of finding 6. No program needs more than 8 bits of SRO |
 | B second loop counter | I2C referee (as two state flags; both variants are one program for this rule) | one program: not yet; none of the UART / SPI programs wanted it |
 | C1 wider branch field | UART RX 8E1 (Z), I2C referee (A) | new conditions are used; no program needs an address above 63 yet |
 | C2 CRC / parity register | UART TX 8E1, UART RX 8E1 | two programs: stays |
 | C3 bit stuffing | none yet (CAN not written) | open |
 | D guard band | none yet (no program declares a guard) | open |
-| E1 trigger on a set of edges | I2C referee | one program: not yet |
-| E2 snapshot tests | I2C referee | one program: not yet |
-| P poison, resync, desync | I2C referee | soundness mechanism for any referee that keeps state: the owner's rule, not subject to the count |
-| K level-qualified trigger | I2C referee | one program: not yet (an SPI referee would qualify SCK edges by CS) |
+| E1 trigger on a set of edges | I2C referee, SPI referee | two programs: stays |
+| E2 snapshot tests | I2C referee, SPI referee | two programs: stays |
+| P poison, resync, desync | I2C referee, SPI referee | soundness mechanism for any referee that keeps state: the owner's rule, not subject to the count |
+| K level-qualified trigger | I2C referee, SPI referee (SCK edges while CS is low) | two programs: stays |

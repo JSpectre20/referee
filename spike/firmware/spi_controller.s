@@ -24,7 +24,7 @@
 ;
 ; v1 candidate used: A. Without it every data bit needs a shift out and a shift in of the one
 ; SR, so the host had to spread each byte over two IN bytes and gather two OUT bytes
-; (v0.3: 29 words per CPHA, 2 IN + 2 OUT bytes per data byte).
+; (v0.3: 29 + 28 words, one file per CPHA; 2 IN + 2 OUT bytes per data byte).
 ; Clock-independent: time literals are converted to cycles at the image's clock.
 .equ CPOL 0
 .equ CPHA 0
