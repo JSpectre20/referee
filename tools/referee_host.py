@@ -12,6 +12,15 @@ the command-line tool, so the two can't drift apart.
     python3 tools/referee_host.py --port /dev/ttyUSB0 drain
     python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
+    python3 tools/referee_host.py --port /dev/ttyUSB0 --engine 1 status       # the Player
+
+Two engines at once (engine 0 = the Referee, engine 1 = the Player): the Player speaks a
+bus, and the Referee judges it through the judge-channel mux (channel ch on uio_in[k]):
+
+    python3 tools/referee_host.py --port /dev/ttyUSB0 load2 firmware/engine/i2c_setup_referee.s \
+        firmware/engine/i2c_controller.s --pin1 2:od,3:od --mux 0:uio3,1:uio2 --run
+    python3 tools/referee_host.py --port /dev/ttyUSB0 --engine 1 i2c-write 50 10 a5
+    python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
 
 Bit-serial controllers (load the firmware first, then talk to the bus through it):
 
@@ -47,7 +56,8 @@ CLOCK_HZ = _clock_hz()
 BAUD = 115200
 POWER_UP_DIV = round(CLOCK_HZ / BAUD)  # the chip's power-up bit period (src/project.v CLKS_PER_BIT)
 FAST_DIV = 20  # clock / 20: 3 Mbaud at 60 MHz
-ENGINE_WORDS = refasm.IMAGE_WORDS  # 97
+ENGINE_WORDS = refasm.IMAGE_WORDS  # 97, for both engines
+REFEREE, PLAYER = refasm.REFEREE, refasm.PLAYER  # engine numbers e
 GLOBAL_WORDS = refasm.GLOBAL_WORDS  # 8
 VERDICT = {0: "INDETERMINATE", 1: "PASS", 2: "VIOLATION", 3: "?"}
 
@@ -78,11 +88,13 @@ def pkt_write_engine(addr, word, e=0):
 
 
 def pkt_read(sel, addr, part):
-    """sel 0 global / 1 engine 0; addr 0x80 = computed CRC; part 0 low / 1 high byte."""
+    """sel 0 global / 1 + e engine e; addr 0x80 = the CRC that engine's last RUN check
+    computed (global: 0x80 + e, as computed by engine e); part 0 low / 1 high byte."""
     return _p(0x72, sel, addr, part)
 
 
 def pkt_crc(sel, crc):
+    """sel 0 global / 1 + e engine e."""
     return _p(0x43, sel, crc >> 8, crc)
 
 
@@ -182,24 +194,58 @@ def gather(hi, lo):
     return sum((w >> (2 * k) & 1) << k for k in range(8))
 
 
-def pin_config(spec):
-    """'0:pp,1:od' -> {pin: (owner 1 = engine 0, mode 1 push-pull / 2 open-drain)}."""
+def pin_config(spec, e=REFEREE):
+    """'0:pp,1:od' -> {pin: (owner e + 1, mode 1 push-pull / 2 open-drain)}."""
     modes = {"pp": 1, "od": 2}
     pins = {}
     for item in filter(None, (spec or "").split(",")):
         p, m = item.split(":")
-        pins[int(p)] = (1, modes[m])
+        pins[int(p)] = (e + 1, modes[m])
     return pins
 
 
-def load_packets(glob, img):
-    """Halt, write the global config and the engine image, and both expected CRCs."""
-    if len(glob) != GLOBAL_WORDS or len(img) != ENGINE_WORDS:
-        raise HostError(f"image sizes {len(glob)}/{len(img)}, expected {GLOBAL_WORDS}/{ENGINE_WORDS}")
-    pkts = [pkt_run(False)]
+def mux_config(spec):
+    """'0:uio3,1:uio2' -> the 4 judge-channel sources (0 = ui_in[4 + ch], 1 + k = uio_in[k])."""
+    mux = [0, 0, 0, 0]
+    for item in filter(None, (spec or "").split(",")):
+        ch, src = item.split(":")
+        mux[int(ch)] = 0 if src == "ui" else 1 + int(src.removeprefix("uio"))
+    return mux
+
+
+def _check_sizes(glob, imgs):
+    if glob is not None and len(glob) != GLOBAL_WORDS:
+        raise HostError(f"global image is {len(glob)} words, expected {GLOBAL_WORDS}")
+    for e, img in imgs.items():
+        if len(img) != ENGINE_WORDS:
+            raise HostError(f"engine {e} image is {len(img)} words, expected {ENGINE_WORDS}")
+
+
+def load_system_packets(glob, imgs):
+    """Halt BOTH engines (the global config is written only while both are halted), write
+    the global config and each image in imgs ({e: image}), and the expected CRCs."""
+    _check_sizes(glob, imgs)
+    pkts = [pkt_run(False, e) for e in (REFEREE, PLAYER)]
     pkts += [pkt_write_global(a, w) for a, w in enumerate(glob)]
-    pkts += [pkt_write_engine(a, w) for a, w in enumerate(img)]
-    pkts += [pkt_crc(0, refasm.crc16(glob)), pkt_crc(1, refasm.crc16(img))]
+    for e, img in imgs.items():
+        pkts += [pkt_write_engine(a, w, e) for a, w in enumerate(img)]
+    pkts.append(pkt_crc(0, refasm.crc16(glob)))
+    pkts += [pkt_crc(1 + e, refasm.crc16(img)) for e, img in imgs.items()]
+    return pkts
+
+
+def load_packets(glob, img, e=REFEREE):
+    """Halt both engines, write the global config and engine e's image, and both CRCs."""
+    return load_system_packets(glob, {e: img})
+
+
+def load_engine_packets(img, e):
+    """Halt engine e only and write its image and expected CRC; the global config (and the
+    other engine, which may keep running) are untouched."""
+    _check_sizes(None, {e: img})
+    pkts = [pkt_run(False, e)]
+    pkts += [pkt_write_engine(a, w, e) for a, w in enumerate(img)]
+    pkts.append(pkt_crc(1 + e, refasm.crc16(img)))
     return pkts
 
 
@@ -215,12 +261,18 @@ def set_equ(source_text, equ):
     return source_text
 
 
-def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ, equ=None):
-    """Assemble firmware -> (global image, engine image, notes)."""
-    source_text = set_equ(source_text, equ)
-    a = refasm.Assembler(clock_hz)
-    words = a.assemble(source_text)
-    return refasm.global_image(pins or {}, mux), a.image(words), a.notes
+def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ, equ=None, engine=REFEREE):
+    """Assemble firmware for engine `engine` -> (global image, engine image, notes).
+    pins: {pin: (owner, mode)} with owner = engine + 1 (see pin_config)."""
+    img, notes = assemble(source_text, clock_hz, equ, engine)
+    return refasm.global_image(pins or {}, mux), img, notes
+
+
+def assemble(source_text, clock_hz=CLOCK_HZ, equ=None, engine=REFEREE):
+    """Firmware -> (engine image, notes) for engine `engine`."""
+    a = refasm.Assembler(clock_hz, engine)
+    words = a.assemble(set_equ(source_text, equ))
+    return a.image(words), a.notes
 
 
 # ----------------------------------------------------------------------------
@@ -229,11 +281,14 @@ def build(source_text, pins=None, mux=None, clock_hz=CLOCK_HZ, equ=None):
 
 
 class Referee:
-    def __init__(self, port, baud=BAUD, timeout=0.5):
+    e = REFEREE  # the engine push_in / pop_out (and the bus helpers) talk to
+
+    def __init__(self, port, baud=BAUD, timeout=0.5, engine=REFEREE):
         import serial  # pyserial; only needed for real hardware
 
         self.ser = serial.Serial(port, baud, timeout=timeout)
         self.ser.reset_input_buffer()
+        self.e = engine
 
     def transact(self, pkt, extra=0):
         self.ser.write(pkt)
@@ -264,7 +319,7 @@ class Referee:
         import time
 
         t0 = time.monotonic()
-        while not self.transact(pkt_push(byte))[0]:
+        while not self.transact(pkt_push(byte, self.e))[0]:
             if time.monotonic() - t0 > timeout:
                 raise HostError("IN stayed full: is the firmware running?")
             time.sleep(0.001)
@@ -275,7 +330,7 @@ class Referee:
 
         t0 = time.monotonic()
         while True:
-            ok, byte, _ = self.transact(pkt_pop())
+            ok, byte, _ = self.transact(pkt_pop(self.e))
             if ok:
                 return byte
             if time.monotonic() - t0 > timeout:
@@ -340,6 +395,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", required=True)
     ap.add_argument("--fast", action="store_true", help="switch to clock / 20 baud first")
+    ap.add_argument("--engine", type=int, choices=(REFEREE, PLAYER), default=REFEREE,
+                    help="0 = the Referee (default), 1 = the Player: for status, halt, load and the bus commands")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("id")
     sub.add_parser("status")
@@ -352,6 +409,16 @@ def main(argv=None):
     ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
     ld.add_argument("--run", action="store_true")
     ld.add_argument("--equ", action="append", default=[], help="override a .equ, e.g. CPOL=1 (SPI modes 2/3)")
+    ld.add_argument("--mux", default="", help="judge channels, e.g. 0:uio3,1:uio2 (default: all on ui_in)")
+    ld.add_argument("--keep-global", action="store_true",
+                    help="write only this engine's image (the other engine keeps running and the config stays)")
+    l2 = sub.add_parser("load2", help="load both engines: the Referee and the Player, one global config")
+    l2.add_argument("referee_source")
+    l2.add_argument("player_source")
+    l2.add_argument("--pin0", default="", help="the Referee's output pins, e.g. 0:pp")
+    l2.add_argument("--pin1", default="", help="the Player's output pins, e.g. 2:od,3:od")
+    l2.add_argument("--mux", default="", help="judge channels, e.g. 0:uio3,1:uio2")
+    l2.add_argument("--run", action="store_true", help="run the Player, then the Referee")
     hexb = lambda x: int(x, 16)  # noqa: E731
     iw = sub.add_parser("i2c-write", help="through i2c_controller.s: write data at a pointer")
     iw.add_argument("addr", type=hexb)
@@ -365,16 +432,17 @@ def main(argv=None):
     sp.add_argument("data", type=hexb, nargs="+")
     args = ap.parse_args(argv)
 
-    ref = Referee(args.port)
+    ref = Referee(args.port, engine=args.engine)
+    e = args.engine
     try:
         if args.fast:
             ref.fast()
         if args.cmd == "id":
             print("Referee" if ref.must(pkt_id()) == ID else "unexpected id")
         elif args.cmd == "status":
-            print(decode_status(ref.must(pkt_status())))
+            print(decode_status(ref.must(pkt_status(e=e))))
         elif args.cmd == "halt":
-            ref.must(pkt_run(False))
+            ref.must(pkt_run(False, e))
         elif args.cmd == "drain":
             n, rest = ref.must(pkt_drain())
             slots = [rest[2 * i] << 8 | rest[2 * i + 1] for i in range(n)]
@@ -391,15 +459,31 @@ def main(argv=None):
             ref.must(pkt_stats_latch(args.slot))
             names = ["pass", "viol", "indet", "min", "max"]
             print({n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)})
-        else:
-            equ = dict(e.split("=", 1) for e in args.equ)
-            glob, img, notes = build(Path(args.source).read_text(), pin_config(args.pin), equ=equ)
-            for p in load_packets(glob, img):
+        elif args.cmd == "load2":
+            img0, n0 = assemble(Path(args.referee_source).read_text(), engine=REFEREE)
+            img1, n1 = assemble(Path(args.player_source).read_text(), engine=PLAYER)
+            pins = {**pin_config(args.pin0, REFEREE), **pin_config(args.pin1, PLAYER)}
+            glob = refasm.global_image(pins, mux_config(args.mux))
+            for p in load_system_packets(glob, {REFEREE: img0, PLAYER: img1}):
                 ref.must(p)
             if args.run:
-                ok, _, _ = ref.transact(pkt_run(True))
+                for en in (PLAYER, REFEREE):
+                    if not ref.transact(pkt_run(True, en))[0]:
+                        raise HostError(f"RUN of engine {en} refused: {decode_status(ref.must(pkt_status(e=en)))}")
+            print("\n".join(n0 + n1) + ("\nloaded, running" if args.run else "\nloaded"))
+        else:
+            equ = dict(x.split("=", 1) for x in args.equ)
+            img, notes = assemble(Path(args.source).read_text(), equ=equ, engine=e)
+            if args.keep_global:
+                pkts = load_engine_packets(img, e)
+            else:
+                pkts = load_packets(refasm.global_image(pin_config(args.pin, e), mux_config(args.mux)), img, e)
+            for p in pkts:
+                ref.must(p)
+            if args.run:
+                ok, _, _ = ref.transact(pkt_run(True, e))
                 if not ok:
-                    raise HostError(f"RUN refused: {decode_status(ref.must(pkt_status()))}")
+                    raise HostError(f"RUN refused: {decode_status(ref.must(pkt_status(e=e)))}")
             print("\n".join(notes) + ("\nloaded, running" if args.run else "\nloaded"))
     except (HostError, refasm.AsmError) as e:
         sys.exit(str(e))

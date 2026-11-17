@@ -43,6 +43,10 @@ as numbers, and keeps the **assumption ledger** (§11).
 | **14. The RUN start is registered; C_START stays 106.** The pass / fail decision is computed in the check's second-to-last cycle (the last word is the claimed-pin mask, a plain register, and everything the check reads is constant during it) and held in a flip-flop; the last cycle's RUN start, which clears ~700 registers, comes from that flip-flop | The start used to come from the read mux, a CRC update and a 16-bit compare, then fan out to every engine register: the second slowest path group. Nothing outside the engine changes. Formal: property 7b (start_r equals the last-cycle check) |
 | **15. Separate fetch and readback muxes; four pc copies** (no ISA change). Fetch always reads `prog[pc]`; the RUN check and host readback read the program through their own 64:1 mux. (From 28 Oct to 13 Nov 2026 the two shared one mux, selected by `running`; in the first 8x4 hardening run that select, the `running` flop through six buffers, was the only path group that missed 60 MHz at the slow corner, by 0.41 ns.) Four copies of pc each address one quarter of the program; synthesis keeps them (one `(* keep *)` process each; checked in the netlist) and formal asserts they always equal pc | The second mux costs about 13,000 um2 per engine, which is small at 33% of 8x4. One pc bit drove ~100 mux inputs through 9 small buffers (4.8 ns at the slow corner): hence the copies. Readback is only possible while halted (the host port NAKs it otherwise) |
 | **16. No pin is driven before the first RUN since reset** (user, 29 Oct). Until a RUN check has passed, every uio pin is high-impedance and the engine's uo_out bits are 0 (uo_out[4] is the host TX), whatever the global config says; a refused RUN changes nothing. From the first RUN start on, the config's ownership and modes apply, and a halted engine keeps its push-pull levels (3.1) | The host writes the global config while loading, before any image has been checked: a pin must not start driving a bus because the config names an owner. Before this, a push-pull pin drove its stale value as soon as its config word was written. Formal: engine_sys `!ran` property (fails without the gate); chip test `no_pin_driven_before_first_run` |
+| **17. Two engines; what the Player does with the referee instructions** (two-engine step, 17 Nov). Engine 0, the **Referee**, is the one-engine chip's engine unchanged (64 words, all referee hardware). Engine 1, the **Player**, is the same RTL module with `REFEREE = 0`: no snapshot or trigger, no verdict block, no bounds table, no stats, no VERDICT FIFO, no LOST; of edge_ts it sees only the four channels' synchronized levels (inputs 12..15). Its referee instructions behave as on a Referee whose trigger never fires and whose verdicts go nowhere: **TRIG** no effect; **REL** no effect; **TSGET r** writes r ← 0 (as before any snapshot: F 1, O 0, epoch 0, diff 2); **JUDGE** no effect at all (no push, no stats, VERDICT_OVF stays 0, no L); **WAITS** can only end by its timeout (T ← 1, at the same cycle a Referee WAITS without a snapshot would); **S is always 0** (`js` never taken, `jns` always). Status: S and VERDICT_OVF read 0. The assembler reports these instructions in a Player program but accepts them | One rule ("a Referee without a trigger") instead of five special cases, and every effect is one the Referee already has: the Player needs no new RTL path, and a program that runs on both engines does the same thing on both until it takes a snapshot. A fault bit for "referee instruction on the Player" would cost hardware for a mistake the assembler can report. WAITS as a pure timeout wait is even useful. Formal: engine property 13 (Player configuration); lockstep `lockstep_player_alongside_referee`; chip test `player_referee_instructions` |
+| **18. The Player's 96 words with the 6-bit address field.** The Player's pc is 7 bits; straight-line code runs 63 → 64 → ... → 95 → **0** (pc + 1 wraps after the last word, as the Referee's wraps after 63). JMP / BR / LOOP targets stay 6 bits (0..63): words 64..95 can be reached **only by falling through from word 63**, and code there can jump back below 64. The assembler rejects a target ≥ 64 with that reason. The fetch path is the Referee's, generalized: one pc copy per 16-word bank (6 for the Player, each its own `(* keep *)` process, 7 x 7 pc flip-flops in the netlist), the bank picked by pc[6:4] | Of the three options (paged targets, only 64 reachable until v1, fall-through), fall-through keeps v1 simplest: v1 widens `a` to 7 bits and nothing else changes, and every Player program written today keeps its meaning (a superset, no paging to undo). It also puts the full 96-word fetch mux in the hardened netlist now, so timing and area are measured on the real structure, not on a 64-word subset. Formal: property 12 (copies = pc, pc < 96), covers for pc = 64 and the 95 → 0 wrap |
+| **19. Image format and host commands for two engines.** The **Player's image is 97 words: program 0..95 + the claimed-pin mask at 96** (no bounds). So both images are 97 words, both RUN checks take 8 + 97 = 105 cycles and C_START is 106 for both, and the claimed-pin mask is at address 96 in both. Host commands (`e` = engine): `W` e in A[7], addr 0..96; `r` sel 0 global / **1 + e** engine e, addr 0x80 = that engine's last computed image CRC, global addr **0x80 + e** = the global CRC engine e's last check computed; `C` sel 0 global / 1 + e; `R`, `P`, `p`, `Q` take e = 0 or 1; **`D`, `S`, `s`, `Z`, `L` take only e = 0** (the Player has no verdicts, stats or LOST). The global config (`G`, `C` 0, `r` 0) needs **both** engines halted; an engine's image, expected CRC and readback need only **that** engine halted, so the Player can be reloaded and re-run while the Referee keeps judging. Global word 1 now says engine count 2 (format version stays 3: the Referee's image and the global layout are unchanged) | Bounds in the Player image would only hold unused words, and 96 + 32 + 1 = 129 words would not fit the `W` packet's 7-bit image address. Equal image lengths keep one RUN-check timing and one host address range for both engines. (`spike/ISA-V1-DIFF.md` section 5 draft gave the Player 16 bounds too; this supersedes that for v0.3.) Chip tests `pin_ownership_two_engines`, `rejects_bad_commands`; `tools/referee_host.py` `load_system_packets`, `load_engine_packets`, `load2` |
+| **20. Per-engine "ran", and only the Referee's RUN clears edge_ts `missed`.** Diff 16 per engine: a pin owned by engine e is driven only once e has had a RUN start since reset; the other engine's RUN doesn't start it. edge_ts is shared, and diff 3 applies to the Referee's RUN only: the Player's RUN leaves `missed` alone | A Player RUN that cleared `missed` while the Referee runs would erase the flag of a missed edge the Referee has not yet snapshotted: a verdict on that timestamp could then be a false PASS. Formal: engine_sys properties (`et_clear_missed == run_start0`, per-engine `ran`); lockstep (the Player is re-run under a running Referee) |
 
 ## 1. Decisions, with evidence
 
@@ -51,7 +55,7 @@ as numbers, and keeps the **assumption ledger** (§11).
 | STA at 60 MHz, 40 MHz fallback | Agreed | The demo board's `clock_project_PWM` uses an RP2 system clock that's a multiple of the project clock, up to twice it: 60 MHz = 120 MHz / 2 at 50% duty. 40 MHz = 120 / 3 at 33% duty, so STA must check the minimum pulse width there. The current chip has +10.7 ns setup slack at 20 ns. At 60 MHz, u = 2 cycles = 33 ns. |
 | Every non-waiting instruction takes 1 cycle, incl. taken branches and LOOP | Agreed | Flop program memory is read combinationally. Only WAITD, WAITP and WAITS stall. |
 | 64x16 flop program memory per engine | Agreed | ~55k µm² per engine. When this was decided the chip (before the engine) was 82k µm², 9.1% of the 6x4 core. SRAM clock-to-output (~6.3 ns) would sit in the 1-cycle branch path. |
-| Engines | 1 in v0, 2 planned | Decided at the 8 Nov gate from the area ledger. The image format already supports 2 (§7). One shared edge_ts, with one snapshot + trigger per engine. |
+| Engines | 2 (since 17 Nov) | Decided at the 8 Nov gate from the area ledger. Engine 0, the Referee (64 words, all referee hardware); engine 1, the Player (96 words, emulation only): one RTL module, two parameter sets (§0b, diffs 17-20). One shared edge_ts; the snapshot + trigger are the Referee's. |
 | Judge channels | 4 | Default ui_in[4..7]; each has a mux to uio_in[0..7] for active modes. Non-intrusive only when all four are on ui_in; every verdict carries NI. |
 | WAITP on judge channels | Required | Inputs 12..15 are the channels after the mux, the same synchronized signal edge_ts sees. |
 | 10BASE-T | Out of v0 | Needs a hardware serializer. |
@@ -60,16 +64,16 @@ as numbers, and keeps the **assumption ledger** (§11).
 
 | State | Bits | Changed by |
 | --- | --- | --- |
-| PC | 6 | issue, branches, RUN (→ 0) |
+| PC | 6 (Referee) / 7 (Player) | issue, branches, RUN (→ 0); + 1 wraps after the last word (63 / 95) |
 | X, Y | 16 each, + F, O, E tags (1+1+2 bits) | TSGET |
 | SR | 16 | SHO, SHI, LDSR, PULL |
 | RC | 8 | LDRC, LOOP. One counter, **no nesting** in v0 (inner loops must be unrolled or use the schedule) |
 | DL (schedule) | 16 | **MARK, WAITD only** |
 | TO (timeout) | 16 | **TMO, TMON only** |
-| Flags T, C, E, S | 1 each | WAITP/WAITS; SHI/TSTP/CMP; PULL; snapshot logic, REL |
-| LOST | 8, saturating | +1 per trigger lost while S; **cleared only by the host** |
+| Flags T, C, E, S | 1 each | WAITP/WAITS; SHI/TSTP/CMP; PULL; snapshot logic, REL (S is always 0 on the Player) |
+| LOST | 8, saturating | +1 per trigger lost while S; **cleared only by the host** (Referee only) |
 | lost_since_verdict | 1 | set by a lost trigger; cleared by JUDGE (reported as L) |
-| Stats, slots 0..3 | 5 x 16 each (+ reserved Σm 32, Σm² 48) | JUDGE b < 4; cleared by the host |
+| Stats, slots 0..3 | 5 x 16 each (+ reserved Σm 32, Σm² 48) | JUDGE b < 4; cleared by the host (Referee only) |
 | Sticky status: OUT_OVF, VERDICT_OVF, IN_UNDERRUN, PIN_FAULT, CRC_FAIL | 1 each | hardware; cleared by the host status read or a new RUN |
 | NOW (shared) | 16 | +1 every cycle |
 | Output pins (shared) | 15: uio[0..7] (input / push-pull / open-drain), uo_out[0,1,2,3,5,6,7] (push-pull) | owner + mode in the global config |
@@ -80,8 +84,8 @@ as numbers, and keeps the **assumption ledger** (§11).
 - An instruction **issues** in the cycle it executes; straight-line code issues one per cycle.
 - Every instruction costs **exactly 1 cycle** except WAITD, WAITP and WAITS. Branches (JMP, BR,
   LOOP), taken or not, cost 1 cycle.
-- RUN checks the images (§7, 105 cycles). If both pass, address 0 issues **C_START = 106**
-  cycles after RUN is accepted.
+- RUN checks the images (§7, 105 cycles, for either engine). If both pass, address 0 issues
+  **C_START = 106** cycles after RUN is accepted.
 - **HALT** (or a host halt) cancels any wait. Push-pull pins keep their level;
   **open-drain pins are released**, so a halted engine can't hold SDA low and hang the bus.
 
@@ -189,7 +193,7 @@ Opcodes 0x18..0x1B are reserved for the v1 bitstream unit; 0x1C..0x1F are free.
 | 0x07 | `tmo t[, x16]` | 1 | TO <- DL + t * (x16 ? 16 : 1) (timeout relative to the schedule) |
 | 0x08 | `waitd n` | ≥ 1 (waits) | DL <- DL + n; the next instruction issues at max(t + 1, DL) |
 | 0x09 | `waitp q, v` | ≥ 1 (waits) | until in[q] == v (T <- 0) or NOW - TO >= 0 (T <- 1); pin event wins a tie; DL and TO unchanged |
-| 0x0a | `waits` | ≥ 1 (waits) | until S (T <- 0) or NOW - TO >= 0 (T <- 1); snapshot wins a tie; DL and TO unchanged |
+| 0x0a | `waits` | ≥ 1 (waits) | until S (T <- 0) or NOW - TO >= 0 (T <- 1); snapshot wins a tie; DL and TO unchanged. **Player:** S is never set: waits until NOW - TO >= 0, then T <- 1 (a pure timeout wait) |
 | 0x0b | `jmp a` | 1 | pc <- a |
 | 0x0c | `br c, a` | 1 | if condition c: pc <- a. Aliases: jt jnt jc jnc je jne js jns |
 | 0x0d | `loop a` | 1 | if RC != 0: RC <- RC - 1, pc <- a; else fall through |
@@ -197,10 +201,10 @@ Opcodes 0x18..0x1B are reserved for the v1 bitstream unit; 0x1C..0x1F are free.
 | 0x0f | `ldsr imm[, hi]` | 1 | SR[7:0] (or SR[15:8]) <- imm |
 | 0x10 | `pull[ hi]` | 1 | if IN non-empty: SR byte <- IN, E <- 0; else E <- 1, SR unchanged, IN_UNDERRUN <- 1. Never stalls. |
 | 0x11 | `push[ hi]` | 1 | OUT <- SR byte; never stalls; full -> drop, OUT_OVF <- 1 |
-| 0x12 | `trig ch, e` | 1 | this engine's snapshot trigger <- channel ch, edge e (rise or fall) |
-| 0x13 | `rel` | 1 | S <- 0 (release the snapshot; the next trigger may replace it) |
-| 0x14 | `tsget r, ch, e` | 1 | r <- snapshot timestamp of channel ch, edge e (rise, fall or last); F(r) <- its stale \| missed \| !valid; O(r) <- its ORD bit; E(r) <- snapshot epoch |
-| 0x15 | `judge b[, raw][, push]` | 1 | m <- Y - X; v <- verdict(m, bounds[b], invalid = FX \| FY \| OX \| OY \| (EX != EY)); update stats[b] if b < 4; push per mode (all / nonpass / none), header (+ m if raw), all or nothing; clear lost_since_verdict |
+| 0x12 | `trig ch, e` | 1 | this engine's snapshot trigger <- channel ch, edge e (rise or fall). **Player:** no effect (no trigger) |
+| 0x13 | `rel` | 1 | S <- 0 (release the snapshot; the next trigger may replace it). **Player:** no effect (S is always 0) |
+| 0x14 | `tsget r, ch, e` | 1 | r <- snapshot timestamp of channel ch, edge e (rise, fall or last); F(r) <- its stale \| missed \| !valid; O(r) <- its ORD bit; E(r) <- snapshot epoch. **Player:** r <- 0 (as before any snapshot: F 1, O 0, epoch 0; nothing reads the tags) |
+| 0x15 | `judge b[, raw][, push]` | 1 | m <- Y - X; v <- verdict(m, bounds[b], invalid = FX \| FY \| OX \| OY \| (EX != EY)); update stats[b] if b < 4; push per mode (all / nonpass / none), header (+ m if raw), all or nothing; clear lost_since_verdict. **Player:** no effect (no verdict block, stats or VERDICT FIFO; VERDICT_OVF stays 0) |
 | 0x16 | `tmon t[, x16]` | 1 | TO <- NOW + t * (x16 ? 16 : 1) (timeout relative to now, e.g. after an input-paced wait) |
 | 0x17 | `cmp imm[, hi]` | 1 | C <- (SR[7:0] (or SR[15:8]) == imm) |
 | 0x18..0x1b | reserved | - | v1 bitstream unit (LFSR CRC/parity tapping SHO/SHI bits) |
@@ -321,6 +325,8 @@ The chip must run at the assembled clock (A9).
 
 ## 7. Images and loader
 
+Two engines since 17 Nov (§0b, diffs 17-20): engine 0 = the Referee, engine 1 = the Player.
+
 **Global config (8 words, CRC-16):**
 - magic `0x5246`;
 - format version | engine count;
@@ -331,10 +337,10 @@ The chip must run at the assembled clock (A9).
 It can be written only while **all** engines are halted.
 
 **Per-engine image (97 words, its own CRC-16):**
-- program (64 words);
-- bounds (16 × 2 words);
-- the **claimed-pin mask** (15 bits), computed by the assembler from the program's SET/SHO
-  operands.
+- Referee: program (64 words), bounds (16 × 2 words), the claimed-pin mask;
+- Player: program (96 words), the claimed-pin mask (no bounds; §0b, diff 19);
+- the **claimed-pin mask** (15 bits, word 96 in both), computed by the assembler from the
+  program's SET/SHO operands.
 
 It can be written only while **that** engine is halted.
 
@@ -360,14 +366,14 @@ SET/SHO to an unowned pin has no effect and sets PIN_FAULT (a second line of def
 | --- | --- | --- |
 | Identify | `49 00 00 00` | data 0x52 |
 | Write global word | `47 addr hi lo` | all engines halted |
-| Write engine word | `57 e:addr hi lo` | e in addr[7]; that engine halted |
-| Read word | `72 sel addr part` | global or engine e; high or low byte; while halted |
-| Expected CRC | `43 sel hi lo` | sel: global / engine e |
+| Write engine word | `57 e:addr hi lo` | e in addr[7]; addr 0..96; that engine halted |
+| Read word | `72 sel addr part` | sel 0 global (both halted; addr 0x80 + e = the global CRC engine e computed), 1 + e engine e (e halted; addr 0x80 = its computed CRC); high or low byte |
+| Expected CRC | `43 sel hi lo` | sel: 0 global (both halted) / 1 + e engine e (e halted) |
 | Run / halt | `52 e 01 00` / `52 e 00 00` | RUN is ACK'd only if the checks passed |
 | IN push / OUT pop | `50 e byte 00` / `70 e 00 00` | |
-| VERDICT drain | `44 e max 00` | reply: count, then 2 bytes per slot (up to 8) |
-| Stats latch / read / clear | `53 e slot 00` / `73 e idx 00` / `5A e slot 00` | latch is atomic per slot |
-| Lost counter | `4C e 00 00` | reply: LOST; `4C e 01 00` clears it (host only) |
+| VERDICT drain | `44 0 max 00` | Referee only; reply: count, then 2 bytes per slot (up to 8) |
+| Stats latch / read / clear | `53 0 slot 00` / `73 0 idx 00` / `5A 0 slot 00` | Referee only; latch is atomic per slot |
+| Lost counter | `4C 0 00 00` | Referee only; reply: LOST; `4C 0 01 00` clears it (host only) |
 | Baud | `42 div_hi div_lo 00` | applied after the reply; 60 / 30 / 20 = 1 / 2 / 3 Mbaud at 60 MHz |
 | Status | `51 e 00 00` | running, S, sticky bits, NI; read-and-clear of the sticky bits |
 
@@ -407,7 +413,7 @@ This removes the harness condition used by the merged cross-interval proof (A16)
 | Snapshot lemma at tick level: Y is the trigger edge and never ORD; X is never older than pin 0's last rise at or before the trigger (completeness); X without ORD *is* that rise (order); the cross verdict judged **through the snapshot** is sound, with the A16 harness condition removed | `formal/verdict_formal.sv` (+ `src/snapshot.v`) | `verdict.sby`: prove4, prove8, sharp4, sharp8 (unbounded), bmc4, cover4 |
 | Snapshot at cycle level, every input free: capture == edge_ts state as of the end of r + 1, visible from r + 3; ORD exactly on reports in r - 1..r + 1 except the trigger edge; constant while S; lost triggers | `src/snapshot.v` (`SNAPSHOT_PROPS`) | `engine.sby`: snap, snap_cover; snap_early (capture at r + 1) must FAIL |
 | Combinational theorem, engine parameters (M_W 16, FRAC_W 4, N_W 20, sharp) | `formal/verdict_comb.sv` | `verdict.sby`: comb, comb_cover; comb_onesided (rounded-down bound only) and comb_u1 must FAIL |
-| Engine properties 1-10 above, every input free, arbitrary image | `src/engine.v`, `src/engine_sys.v` (`FORMAL`) | `engine.sby`: prove (unbounded), cover; tie_timeout (timeout wins a tie) must FAIL |
+| Engine properties 1-10 above, every input free, arbitrary image; since 17 Nov for **both engines at once** (the Referee and the Player in one engine_sys), plus the Player's own (property 13: no referee hardware, WAITS only times out, TSGET writes 0; property 12: pc < 96) and the two-engine pad properties | `src/engine.v`, `src/engine_sys.v` (`FORMAL`) | `engine.sby`: prove (unbounded), cover; tie_timeout (timeout wins a tie) must FAIL |
 
 The cover and tie_timeout tasks start the engine in the post-RUN state (define
 `ENGINE_FORMAL_START_RUNNING`) so that they don't spend ~106 cycles in a RUN check with an
@@ -470,4 +476,4 @@ This holds for any K, because bounds are in 1/16 cycle and the lemma is in cycle
 | A15 | One LOOP counter, no nesting | firmware | Design limit for v0; the assembler reports nested-loop attempts |
 | A16 | The earlier edge of a judged pair is latched before the pair is judged | cross intervals | Was a **harness condition** in the merged verdict proof. Now **enforced** by the one-cycle snapshot delay, ambiguous order **flagged** (ORD), and **proved**: the cross verdict is judged through `src/snapshot.v` with no harness condition (`formal/verdict.sby`, snapshot lemma, §9) |
 | A18 | No parity or CRC in v0 (no ALU) | UART 8E1/8O1, CAN, USB, any CRC | **Design limit**: until the v1 bitstream unit (opcodes 0x18..0x1B reserved: LFSR CRC/parity on SHO/SHI bits, bit stuffing, NRZI), the host supplies the parity bit (e.g. as the 9th bit of a 16-bit IN pair) |
-| A17 | Two engines never drive one pin | outputs | **Enforced** by the image format (one owner per pin; claims ⊆ owned, checked at RUN) and at run time (PIN_FAULT) |
+| A17 | Two engines never drive one pin | outputs | **Enforced** by the image format (one owner per pin; claims ⊆ owned, checked at RUN) and at run time (PIN_FAULT); since 17 Nov with two real engines: formal (owned sets disjoint, a pin follows only its owner) and chip test `pin_ownership_two_engines` |

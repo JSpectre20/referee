@@ -30,7 +30,8 @@ import sys
 from pathlib import Path
 
 import cocotb
-from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, SimTimeoutError, Timer, with_timeout
+from cocotb.triggers import (ClockCycles, Edge, FallingEdge, First, ReadOnly, RisingEdge, SimTimeoutError, Timer,
+                             with_timeout)
 from cocotb.utils import get_sim_time
 from cocotbext.uart import UartSink, UartSource
 
@@ -326,7 +327,11 @@ async def rejects_bad_commands(dut):
     assert (await h.transact(bytes([0x7A, 1, 2, 3])))[:2] == (host.NAK, 0x7A), "unknown command"
     assert (await h.transact(host.pkt_write_engine(97, 0)))[0] == host.NAK, "engine address 97 is out of range"
     assert (await h.transact(host.pkt_write_global(8, 0)))[0] == host.NAK, "global address 8 is out of range"
-    assert (await h.transact(host.pkt_run(True, e=1)))[0] == host.NAK, "there is no engine 1"
+    assert (await h.transact(host.pkt_run(True, e=2)))[0] == host.NAK, "there is no engine 2"
+    assert (await h.transact(host.pkt_write_engine(97, 0, e=1)))[0] == host.NAK, "Player address 97 is out of range"
+    for p in (host.pkt_drain(8, e=1), host.pkt_stats_latch(0, e=1), host.pkt_stats_read(0, 0, e=1),
+              host.pkt_stats_clear(0, e=1), host.pkt_lost(e=1), host.pkt_read(3, 0, 0), host.pkt_crc(3, 0)):
+        assert (await h.transact(p))[0] == host.NAK, f"{p.hex()}: the Player has no verdicts / stats / LOST; no sel 3"
     assert (await h.transact(host.pkt_pop()))[0] == host.NAK, "OUT is empty"
     assert (await h.transact(host.pkt_baud(5)))[0] == host.NAK, "bit period below 6"
     assert await h.must(host.pkt_id()) == host.ID, "still works afterwards"
@@ -542,70 +547,70 @@ async def resync_after_partial_packet(dut):
 # -----------------------------------------------------------------------------
 
 
-async def push_in(h, byte):
-    """Push one byte into IN, waiting while it is full."""
+async def push_in(h, byte, e=0):
+    """Push one byte into engine e's IN, waiting while it is full."""
     for _ in range(200):
-        if (await h.transact(host.pkt_push(byte)))[0] == host.ACK:
+        if (await h.transact(host.pkt_push(byte, e)))[0] == host.ACK:
             return
         await Timer(5, unit="us")
     raise AssertionError("IN stayed full")
 
 
-async def pop_out(h, timeout_us=2000):
-    """Pop one byte from OUT, waiting until the firmware has pushed it."""
+async def pop_out(h, timeout_us=2000, e=0):
+    """Pop one byte from engine e's OUT, waiting until the firmware has pushed it."""
     t0 = get_sim_time("us")
     while get_sim_time("us") - t0 < timeout_us:
-        status, byte, _ = await h.transact(host.pkt_pop())
+        status, byte, _ = await h.transact(host.pkt_pop(e))
         if status == host.ACK:
             return byte
         await Timer(5, unit="us")
     raise AssertionError("no byte in OUT")
 
 
-async def serial_byte(h, byte, cmd=None):
+async def serial_byte(h, byte, cmd=None, e=0):
     """One byte through i2c_controller.s ('X') or an SPI controller: spread in, gather out."""
     if cmd is not None:
-        await push_in(h, cmd)
+        await push_in(h, cmd, e)
     for b in host.spread(byte):
-        await push_in(h, b)
-    return host.gather(await pop_out(h), await pop_out(h))
+        await push_in(h, b, e)
+    return host.gather(await pop_out(h, e=e), await pop_out(h, e=e))
 
 
-async def i2c_bit(h, cmd):
+async def i2c_bit(h, cmd, e=0):
     """'A' (SDA released, sampled) or 'K' (SDA low): one clock; returns the SDA sample."""
-    await push_in(h, cmd)
-    await pop_out(h)
-    return (await pop_out(h)) & 1
+    await push_in(h, cmd, e)
+    await pop_out(h, e=e)
+    return (await pop_out(h, e=e)) & 1
 
 
-async def i2c_write(h, addr, ptr, data):
+async def i2c_write(h, addr, ptr, data, e=0):
     """START, address + W, pointer, data, STOP; returns the target's ACK bits (0 = ACK)."""
     acks = []
-    await push_in(h, host.I2C_START)
+    await push_in(h, host.I2C_START, e)
     for b in [addr << 1, ptr] + list(data):
-        assert await serial_byte(h, b, host.I2C_XFER) == b, "SDA must read back what the controller sent"
-        acks.append(await i2c_bit(h, host.I2C_NACK))  # release SDA and sample: the target's ACK
+        assert await serial_byte(h, b, host.I2C_XFER, e) == b, "SDA must read back what the controller sent"
+        acks.append(await i2c_bit(h, host.I2C_NACK, e))  # release SDA and sample: the target's ACK
         if acks[-1]:
             break
-    await push_in(h, host.I2C_STOP)
+    await push_in(h, host.I2C_STOP, e)
     return acks
 
 
-async def i2c_read(h, addr, ptr, n):
+async def i2c_read(h, addr, ptr, n, e=0):
     """START, address + W, pointer, repeated START, address + R, n bytes (ACK all but the
     last, NACK the last), STOP."""
-    await push_in(h, host.I2C_START)
+    await push_in(h, host.I2C_START, e)
     for b in (addr << 1, ptr):
-        await serial_byte(h, b, host.I2C_XFER)
-        assert await i2c_bit(h, host.I2C_NACK) == 0, f"no ACK for {b:#04x}"
-    await push_in(h, host.I2C_START)
-    await serial_byte(h, addr << 1 | 1, host.I2C_XFER)
-    assert await i2c_bit(h, host.I2C_NACK) == 0, "no ACK for the read address"
+        await serial_byte(h, b, host.I2C_XFER, e)
+        assert await i2c_bit(h, host.I2C_NACK, e) == 0, f"no ACK for {b:#04x}"
+    await push_in(h, host.I2C_START, e)
+    await serial_byte(h, addr << 1 | 1, host.I2C_XFER, e)
+    assert await i2c_bit(h, host.I2C_NACK, e) == 0, "no ACK for the read address"
     got = []
     for k in range(n):
-        got.append(await serial_byte(h, 0xFF, host.I2C_XFER))  # SDA released: the target drives it
-        await i2c_bit(h, host.I2C_ACK if k < n - 1 else host.I2C_NACK)
-    await push_in(h, host.I2C_STOP)
+        got.append(await serial_byte(h, 0xFF, host.I2C_XFER, e))  # SDA released: the target drives it
+        await i2c_bit(h, host.I2C_ACK if k < n - 1 else host.I2C_NACK, e)
+    await push_in(h, host.I2C_STOP, e)
     return got
 
 
@@ -668,3 +673,221 @@ async def spi_controller_modes(dut):
         assert t.frames == frames, f"mode {mode}: target got {t.frames}, sent {frames}"
         assert not t.violations, f"mode {mode}: " + "; ".join(t.violations[:5])
         dut._log.info("spi mode %d: %d frames, %d bytes each way", mode, len(frames), sum(map(len, frames)))
+
+
+# -----------------------------------------------------------------------------
+# Two engines: the Referee (engine 0) and the Player (engine 1)
+# -----------------------------------------------------------------------------
+
+
+def assemble(src, e):
+    return host.assemble(src, engine=e)[0]
+
+
+async def run_engine(h, e):
+    status, _, _ = await h.transact(host.pkt_run(True, e))
+    return status == host.ACK
+
+
+async def engine_status(h, e):
+    return host.decode_status(await h.must(host.pkt_status(e=e)))
+
+
+@cocotb.test()
+async def pin_ownership_two_engines(dut):
+    """Two engines can never drive one pin (A17). The global config gives uio[0] to the
+    Referee and uio[1] to the Player, both push-pull. RUN(e) is refused while e's image
+    claims the other engine's pin, and the refused engine drives nothing. The global
+    config can't be written while either engine runs. With correct images both run, each
+    driving only its own pin; a Player image whose claimed-pin mask is forged (CRC made to
+    match) passes RUN but its SET to the Referee's pin has no effect and sets PIN_FAULT."""
+    h = await start(dut)
+    glob = host.refasm.global_image({0: (1, 1), 1: (2, 1)})
+    ref_ok = assemble("        set  0, 1\nloop:   jmp  loop\n", 0)
+    ply_ok = assemble("        set  1, 1\nloop:   jmp  loop\n", 1)
+    ply_bad = assemble("        set  0, 0\nloop:   jmp  loop\n", 1)  # claims the Referee's pin
+    ref_bad = assemble("        set  1, 0\nloop:   jmp  loop\n", 0)  # claims the Player's pin
+
+    for p in host.load_system_packets(glob, {0: ref_ok, 1: ply_bad}):
+        await h.must(p)
+    assert not await run_engine(h, 1), "the Player claims uio[0], which the Referee owns: RUN refused"
+    st = await engine_status(h, 1)
+    assert st["crc_fail"] and not st["running"], st
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_oe.value) == 0, "a refused RUN drives nothing"
+    assert await run_engine(h, 0)
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_oe.value) == 0x01 and int(dut.uio_out.value) & 1, "only the Referee's uio[0]"
+
+    # while the Referee runs: no global config write, no Referee image write; the
+    # Player (halted) can be reloaded on its own
+    assert (await h.transact(host.pkt_write_global(2, 0)))[0] == host.NAK, "config written while an engine runs"
+    assert (await h.transact(host.pkt_crc(0, 0)))[0] == host.NAK
+    assert (await h.transact(host.pkt_write_engine(0, 0, e=0)))[0] == host.NAK
+    for p in host.load_engine_packets(ply_ok, 1)[1:]:  # (skip the halt: the Player is halted)
+        await h.must(p)
+    assert await run_engine(h, 1), "the Player's own pin: accepted while the Referee keeps running"
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_oe.value) == 0x03 and int(dut.uio_out.value) & 3 == 3, "each engine drives its own pin"
+    assert (await engine_status(h, 0))["running"], "the Player's RUN left the Referee running"
+
+    # the Referee claims the Player's pin: refused, and a refused RUN changes no pin
+    for p in host.load_engine_packets(ref_bad, 0):
+        await h.must(p)
+    assert not await run_engine(h, 0), "the Referee claims uio[1], which the Player owns: RUN refused"
+    assert (await engine_status(h, 1))["running"]
+    assert int(dut.uio_oe.value) == 0x03 and int(dut.uio_out.value) & 3 == 3, "a halted engine keeps its level"
+
+    # second line of defence: a forged claimed-pin mask passes the check (claims nothing),
+    # but SET to an unowned pin does nothing at run time and sets PIN_FAULT
+    forged = list(ply_bad)
+    forged[96] = 0
+    for p in host.load_engine_packets(forged, 1):
+        await h.must(p)
+    assert await run_engine(h, 1), "a mask that claims nothing passes the check"
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uio_out.value) & 1 == 1, "the Player's SET 0, 0 must not move the Referee's uio[0]"
+    st = await engine_status(h, 1)
+    assert st["pin_fault"] and st["running"], st
+
+
+@cocotb.test()
+async def player_referee_instructions(dut):
+    """The Player has no referee hardware; its referee instructions do what
+    docs/isa-timing.md 0b diff 17 says: TRIG, REL and JUDGE do nothing, WAITS can only
+    time out (T = 1), S is never set. A JUDGE on the Player produces no verdict, stats
+    or VERDICT_OVF anywhere (not even in the Referee's FIFO), and the Player answers no
+    drain, stats or LOST command. The program also runs past word 63 by falling through
+    (words 64..95 exist only on the Player)."""
+    h = await start(dut)
+    src = """
+        ldsr 0x11
+        trig 1, rise         ; no trigger on the Player
+        rel
+        tsget X, 0, rise     ; X <- 0
+        judge 0, raw         ; nothing
+        tmon 10us
+        waits                ; S never comes: ends by the timeout
+        jnt  bad
+        js   bad
+        push                 ; 0x11: WAITS timed out, S = 0
+        jmp  far
+bad:    ldsr 0xEE
+        push
+        halt
+far:    nop
+""" + "        nop\n" * 47 + """        ldsr 0x22           ; word 63
+        push                 ; word 64: reached by falling through
+        judge 1
+        ldsr 0x33
+        push
+        halt
+"""
+    img = assemble(src, 1)
+    # the claimed-pin mask is empty; the Referee stays halted throughout
+    for p in host.load_packets(host.refasm.global_image(), img, e=1):
+        await h.must(p)
+    await ClockCycles(dut.clk, 5)
+    t_run = get_sim_time("ns")
+    assert await run_engine(h, 1)
+    first = await pop_out(h, e=1)
+    t_first = get_sim_time("ns")
+    assert first == 0x11, f"WAITS on the Player must time out with T = 1 and S = 0 (got {first:#04x})"
+    assert t_first - t_run >= 10_000, "the WAITS waited for its whole 10 us timeout"
+    assert await pop_out(h, e=1) == 0x22 and await pop_out(h, e=1) == 0x33, "words 63, 64.. ran in order"
+    await ClockCycles(dut.clk, 20)
+    st = await engine_status(h, 1)
+    assert not st["running"] and not st["S"] and not st["verdict_ovf"] and not st["pin_fault"], st
+    assert await h.drain() == [], "the Player's JUDGEs put nothing in the Referee's VERDICT FIFO"
+    stats = await h.stats(0)
+    assert stats == {"pass": 0, "viol": 0, "indet": 0, "min": 0, "max": 0}, stats
+    for p in (host.pkt_drain(8, e=1), host.pkt_stats_latch(0, e=1), host.pkt_lost(e=1)):
+        assert (await h.transact(p))[0] == host.NAK
+
+
+async def watch_i2c(dut, rises):
+    """Record, for every SCL rise on the bus wires, the time since SDA's latest edge (ns),
+    i.e. the true interval the Referee's tsget X, 0, last / tsget Y, 1, rise measures."""
+    scl, sda = int(dut.scl_bus.value), int(dut.sda_bus.value)
+    t_sda = None
+    while True:
+        await First(Edge(dut.scl_bus), Edge(dut.sda_bus))
+        await ReadOnly()
+        now = get_sim_time("ns")
+        nscl, nsda = int(dut.scl_bus.value), int(dut.sda_bus.value)
+        if nsda != sda:
+            t_sda = now
+        if nscl and not scl:
+            rises.append(None if t_sda is None else now - t_sda)
+        scl, sda = nscl, nsda
+
+
+@cocotb.test()
+async def referee_judges_player_i2c(dut):
+    """The Player speaks a bus and the Referee judges it, on one chip.
+
+    The Player (engine 1) runs firmware/engine/i2c_controller.s on uio[2] (SCL) and
+    uio[3] (SDA), open-drain, against the EEPROM model. The Referee (engine 0) watches
+    the same wires through the judge-channel mux (channel 0 = uio_in[3] = SDA, channel 1 =
+    uio_in[2] = SCL; not non-intrusive) and judges every SCL rise: the time since SDA's
+    latest edge against Fast-mode tSU;DAT (min 100 ns, slot 0) and against a 1.26 us
+    minimum (slot 1) that the bus meets on some rises and breaks on others. An
+    independent monitor in the test records the true interval of every SCL rise from the
+    bus wires; the Referee's stats must count exactly those rises, find no tSU;DAT
+    violation, and agree with the truth on slot 1 (sound counts, decisive outside u + 1
+    cycle of the bound, min / max m within u of the true extremes)."""
+    h = await start(dut)
+    referee = """
+.bound 0, min, 100ns         ; Fast-mode tSU;DAT
+.bound 1, min, 1260ns        ; a bound the bus meets on some rises and breaks on others
+        trig 1, rise         ; channel 1 = SCL
+loop:   tmon 1023, x16
+        waits
+        jt   loop
+        tsget X, 0, last     ; channel 0 = SDA: its latest edge before this SCL rise
+        tsget Y, 1, rise
+        judge 0, nonpass
+        judge 1, none
+        rel
+        jmp  loop
+"""
+    img0 = assemble(referee, 0)
+    img1 = assemble((FW / "i2c_controller.s").read_text(), 1)
+    glob = host.refasm.global_image({2: (2, 2), 3: (2, 2)}, host.mux_config("0:uio3,1:uio2"))
+    for p in host.load_system_packets(glob, {0: img0, 1: img1}):
+        await h.must(p)
+    t = I2CTarget(dut, addr=0x50)
+    assert await run_engine(h, 0), "the Referee claims no pin"
+    assert await run_engine(h, 1), "the Player claims uio[2], uio[3], which it owns"
+    rises = []
+    mon = cocotb.start_soon(watch_i2c(dut, rises))
+    data = [0xA5, 0x3C] if GL else [0xA5, 0x00, 0xFF, 0x3C]
+    assert await i2c_write(h, 0x50, 0x10, data, e=1) == [0] * (len(data) + 2), "every byte ACKed"
+    assert await i2c_read(h, 0x50, 0x10, len(data), e=1) == data, "read back through a repeated START"
+    await Timer(20, unit="us")
+    mon.cancel()
+    t.stop_model()
+    assert not t.violations, "I2C Fast-mode timing: " + "; ".join(t.violations[:5])
+    st = await engine_status(h, 0)
+    assert st["running"] and not st["ni"], st
+
+    # the truth, from the bus wires
+    true = [x for x in rises if x is not None]
+    assert len(true) == len(rises), "SDA moved (the first START) before the first SCL rise"
+    n = len(true)
+    s0, s1 = await h.stats(0), await h.stats(1)
+    dut._log.info("referee on the player's bus: %d SCL rises, true setup %.0f..%.0f ns; slot 0 %s; slot 1 %s",
+                  n, min(true), max(true), s0, s1)
+    assert s0["pass"] + s0["viol"] + s0["indet"] == n, "one judgment per SCL rise"
+    assert s1["pass"] + s1["viol"] + s1["indet"] == n
+    assert s0["viol"] == 0 and s0["indet"] == 0, "the Player's controller meets tSU;DAT on every rise"
+    assert await h.drain() == [], "judge 0, nonpass: no non-PASS verdict"
+    N = 1260.0  # between the ACK bits (setup ~1.20 us) and the controller's own (~1.32 us)
+    must_pass = sum(x >= N + (U + 1) * P_NS for x in true)
+    must_viol = sum(x <= N - (U + 1) * P_NS for x in true)
+    assert must_pass > 0 and must_viol > 0, f"the 1.26 us bound must split the rises: {sorted(true)}"
+    assert must_pass <= s1["pass"] <= sum(x >= N for x in true), (s1, must_pass)
+    assert must_viol <= s1["viol"] <= sum(x < N for x in true), (s1, must_viol)
+    to_s = lambda v: v - 0x10000 if v & 0x8000 else v  # noqa: E731
+    assert abs(to_s(s1["min"]) * P_NS - min(true)) < U * P_NS and abs(to_s(s1["max"]) * P_NS - max(true)) < U * P_NS, s1
+    assert await h.must(host.pkt_lost()) == 0, "no trigger lost at 400 kHz"

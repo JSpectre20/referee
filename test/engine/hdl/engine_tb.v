@@ -1,4 +1,4 @@
-// Lockstep wrapper for src/engine_sys.v: clock in Verilog, every port as a tb signal.
+// Lockstep wrapper for src/engine_sys.v (both engines): clock in Verilog, every port as a tb signal.
 `default_nettype none
 `timescale 1ns / 1ps
 
@@ -10,6 +10,7 @@ module engine_tb;
   reg [7:0] ui_in = 8'd0, uio_in = 8'd0;
   wire [7:0] uio_out, uio_oe, uo_eng;
   reg h_gwe = 0, h_gcrc_we = 0, h_we = 0, h_crc_we = 0, h_run = 0, h_halt = 0;
+  reg h_e = 0;  // the engine a host strobe goes to (0 Referee, 1 Player)
   reg [2:0] h_gaddr = 0;
   reg [15:0] h_gwdata = 0, h_gcrc = 0, h_wdata = 0, h_crc = 0;
   reg [6:0] h_addr = 0, h_raddr = 0;
@@ -23,13 +24,14 @@ module engine_tb;
   reg h_stats_latch = 0, h_stats_clear = 0, h_lost_clear = 0, h_status_clear = 0;
   reg [1:0] h_stats_slot = 0;
   reg [2:0] h_stats_idx = 0;
-  wire halted, running, checking, ni;
+  wire ni;
+  wire [1:0] halted, running, checking;
 
   engine_sys u_sys (
       .clk(clk), .rst_n(rst_n), .ui_in(ui_in), .uio_in(uio_in),
       .uio_out(uio_out), .uio_oe(uio_oe), .uo_eng(uo_eng),
       .h_gwe(h_gwe), .h_gaddr(h_gaddr), .h_gwdata(h_gwdata), .h_grdata(h_grdata),
-      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc),
+      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc), .h_e(h_e),
       .h_we(h_we), .h_addr(h_addr), .h_wdata(h_wdata), .h_raddr(h_raddr), .h_rdata(h_rdata),
       .h_crc_we(h_crc_we), .h_crc(h_crc), .h_run(h_run), .h_halt(h_halt),
       .h_in_push(h_in_push), .h_in_data(h_in_data), .in_full(in_full),

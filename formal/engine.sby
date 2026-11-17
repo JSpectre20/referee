@@ -2,14 +2,18 @@
 # RTL they talk about: src/engine.v and src/engine_sys.v (`ifdef FORMAL`),
 # src/snapshot.v (`ifdef SNAPSHOT_PROPS`).
 #
-#   prove        engine_sys, every input free, arbitrary program: 1-cycle issue,
+#   prove        engine_sys with BOTH engines (the Referee and the Player), every
+#                input free, arbitrary programs: 1-cycle issue,
 #                WAITD = max(t+1, DL), DL/TO writers, event wins a tie, pads only
 #                after SET/SHO to owned pins, image/config writes only while halted,
 #                no issue without a passed RUN check (and the registered RUN start
 #                equals the last-cycle check), JUDGE inputs and its cycle-2 effects
 #                (push / FIFO-full / VERDICT_OVF / stats / L clear, back to back),
-#                the four pc copies equal pc, LOST, HALT releases open-drain pins
-#                (k-induction, unbounded)
+#                the pc copies (one per 16-word bank) equal pc and pc < program size,
+#                LOST, HALT releases open-drain pins; two engines: one owner per pin,
+#                a pin follows only its owner, per-engine "ran", only the Referee's
+#                RUN clears edge_ts missed; the Player: no referee hardware, WAITS
+#                only times out, TSGET writes 0 (k-induction, unbounded)
 #   cover        the interesting cases of those are reachable. Starts in the
 #                post-RUN state (ENGINE_FORMAL_START_RUNNING) instead of a 106-cycle
 #                RUN check: claims constrained valid, and the first cycle must
