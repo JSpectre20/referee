@@ -184,14 +184,20 @@ module engine (
   assign checking = (st == ST_CHECK);
 
   // Image word for the RUN check and host readback (both only while not
-  // running: the host port NAKs a readback unless halted). Program words come
-  // through the fetch port below, which is shared: the 64:1 mux over 64 x 16
-  // flip-flops is the largest logic block in the engine, so it exists once.
+  // running: the host port NAKs a readback unless halted). Program words are
+  // read through their OWN 64:1 mux here, separate from the fetch port below.
+  // The two were one shared port until the first 8x4 hardening run (12 Nov
+  // 2026): sharing put a `running ? pc : img_addr` select in front of the
+  // fetch mux, and that select (the `running` flop fanned out through six
+  // buffers, about 4.5 ns at the slow corner) was the only path group that
+  // missed 60 MHz. At 33% of 8x4 the second mux (about 13,000 um2) is cheap.
+  // Nothing on this side is timing-critical: chk_idx and h_raddr are
+  // registers, and the result feeds the CRC register or the host reply.
   wire [6:0] img_addr = checking ? (chk_idx - 7'd8) : h_raddr;
-  wire [15:0] prog_word;  // the program read port (fetch while running, else img_addr)
+  wire [15:0] rb_word = prog[img_addr[5:0]];  // readback / RUN-check port
   reg  [15:0] img_word;
   always @(*) begin
-    if (img_addr < 7'd64) img_word = prog_word;
+    if (img_addr < 7'd64) img_word = rb_word;
     else if (img_addr < 7'd96) img_word = bnd[img_addr[4:0]];
     else img_word = claims;
   end
@@ -251,21 +257,17 @@ module engine (
   // ---------------------------------------------------------------------------
   // Program read port (fetch) and decode
   // ---------------------------------------------------------------------------
-  // While running it fetches prog[pc]; otherwise it reads prog[img_addr] for
-  // the RUN check and readback. Quarter k (words 16k..16k+15) is addressed by
-  // its own pc copy, then the quarter is chosen by pc[5:4] (or img_addr[5:4]).
-  wire [3:0] fa0 = running ? pc_q0[3:0] : img_addr[3:0];
-  wire [3:0] fa1 = running ? pc_q1[3:0] : img_addr[3:0];
-  wire [3:0] fa2 = running ? pc_q2[3:0] : img_addr[3:0];
-  wire [3:0] fa3 = running ? pc_q3[3:0] : img_addr[3:0];
-  wire [1:0] fquarter = running ? pc[5:4] : img_addr[5:4];
-  wire [15:0] pq0 = prog[{2'd0, fa0}];
-  wire [15:0] pq1 = prog[{2'd1, fa1}];
-  wire [15:0] pq2 = prog[{2'd2, fa2}];
-  wire [15:0] pq3 = prog[{2'd3, fa3}];
-  assign prog_word = (fquarter == 2'd0) ? pq0 : (fquarter == 2'd1) ? pq1 : (fquarter == 2'd2) ? pq2 : pq3;
-
-  wire [15:0] instr = prog_word;
+  // It always reads prog[pc]: nothing but the pc and its copies is in front
+  // of the mux (no `running`, no host address). Quarter k (words 16k..16k+15)
+  // is addressed by its own pc copy, then pc[5:4] picks the quarter. While
+  // the engine is not running the fetched word is ignored (every use below is
+  // gated by `issue`, which implies running), so it does not matter what the
+  // pc points at.
+  wire [15:0] pq0 = prog[{2'd0, pc_q0[3:0]}];
+  wire [15:0] pq1 = prog[{2'd1, pc_q1[3:0]}];
+  wire [15:0] pq2 = prog[{2'd2, pc_q2[3:0]}];
+  wire [15:0] pq3 = prog[{2'd3, pc_q3[3:0]}];
+  wire [15:0] instr = (pc[5:4] == 2'd0) ? pq0 : (pc[5:4] == 2'd1) ? pq1 : (pc[5:4] == 2'd2) ? pq2 : pq3;
   wire [ 4:0] op = instr[15:11];
   wire [ 3:0] f_p = instr[F_P_HI:F_P_LO];
   wire [ 3:0] f_q = instr[F_Q_HI:F_Q_LO];
