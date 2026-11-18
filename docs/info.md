@@ -6,7 +6,9 @@ This file is used to generate your project datasheet.
 
 Referee is a programmable protocol emulator and bus referee, built for the Jane Street
 protocol emulator ASIC competition. Protocols are programs, not fixed logic, and the chip
-can also *judge* timing on a bus it is not part of, with verdicts that are proved sound.
+can also *judge* timing on a bus it is not part of, with verdicts that are proved sound under
+stated assumptions (`docs/verdict.md`), for traffic within a bus envelope the user must assume
+(ISA v1 will declare it in `.bus`).
 
 This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
 
@@ -21,8 +23,11 @@ This build contains one **Referee engine** (ISA v0.3, `docs/isa-timing.md`):
   flagged (ORD).
 - **A three-valued verdict block**: `judge` compares a measured interval with a bound written
   in ns and answers PASS, VIOLATION or INDETERMINATE. The rule is proved sound by formal
-  proofs (`formal/verdict.sby`): a PASS means the true interval met the bound, and a
-  VIOLATION means it broke it. **Stats** count verdicts per bound, and a FIFO streams them
+  proofs (`formal/verdict.sby`): a PASS means the true interval between the pads' switching
+  moments met the bound, and a VIOLATION means it broke it. It is the specification's interval
+  only within the bus envelope (edges complete within the assumed rise / fall time, levels reach
+  VIL / VIH); see `docs/writeup.md` section 3.
+  **Stats** count verdicts per bound, and a FIFO streams them
   (all, or only the non-PASS ones) to the host.
 - **Pin ownership**: a global config gives each output pin an owner and a mode (push-pull or
   open-drain). Each image carries a CRC, and RUN refuses an image that fails its CRC or

@@ -59,9 +59,10 @@ the slow corner, 34.5% of the core; simulation only, no silicon or FPGA run yet)
 engine module, built twice: the **Referee** (the engine above, 64 words, all judging hardware) and
 a lean **Player** (96 words, no snapshot, verdict block, bounds or stats), so the chip can speak a
 protocol and judge a bus at once. Locally: 17 of 17 chip tests, 39 unit and lockstep tests and the
-formal tasks pass. Hardening is not yet green (section 12): the first run missed 60 MHz by 1.77 ns,
-the fix moved that to 0.19 ns on one endpoint, and a second fix (a registered readback address) is
-committed on the branch with its hardening run in progress. Standard-cell area in the hardened layout: 55.2% of the core.
+formal tasks pass. Hardening (section 12): the first run missed 60 MHz by 1.77 ns, the fix moved
+that to 0.19 ns on one endpoint, and the second fix (a registered readback address) meets 60 MHz
+with +1.80 ns at the slow corner, 54.5% of the core, in 1 h 44 min (run 44309280727). Its
+gate-level test failed, 12 of 17 (ledger rows 30 and 31); the fixes are in progress.
 
 **An FPGA build** (merged into `integration` on 17 November, `fpga/`): the current one-engine chip,
 unchanged, at 60 MHz in a Zynq-7020 (ZedBoard first, PYNQ-Z2 from the same script), judging a real
@@ -109,13 +110,21 @@ conversion rounds.
 **Proved (SymbiYosys, unbounded):** external edges are placed on a grid of 4 or 8 steps per clock
 cycle, and a sample taken next to an edge may resolve either way. Under that model, for a rising
 edge on one pin to a rising edge on another read through the snapshot, and for a high pulse on one
-pin, a PASS or VIOLATION is never wrong. With u = 1 instead of 2 the proof fails, and the
+pin, a PASS or VIOLATION is never wrong about the interval between the moments the pads switched.
+With u = 1 instead of 2 the proof fails, and the
 counterexample is kept in the repository (a true interval of 1.25 cycles measured as 0).
 
 **Assumed, and written down:** each level on a judged pin lasts at least 4 cycles; the judged pins
 have no skew between them; the chip runs at the clock the program was assembled for; a metastable
-sample settles within a cycle. **Not yet proved:** intervals involving a falling edge, "the latest
-edge, whichever way", or two edges of one pin, at sub-cycle resolution.
+sample settles within a cycle; and the **bus envelope**: the proof is about the interval between
+the moments the pads switched, which is the specification's interval only if every edge completes,
+monotonically, within the declared rise / fall time and every level reaches VIL / VIH. A runt that
+never reaches VIH, or a bounce, is outside the envelope and can be misjudged with no flag (ledger
+row 24); no digital pad can detect a level that stops at 60% of the supply. ISA v1 declares the
+edge times in `.bus`; the short-level flag's threshold is to be derived from them per channel, so
+that runts and bounces up to that length are flagged (in progress, row 24).
+**Not yet proved:** intervals involving a falling edge, "the latest edge, whichever way", or two
+edges of one pin, at sub-cycle resolution.
 
 **Slow edges and the pad threshold (ISA v1, in the model only).** A specification measures an
 interval between fixed levels of an edge (I2C: 30% and 70% of the supply); the chip's pad switches
@@ -202,22 +211,30 @@ ISA v1.0 tag on 21 November). **Everything in this section is in the model, not 
   how late an edge can arrive (the assembler computes it from the declaration), and the hardware
   marks W on a snapshot whose trigger has an edge of another channel within that window, before or
   after it. The program then loses track (poison) instead of misreading.
-- **The UM10204 receiver rule, as a definition (option A, owner, 18 November).** The I2C
-  specification requires every device to hold SDA internally for at least 300 ns "to bridge the
-  undefined region of the falling edge of SCL" (UM10204, the note to tHD;DAT in the bus-line
-  characteristics table). The referee classifies edges the same way: an SDA change that SCL's fall
-  follows within 300 ns is a data change with a negative hold time, never a START or STOP. This is
-  stated as a **definition, not an assumption**: it changes which rule gets the blame only for
-  traffic that already breaks the specification, and such a hold violation is reported as
-  "tHD;DAT (or tHD;STA if a START was intended)". The tHD;DAT verdict uses the guard band, so a truly
+- **The receiver rule, as our definition (option A, owner, 18 November), motivated by UM10204.**
+  UM10204 Rev. 6 (4 April 2014), Table 10, note [3]: "A device must internally provide a hold time
+  of at least 300 ns for the SDA signal (with respect to the VIH(min) of the SCL signal) to bridge
+  the undefined region of the falling edge of SCL." The current Rev. 7.0 (1 October 2021) replaces
+  that note with a transmitter-side rule (Table 11, note [2]): "Ensure SCL drops below 0.3VDD on
+  falling edge before SDA crosses into the indeterminate range of 0.3 VDD to 0.7 VDD." So the 300 ns
+  classification is the project's definition, motivated by the Rev. 6 note and by what receivers
+  implement, not a rule of the current specification. The referee classifies an SDA change that
+  SCL's fall follows within 300 ns as a possible data change with a negative hold time. As first
+  built it called every such change data; for an SDA **rise** that is wrong, because the rise may be
+  a STOP and UM10204 sets no minimum time from a STOP to the next SCL fall (ledger row 25). Being
+  changed to: an SDA **fall** in the window is a VIOLATION naming both rules (tHD;STA if a START,
+  tHD;DAT if data; both are broken); an SDA **rise** is CAN'T TELL. The tHD;DAT verdict uses the
+  guard band, so a truly
   negative hold that looks positive at the pads is CAN'T TELL, never PASS, and the assembler
   refuses a bus whose SDA windows reach 300 ns. Why: the alternative, poisoning on every such case,
   also poisoned legal traffic (with data holds of 0-33 ns, 51.6% of it went unjudged).
 - **The short-level taint.** A timestamp next to a level that, as sampled, lasted 5 cycles or less
   is flagged, so its verdict is CAN'T TELL. The proofs assume levels of at least 4 cycles; this
   puts a hardware flag on that assumption instead of trusting it.
-- **The Referee gets 96 words** (owner, 18 November), the same size as the Player: one I2C referee
-  already needed 62 of 64. In the model now; the RTL change needs another hardening run.
+- **The Referee gets 112 or 128 words** (owner, 18 November; first set at 96, but the stateless
+  I2C referee then used 96 of 96, leaving no room for a firmware fix after the freeze): 128 if a
+  local synthesis estimate of the full v1 projects a build under about 4 hours with at least +1 ns
+  of slack, otherwise 112. The Player stays at 96. The RTL change needs another hardening run.
 - **In progress: a stateless I2C referee.** The current I2C referee (82 words, model only) keeps
   one bit of protocol state. The next version is to read that from the snapshot with J too, so that
   an ambiguous event skips its own verdict instead of poisoning those after it. Not finished.
@@ -226,7 +243,8 @@ ISA v1.0 tag on 21 November). **Everything in this section is in the model, not 
 
 **What goes into the RTL first** (the owner's cut line, 18 November): must have = the soundness set
 (queue depth 2, poison / resync / desync, trigger mask + `trigq` + `tsts`, the signed guard band, J,
-the short-level taint) + 7-bit addresses + image format 4 + 96-word engines; should have = the
+the short-level taint, made programmable per channel, and candidate M, the stale-edge tag) + 7-bit
+addresses + image format 4 with 8-bit addressing + a 112- or 128-word Referee; should have = the
 separate shift registers and the CRC unit; cut first = count-only stats for all 16 bounds and the
 violation pulse pin.
 
@@ -291,7 +309,8 @@ second chance at a target.
 - Measurement 3 (first measurement): 5,050 poisoned JUDGEs on the fast bus, 7,974 on the slow bus,
   over all mixes.
 - Legal traffic: 0% unjudged on both buses, for every data hold tested from 0 ns (measured after
-  option A).
+  option A), on the dense test mixes. After more than 273 µs of idle bus, or of constant SDA, it is
+  not 0% (ledger row 26); sparse-traffic mixes are being added.
 
 ## 7. Generality
 
@@ -305,7 +324,7 @@ that possible is a small set of primitives, none of them specific to one protoco
 | trigger mask, level-qualified trigger | the events are the protocol's own (an SCL edge; SDA while SCL is high) |
 | `tsts` | which edge triggered, a line's level, and whether that answer is ambiguous |
 | J | "did this edge certainly come after that one", as a branch, from the snapshot alone |
-| the guarded verdict | three values, sound for the declared bus, with the guard derived by the assembler |
+| the guarded verdict | three values, sound within the declared bus envelope (section 3), with the guard derived by the assembler |
 | poison / resync | a program that keeps state cannot give a confident verdict from a stale state |
 | flag W | two edges close enough at the pads that their true order is unknown are never misread |
 
@@ -327,9 +346,10 @@ lines each took logged. That is the test of the thesis: rules written after the 
 
 ## 8. Bug ledger
 
-Every real bug found so far, how it was found, and what now stops it from coming back. Rows 15-23
-were found this week; the ISA v1 ones (17-23) are fixed in the model and their fixes are not yet
-committed.
+Every real bug found so far, how it was found, and what now stops it from coming back. Rows 15-32
+were found this week; the ISA v1 ones (17-29) are fixed or being fixed in the model and are not yet
+committed. Mistakes in our own claims and plans are listed too (rows 24, 29, 32): showing what was
+corrected, and how, is part of the method.
 
 | # | Bug | Found by | Consequence if shipped | Fix and regression |
 | --- | --- | --- | --- | --- |
@@ -356,6 +376,15 @@ committed.
 | 21 | H5: W counted only edges that were themselves trigger edges | the same review | close edges missed | W counts any edge of another channel; `test_flag_w_after_side_any_edge_of_another_channel`. Fixing H5 alone raised the old gate to 7.5% (443 of 5909), one reason for section 6 |
 | 22 | The guard band assumed the pad's threshold lies between 30% and 70% of the supply; false for JEDEC LVCMOS33 (24-61%). The reviewer's counterexample: a legal tSU;DAT of 100 ns with SCL rising in 186 ns and a 24% threshold reads 4.95 cycles at the pads and could be judged VIOLATION | the independent guard-band review (3,729 wrong in 100,000 trials) | a false VIOLATION on a legal bus | the threshold range is declared in `.bus` (required) and the edge offsets are computed for it, linear or RC; `test_reviewer_counterexample_slow_scl_rise_low_threshold`; the waveform brute force keeps the old assumption as a negative control |
 | 23 | With a declared threshold range strictly inside 30-70%, the computed pad offset range excluded zero; but a real edge may be faster than declared, and then its pad crossing comes as close to the specification crossing as you like | the independent-waveform brute force (section 4) | a guard too narrow: a possible false PASS or VIOLATION | the offset range always includes zero; the brute force (with thresholds of 45-55% among its cases) is the regression |
+| 24 | An overclaim: the ISA v1 draft said the referee is sound "on any traffic". An interrupted or non-monotonic edge breaks that: an SCL runt that peaks at 60% of the supply (the pads see a high level of more than 5 cycles, the specification sees no edge), or a 27 ns bounce on a slow SDA fall, gives a PASS or VIOLATION about the wrong interval with no flag | the independent review of the stateless referee (review 5), with directed waveforms; its strict fuzz found nothing else in 4,200 waveforms | wrong verdicts on a ringing bus, and a false claim in the docs | the claim narrowed in the README, the datasheet, `docs/verdict.md` and this write-up to "within the declared bus envelope" (edges complete within the declared rise / fall time, levels reach VIL / VIH), section 3 (the ISA v1 spec draft and tables still to change); the short-level flag's threshold becomes programmable per channel, derived from the declared edge time (ISA v1 must-have, in progress) |
+| 25 | A false VIOLATION on legal traffic: option A (row 20) also classified an SDA **rise** up to 300 ns before SCL's fall as data, so a STOP followed 200-250 ns later by an SCL fall was reported as a tHD;DAT VIOLATION. UM10204 sets no minimum time from a STOP to the next SCL fall | review 5 (`stopfall.py`) | a VIOLATION on legal traffic, against the first principle | an SDA **fall** in the window is a VIOLATION naming both rules (tHD;STA if a START, tHD;DAT if data: both are broken); an SDA **rise** is CAN'T TELL; option A is stated as the project's definition, motivated by the UM10204 note, not as the specification's own rule (in progress) |
+| 26 | Blind after idle: the first START after RUN or after about 273 µs of idle bus, and tHIGH / tSU;DAT after SDA has been constant that long, were never judged (the reference edge is stale). Dense test traffic hid it; real buses are idle for milliseconds between transactions | the referee agent's own report, then review 5 (a legal 60-byte read of 0x00: 412 of 550 tSU;DAT unanswered) | the first START of almost every real transaction unjudged: exactly the bit-banged-driver bug the demo is about | candidate M: a tag bit per timestamp, "seen since RUN" or not; a seen but stale edge is certainly earlier than any fresh one, and its interval is at least about 273 µs minus u; sparse traffic (transactions 1-10 ms apart) in every referee test (ISA v1 must-have, in progress) |
+| 27 | The SDA event's early release relied on two one-cycle relations no spec text stated (`waitp` sees an edge in the cycle the timestamp unit reports it; an edge reported in cycle k sets W before a branch in cycle k + 1) | review 5 (shifting either by one cycle gives 16-20 wrong-pair PASS verdicts) | an RTL faithful to the written spec could be unsound | both relations written into the spec and the ISA tables; a lockstep / formal property in RTL v1 (in progress) |
+| 28 | Stale spec text that the RTL would be written from: the branch-on-W definition, the trigger text from v0.3, "W is final after BUS_W cycles" (false when the receiver window is longer), two different flop counts for W | review 5 | RTL built from an old definition | corrected before the v1.0 tag (in progress) |
+| 29 | Measurement 2's headline (96.3%, target 95%) combined two widened definitions: a band extension (a START / STOP whose own SCL fall is in the 300 ns band) and a new "u" category (gross violations within the verdict rule's own uncertainty); with the strict 300 ns band alone it is 89.8%. The slow bus's misses were wrongly explained by edge spacing; most sit inside bound 12's own guard band | review 5's recomputation | a target met by redefining the measurement | all three numbers reported with their definitions: 89.8% (strict band), 94.4% (with the band extension), 96.3% (also excluding "u"); "u" kept only if it is exactly the edges within the proved ordering window, to be confirmed by measurement; the slow-bus cause corrected in section 6 with the next model commit (in progress) |
+| 30 | A NAKed host command still returned a data byte read from image memory; a test passed only because earlier tests had written that memory | the first two-engine gate-level run (12 of 17 tests failed), then running each test alone | stale memory in host replies; a test suite that depended on its order | every NAK carries a defined data byte (spec diff 23); every chip test passes on its own (in progress) |
+| 31 | Gate-level X pessimism: one bit of the Referee's CRC register stayed X through reset (the synthesized reset path computes NOT(q AND NOT q): 1 in silicon, X in simulation), so the RUN check could not be shown at gate level | the same gate-level run, diagnosed in a local gate-level simulation (the first failing test, `no_pin_driven_before_first_run`, passes with flip-flops powering up 0 and with 1) | none in silicon, but a gate that could not show the RUN check | the register rewritten so its reset does not depend on its own output; the X-start gate-level run stays required, plus runs starting at 0, at 1 and at random values; any future case is an explicit reviewed per-flop waiver, never a relaxed gate (in progress) |
+| 32 | Planning mistakes in our own plan, caught by checking it against the code: the cost of a 128-word Referee was estimated at +25k µm² from 96 words (the RTL Referee has 64, so about +50k), and the rule-table front end was scheduled before RTL v1 | Claude's check of the plan | an area overrun; hardware work squeezed against the 7 December freeze | a local synthesis estimate of the full v1 decides 112 or 128 words; RTL v1 before the front end (software keeps improving after the freeze) |
 
 ## 9. Independent review
 
@@ -415,10 +444,18 @@ is where the AI's part is stated.
 
 - No silicon and, so far, no FPGA or real-bus run. The FPGA build exists but has not been through
   Vivado or onto a board.
-- The two-engine chip does not yet meet 60 MHz at the slow corner (0.19 ns short in the last run; the
-  fix is committed and its hardening run is in progress).
+- The two-engine chip meets 60 MHz (+1.80 ns at the slow corner, 54.5% of the area, run
+  44309280727), but its gate-level test failed (12 of 17): one real bug (ledger row 30) and one
+  gate-level X-pessimism case (row 31). Both fixes are in progress; PR #15 is not merged.
+- **Soundness holds within the declared bus envelope only**: every edge completes, monotonically,
+  within the declared rise / fall time, and every level reaches VIL / VIH. A runt or a bounce outside
+  it can be misjudged with no flag (row 24); no digital pad can see a level stopping at 60% of the
+  supply.
+- In the current referee model, the first START after RUN or after about 273 µs of idle bus is not
+  judged, nor tHIGH / tSU;DAT after SDA has been constant that long (row 26): candidate M fixes it
+  and is an ISA v1 must-have.
 - **ISA v1 exists in the model only, not in the RTL**: queue depth 2, poison, J, W, the guard band,
-  the taint, the 96-word Referee. The RTL work starts after ISA v1.0 is tagged (21 November).
+  the taint, the larger Referee memory. The RTL work starts after ISA v1.0 is tagged (21 November).
 - The proofs cover two kinds of interval at sub-cycle resolution; the rest rests on cycle-level
   proofs, simulation and fuzzing (section 3). The guard-band formulas are argued and brute-forced,
   not proved.
@@ -431,8 +468,11 @@ is where the AI's part is stated.
   of violating tLOW and 23.3% of tHD;STA intervals went unjudged (first measurement). A future
   version of the assembler is to list such rules at the top of its report.
 - The first gross START / STOP violation per transfer is reported 91.3% of the time on the fast bus
-  and 43.6% on the slow bus: below the 95% target (section 6). tHD;STA misses the per-rule target on
-  the fast bus (11.6%, all in the 300 ns band).
+  and 43.6% on the slow bus: below the 95% target (section 6). With the stateless referee (not yet
+  committed) the fast bus is at 89.8% with the strict 300 ns band, 94.4% with the band extension and
+  96.3% with the "u" category (each defined in row 29); all three will be reported. tHD;STA misses
+  the per-rule target on the fast bus (14.0% with the stateless referee, 11.6% before it; all in the
+  300 ns band or the first START after RUN).
 - Intervals longer than 273 microseconds are flagged and answered CAN'T TELL.
 - A firmware referee follows SPI only up to about 2.1 MHz SCK.
 - tVD;DAT (I2C data valid time) is not judged: at the SDA edge the program cannot know whether a
@@ -446,11 +486,12 @@ is where the AI's part is stated.
 | --- | --- |
 | 13 November | one engine hardened green at 8x4 and 60 MHz (+2.7 ns), with precheck and gate-level tests |
 | 17 November | FPGA build for ZedBoard / PYNQ-Z2 merged (not yet run on a board); two engines in RTL (pull request open); ISA v1 spec closure in the model |
-| 18 November | two-engine hardening: -1.77 ns, fixed to -0.19 ns (build 1 h 54 min, 55.2% of the core), second fix committed and rerunning; the two reviews' holes fixed in the model; option A; queue depth 2; three measurements (not yet committed) |
+| 18 November | two-engine hardening: -1.77 ns, fixed to -0.19 ns (build 1 h 54 min, 55.2% of the core), then +1.80 ns (1 h 44 min, 54.5%) with the gate-level test red (rows 30, 31); the two reviews' holes fixed in the model; option A; queue depth 2; three measurements; the stateless I2C referee and its review (not yet committed); soundness claims narrowed to the declared bus envelope |
 
-Planned, in order: the readback fix's hardening result; the stateless I2C referee and the commit
-of the ISA v1 model work; this write-up committed; the rule-table front end; the RTL for ISA v1,
-soundness items first, in lockstep with the v1 model; the time-boxed firmware proof. Also planned:
+Planned, in order: the gate-level fixes and a hardening rerun; the review fixes, candidate M and the
+per-channel short-level threshold in the model, then the commit of the ISA v1 model work; the RTL for
+ISA v1, soundness items first, in lockstep with the v1 model; the rule-table front end (software,
+after the hardware freeze if need be); the time-boxed firmware proof. Also planned:
 one command that reproduces every claim in the README and this write-up and ends PASSED or FAILED,
 and a mutation campaign on the verdict, snapshot, timestamp and poison logic.
 
