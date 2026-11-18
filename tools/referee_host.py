@@ -3,6 +3,7 @@
 """Host side of Referee's UART command port v2 (src/host_port.v, docs/isa-timing.md section 7).
 
 Packets are 4 bytes, CMD A B C; every reply starts STATUS DATA (ACK 0x06 / NAK 0x15).
+A NAK's DATA is always the command byte (docs/isa-timing.md 0b, diff 23).
 The packet builders here are shared by the cocotb chip tests (test/test.py) and
 the command-line tool, so the two can't drift apart.
 
@@ -293,7 +294,8 @@ class Referee:
     def transact(self, pkt, extra=0):
         self.ser.write(pkt)
         reply = self.ser.read(2)
-        if len(reply) != 2 or reply[0] not in (ACK, NAK):
+        if len(reply) != 2 or reply[0] not in (ACK, NAK) or (reply[0] == NAK and reply[1] != pkt[0]):
+            # (a NAK echoes the command byte: anything else is a reply to another packet)
             raise HostError(f"bad reply {reply.hex() or 'nothing'} to {pkt.hex()}")
         rest = b""
         if reply[0] == ACK and pkt[0] == 0x44:

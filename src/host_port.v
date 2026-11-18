@@ -50,6 +50,13 @@
  *                                          read-and-clear
  *   other                                NAK                                    CMD
  *
+ * The DATA column is the data byte of an ACK. A NAK's data byte is ALWAYS the
+ * command byte CMD, for every command (docs/isa-timing.md 0b, diff 23): never
+ * a word from an image, a FIFO, the stats or anything else the host was just
+ * refused. (Before 18 Nov a NAK'd 'r' still returned the addressed word: for
+ * an unwritten image word that is stale flip-flop contents in silicon and X in
+ * simulation; found by the first two-engine gate-level run.)
+ *
  * Rules
  *   - Wait for the whole reply before sending the next packet. A packet that
  *     completes while a reply is still going out is dropped and sets
@@ -240,7 +247,7 @@ module host_port #(
         if (!e_ok || in_full) st = NAK;
       end
       C_POP: begin
-        dt = out_empty ? 8'h00 : out_data;  // never the stale storage of an empty FIFO
+        dt = out_data;  // (an empty FIFO is NAK'd: then dt = cmd below, never its stale storage)
         if (!e_ok || out_empty) st = NAK;
       end
       C_DRAIN: begin
@@ -267,11 +274,13 @@ module host_port #(
         dt = bb[0] ? {overrun, 7'd0} : {status[6:0], ni};
         if (!e_ok || bb > 8'd1) st = NAK;
       end
-      default: begin
-        st = NAK;
-        dt = cmd;
-      end
+      default: st = NAK;
     endcase
+    // Every NAK carries the command byte as its data (0b, diff 23), so a
+    // refused command never returns what it was refused: e.g. a NAK'd 'r'
+    // must not return the addressed word (an unwritten image word is stale
+    // flip-flop contents), a NAK'd 'p' not the empty FIFO's storage.
+    if (st == NAK) dt = cmd;
   end
 
   wire exec = packet && !replying;  // a packet we will act on
@@ -407,6 +416,7 @@ module host_port #(
         rw_skip <= 1'b0;
       end else if (rstate == R_RUNWAIT && !checking[r_e]) begin
         r_status <= running[r_e] ? ACK : NAK;
+        if (!running[r_e]) r_data <= C_RUN;  // a refused RUN: NAK, 'R' (diff 23)
         rstate   <= R_SEND;
       end
 

@@ -10,6 +10,7 @@
 #                equals the last-cycle check), JUDGE inputs and its cycle-2 effects
 #                (push / FIFO-full / VERDICT_OVF / stats / L clear, back to back),
 #                the pc copies (one per 16-word bank) equal pc and pc < program size,
+#                the computed-CRC registers equal their pre-18-Nov form (14),
 #                LOST, HALT releases open-drain pins; two engines: one owner per pin,
 #                a pin follows only its owner, per-engine "ran", only the Referee's
 #                RUN clears edge_ts missed; the Player: no referee hardware, WAITS

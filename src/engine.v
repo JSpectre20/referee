@@ -547,6 +547,44 @@ module engine #(
   // the bad timestamp could be a false PASS (0b, diff 20).
   assign et_clear_missed = (REFEREE != 0) && start;
 
+  // The two computed CRCs, crc_got_g (global image) and crc_got_e (this
+  // engine's image). They start from the CRC seed 0xFFFF at reset and when a
+  // RUN is accepted, then take one word per check cycle (global words in
+  // chk_idx 0..7, engine words in 8..104), and otherwise hold (the host reads
+  // them back at 'r' addr 0x80).
+  //
+  // Written as ONE next-state expression per register: the update term
+  // (crc_*_upd: the next CRC or the held value) is computed separately, and
+  // reset and a RUN accepted force the seed through their own term, an OR of
+  // crc_init into every bit (the seed is all ones). Why: in the first
+  // two-engine gate-level run (hardening run 44309280727, 18 Nov 2026) the flop
+  // u_sys.crc_got_e0[14] stayed X through reset. Synthesis had folded the
+  // reset into the hold path as D = o21ai(q, n1, o21ai(n2, n3, q)); during
+  // reset n1 = 0 and n2 = 1, so D = NOT(q AND NOT q): 1 in silicon, but X in an
+  // X-propagating simulation that starts with q = X (gate-level X pessimism;
+  // the chip would have worked). The written form keeps the reset term apart
+  // from the term that reads the register, so the natural mapping is an OR /
+  // NOR with crc_init as one input, which is 1 whatever q is. RTL cannot
+  // dictate the gate structure, though: the hardening run's gate-level test
+  // decides, and a flop that still stays X there gets an explicit, reviewed
+  // waiver (test/README.md), never a relaxed test. The behaviour is cycle for
+  // cycle the old one (formal property 14 proves it against shadow copies
+  // written as the old code; the old `start` assignment of crc_e_next is
+  // covered by crc_e_step, since start is the last check cycle: 7b).
+  wire crc_init = !rst_n || (h_run && halted);  // reset, or a RUN accepted: seed
+  wire crc_g_step = checking && (chk_idx < 7'd8);  // a global word this cycle
+  wire crc_e_step = checking && (chk_idx >= 7'd8);  // an engine word this cycle
+  // (* keep *): synthesis (abc) treats a kept net as a cut point, so each
+  // flop's D is a function of crc_*_upd and crc_init only: upd appears once in
+  // D's cone, and an X-propagating simulation then gives D = 1 during reset
+  // even while upd is X (review 6, 18 Nov; about 32 nets of lost optimisation).
+  (* keep *) wire [15:0] crc_g_upd = crc_g_step ? crc_g_next : crc_got_g;
+  (* keep *) wire [15:0] crc_e_upd = crc_e_step ? crc_e_next : crc_got_e;
+  always @(posedge clk) begin
+    crc_got_g <= crc_g_upd | {16{crc_init}};
+    crc_got_e <= crc_e_upd | {16{crc_init}};
+  end
+
   // next pc, loaded by pc and every copy (pc_d is declared with the fetch port)
   always @(*) begin
     pc_d = pc;
@@ -627,8 +665,7 @@ module engine #(
 `ifndef ENGINE_FORMAL_START_RUNNING
       crc_exp_e <= 16'd0;
 `endif
-      crc_got_g <= 16'hFFFF;
-      crc_got_e <= 16'hFFFF;
+      // (crc_got_g / crc_got_e: their own block below)
       crc_fail <= 1'b0;
       start_r <= 1'b0;
       {X, Y, SR, DL, TO} <= 80'd0;
@@ -669,16 +706,12 @@ module engine #(
       // the expected CRC is part of what the RUN check verifies: written only
       // while halted, so it can't change between RUN and the check's verdict
       if (h_crc_we && halted) crc_exp_e <= h_crc;
-      if (h_run && halted) begin
+      if (h_run && halted) begin  // (the CRCs restart from 0xFFFF: crc_init below)
         st <= ST_CHECK;
         chk_idx <= 7'd0;
-        crc_got_g <= 16'hFFFF;
-        crc_got_e <= 16'hFFFF;
       end
       start_r <= check_ok_ahead;
-      if (checking) begin
-        if (chk_idx < 7'd8) crc_got_g <= crc_g_next;
-        else crc_got_e <= crc_e_next;
+      if (checking) begin  // (the CRC updates: crc_g_step / crc_e_step below)
         chk_idx <= chk_idx + 7'd1;
         if (check_last && !start_r) begin
           st <= ST_HALTED;
@@ -842,7 +875,7 @@ module engine #(
       // ---- RUN starts (highest priority) ----------------------------------------
       if (start) begin
         st <= ST_RUN;
-        crc_got_e <= crc_e_next;
+        // (crc_got_e takes crc_e_next in this cycle too: start is the last check cycle)
         {X, Y, SR} <= 48'd0;  // (pc: pc_d = 0)
         RC <= 8'd0;
         DL <= now + 16'd1;
@@ -917,6 +950,27 @@ module engine #(
     {f_push_2, f_raw_2} <= {f_push_1, f_raw_1};
     f_pass_1 <= v_pass;
   end
+  // property 14: the CRC registers in their form before 18 Nov (nested ifs in
+  // the main register block: reset, RUN accepted, one word per check cycle,
+  // and the RUN start's own update of crc_got_e)
+  reg [15:0] f_crc_g, f_crc_e;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      f_crc_g <= 16'hFFFF;
+      f_crc_e <= 16'hFFFF;
+    end else begin
+      if (h_run && halted) begin
+        f_crc_g <= 16'hFFFF;
+        f_crc_e <= 16'hFFFF;
+      end
+      if (checking) begin
+        if (chk_idx < 7'd8) f_crc_g <= crc16_word(f_crc_g, gw_data);
+        else f_crc_e <= crc16_word(f_crc_e, img_word);
+      end
+      if (start) f_crc_e <= crc16_word(f_crc_e, img_word);
+    end
+  end
+
   wire       f_want = (f_push_2 == PUSH_ALL) || ((f_push_2 == PUSH_NONPASS) && !f_pass_1);
   wire [3:0] f_need = 4'd1 + {3'd0, f_raw_2};
 
@@ -1004,6 +1058,11 @@ module engine #(
       //         check ra is exactly the word the check means to read
       assert (ra_copies == {NBANK{ra[3:0]}});
       if (checking) assert (ra == chk_idx - 7'd8);
+      // -- 14. the CRC registers, written since 18 Nov as one next-state
+      //        expression each (the gate-level X-pessimism fix above), are cycle
+      //        for cycle the registers as they were written before: f_crc_g /
+      //        f_crc_e below are exactly the old code
+      assert (crc_got_g == f_crc_g && crc_got_e == f_crc_e);
 
       // -- 8. JUDGE feeds the verdict block, in its cycle 2, exactly Y - X,
       //       invalid = FX | FY | OX | OY | (EX != EY) and bound b as of its

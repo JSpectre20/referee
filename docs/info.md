@@ -36,7 +36,7 @@ bus the Player drives.
   claims a pin it doesn't own.
 - **A UART host port** on the standard Tiny Tapeout UART pins: 115200 8N1 at power-up, and up
   to clock / 20 on command (3 Mbaud at 60 MHz). Commands are 4 bytes. Each reply is ACK (0x06) or NAK (0x15), then a
-  data byte; the verdict drain sends more.
+  data byte (for a NAK always the command byte); the verdict drain sends more.
 
 `e` is the engine: 0 = Referee, 1 = Player.
 

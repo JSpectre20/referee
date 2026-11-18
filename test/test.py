@@ -85,10 +85,17 @@ class Host:
         return out
 
     async def transact(self, pkt):
-        """Send one packet; return (status, data, extra bytes of a drain reply)."""
+        """Send one packet; return (status, data, extra bytes of a drain reply).
+
+        Every NAK is checked here, in every test: its data byte must be the command
+        byte (docs/isa-timing.md 0b, diff 23), never what the command was refused,
+        e.g. the word a refused 'r' addressed (stale image flip-flops in silicon, X in
+        a fresh simulation) or an empty FIFO's storage."""
         await self.src.write(pkt)
         await self.src.wait()
         status, data = await self._read(2)
+        assert status in (host.ACK, host.NAK), f"{pkt.hex()}: status {status:#04x}"
+        assert status == host.ACK or data == pkt[0], f"{pkt.hex()}: NAK with data {data:#04x}, not the command byte"
         extra = b""
         if pkt[0] == 0x44 and status == host.ACK:
             extra = bytes(await self._read(2 * data))
@@ -312,6 +319,7 @@ async def no_image_writes_around_run(dut):
     assert replies[:2] == bytes([host.ACK, 1]), f"RUN must pass on the original image: {replies.hex()}"
     for i in range(2, len(replies), 2):
         assert replies[i] == host.NAK, f"a write while not halted was accepted: {replies.hex()}"
+        assert replies[i + 1] in {w[0] for w in writes}, f"a NAK's data must be its command byte (diff 23): {replies.hex()}"
     await h.must(host.pkt_run(False))
     for sel, addr, word in [(1, 0, img[0]), (0, 2, glob[2])]:
         assert await h.word16(host.pkt_read(sel, addr, 0), host.pkt_read(sel, addr, 1)) == word
@@ -323,6 +331,12 @@ async def no_image_writes_around_run(dut):
 
 @cocotb.test()
 async def rejects_bad_commands(dut):
+    """Every malformed or impossible command is NAK'd, and every NAK's data byte is the
+    command byte (docs/isa-timing.md 0b, diff 23; checked in Host.transact). Must pass
+    on its own, from a fresh reset: until 18 Nov the 'r' with sel 3 below returned the
+    Referee's word 0, which nothing had written in a fresh simulation (an X byte on the
+    host TX; stale flip-flop contents in silicon). The full suite hid it, because earlier
+    tests had loaded word 0."""
     h = await start(dut)
     assert (await h.transact(bytes([0x7A, 1, 2, 3])))[:2] == (host.NAK, 0x7A), "unknown command"
     assert (await h.transact(host.pkt_write_engine(97, 0)))[0] == host.NAK, "engine address 97 is out of range"
@@ -332,6 +346,11 @@ async def rejects_bad_commands(dut):
     for p in (host.pkt_drain(8, e=1), host.pkt_stats_latch(0, e=1), host.pkt_stats_read(0, 0, e=1),
               host.pkt_stats_clear(0, e=1), host.pkt_lost(e=1), host.pkt_read(3, 0, 0), host.pkt_crc(3, 0)):
         assert (await h.transact(p))[0] == host.NAK, f"{p.hex()}: the Player has no verdicts / stats / LOST; no sel 3"
+    # reads refused for their address, in a fresh image (nothing written): the NAK must
+    # not carry the addressed (unwritten) word: Referee word 97, the Player's 97, global 8,
+    # an engine CRC address other than 0x80
+    for p in (host.pkt_read(1, 97, 0), host.pkt_read(2, 97, 1), host.pkt_read(0, 8, 0), host.pkt_read(1, 0x81, 0)):
+        assert (await h.transact(p))[0] == host.NAK, f"{p.hex()}: address out of range"
     assert (await h.transact(host.pkt_pop()))[0] == host.NAK, "OUT is empty"
     assert (await h.transact(host.pkt_baud(5)))[0] == host.NAK, "bit period below 6"
     assert await h.must(host.pkt_id()) == host.ID, "still works afterwards"
