@@ -34,8 +34,9 @@ digital pins.
   explains the rule and its proof. The proof (SymbiYosys) puts the external edges on a grid
   of 4 and of 8 steps per clock cycle, lets a sample taken next to an edge resolve either
   way, and shows that for the interval kinds listed below, under the assumptions listed
-  below, a PASS or a VIOLATION is never wrong. With an uncertainty of one cycle instead of
-  two, the proof fails, and the counterexample is kept in [`docs/results/`](docs/results/).
+  below, a PASS or a VIOLATION is never wrong about the interval between the moments the pads
+  switched. With an uncertainty of one cycle instead of two, the proof fails, and the
+  counterexample is kept in [`docs/results/`](docs/results/).
 
 Timing rules are firmware too: a new rule is a few lines
 ([`firmware/engine/i2c_setup_referee.s`](firmware/engine/i2c_setup_referee.s) is 10 instructions).
@@ -47,6 +48,7 @@ Timing rules are firmware too: a new rule is a few lines
 | Measurement uncertainty | 2 clock cycles (33 ns at 60 MHz); fixed in hardware |
 | Longest interval that can be judged | 273 µs (16-bit timestamps); longer ones are flagged and answered CAN'T TELL |
 | Assumed, not checked by the chip | each level on a judged pin lasts at least 4 clock cycles; the judged pins have no skew or pad-delay difference between them; the chip runs at the clock the firmware was assembled for; a sample that goes metastable settles within one cycle |
+| The bus envelope (what "the true interval" means) | the proof is about the interval between the moments the chip's pads switched. Relating that to a specification's levels (I2C: 30% and 70% of the supply) holds only **within a declared bus envelope**: every edge completes, monotonically, within the declared rise / fall time, and every level reaches the specification's VIL / VIH. A runt that never reaches VIH, or a bounce, is outside the envelope and can be misjudged; no digital pad can see a level that sits at 60% of the supply. ISA v1 declares the edge times in `.bus` and derives the guard band from them; deriving the short-level flag's threshold from them per channel is in progress ([write-up, section 3](docs/writeup.md#3-what-a-verdict-means-and-what-is-proved)) |
 | Proved at sub-cycle resolution | (1) a rising edge on one pin to a rising edge on another, read through the snapshot the way firmware reads it; (2) a high pulse (rise to fall) on one pin, measured straight from the timestamp unit, which firmware cannot do today |
 | Not yet proved at sub-cycle resolution | every other interval firmware can judge: any interval with a falling edge, "the latest edge, whichever way", or two edges of one pin. The I2C setup-time referee in this repo uses "the latest edge", so its verdicts are not yet covered by the proof |
 | Evidence for the unproved cases | falling-edge timestamps have the same proved latency as rising ones (`formal/edge_ts.sby`); the snapshot's capture of falling edges and of which edge came last is proved at whole-cycle resolution (`formal/engine.sby`, task `snap`); `tsget`'s choice between them is checked in lockstep simulation against the reference model; a chip-level test checks every verdict of a "latest edge" referee against the interval the test generated |
