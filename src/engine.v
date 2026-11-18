@@ -248,8 +248,46 @@ module engine #(
   // registers, and the result feeds the CRC register or the host reply.
   // (The Player's mux is 96:1; words 96..127 don't exist, and the claimed-pin
   // mask at 96 is picked before the program mux's output is used.)
-  wire [6:0] img_addr = checking ? (chk_idx - 7'd8) : h_raddr;
-  wire [15:0] rb_word = prog[img_addr[PC_W-1:0]];  // readback / RUN-check port
+  //
+  // The address is REGISTERED (ra), with one kept copy of its low 4 bits per
+  // 16-word bank, the structure the fetch port got on 13 Nov. Why: in the first
+  // two-engine hardening run with the host-port fix (44226517009, 18 Nov) the
+  // one path that missed 60 MHz (-0.19 ns at the slow corner) went from the host
+  // read address through ~4.5 ns of fan-out buffers into this mux (96 words in
+  // the Player) and on through the CRC update. ra loads the address of the word
+  // to read in the NEXT cycle, so nothing changes in the RUN check's schedule:
+  //   - RUN accepted (the check starts next cycle with chk_idx 0): 0 - 8;
+  //   - during the check: chk_idx + 1 - 8, the next check word;
+  //   - otherwise: the host's read address. That is packet byte B, which arrived
+  //     at least a UART byte time (>= 20 cycles) before the packet completes, so
+  //     ra already holds it when the host port reads h_rdata: no reply change.
+  // Formal (12b): the copies always equal ra, and during the check ra is always
+  // chk_idx - 8, the word the check means to read (docs/isa-timing.md 0b, diff 22).
+  reg [6:0] ra;
+  wire [6:0] ra_d = (h_run && halted) ? 7'd120   // 0 - 8 (mod 128)
+                  : checking ? (chk_idx - 7'd7)  // (chk_idx + 1) - 8
+                  : h_raddr;
+  always @(posedge clk) ra <= !rst_n ? 7'd0 : ra_d;
+  wire [6:0] img_addr = ra;
+  wire [16*NBANK-1:0] rq;   // bank k's word at rq[16k +: 16], each bank read by its own copy
+  wire [4*NBANK-1:0] ra_copies;
+  genvar kr;
+  generate
+    for (kr = 0; kr < NBANK; kr = kr + 1) begin : g_rbank
+      // one (* keep *) process per copy, as the pc copies (opt_merge would fold them)
+      (* keep *) reg [3:0] ra_q;
+      (* keep *) always @(posedge clk) ra_q <= !rst_n ? 4'd0 : ra_d[3:0];
+      localparam [7:0] RBASE = 16 * kr;
+      wire [7:0] raddr8 = RBASE | {4'd0, ra_q};
+      wire [PC_W-1:0] raddr = raddr8[PC_W-1:0];
+      wire _unused_ra = &{1'b0, raddr8[7:PC_W]};
+      assign rq[16*kr+:16] = prog[raddr];
+      assign ra_copies[4*kr+:4] = ra_q;
+    end
+  endgenerate
+  // (bank 6 / 7 of the Player's 7-bit address do not exist: ra >= 96 is the
+  // claimed-pin mask, picked below before rb_word is used)
+  wire [15:0] rb_word = rq[16*ra[PC_W-1:4]+:16];  // readback / RUN-check port
   reg  [15:0] img_word;
   always @(*) begin
     if (img_addr < PW) img_word = rb_word;
@@ -823,7 +861,7 @@ module engine #(
   end
 
   // (the copies' bits above bit 3 only exist so that every copy equals pc)
-  wire _unused = &{1'b0, f_n[10:0], b_lo[9:0], f_e[1], pc_copies, f_a8[7:6]};
+  wire _unused = &{1'b0, f_n[10:0], b_lo[9:0], f_e[1], pc_copies, ra_copies, f_a8[7:6]};
 
 `ifdef FORMAL
   // ===========================================================================
@@ -962,6 +1000,10 @@ module engine #(
       //        pc never reaches 96..127, where no bank exists)
       assert (pc_copies == {NBANK{pc}});
       assert (pc < PROG_WORDS);
+      // -- 12b. the readback address copies always equal ra, and during the RUN
+      //         check ra is exactly the word the check means to read
+      assert (ra_copies == {NBANK{ra[3:0]}});
+      if (checking) assert (ra == chk_idx - 7'd8);
 
       // -- 8. JUDGE feeds the verdict block, in its cycle 2, exactly Y - X,
       //       invalid = FX | FY | OX | OY | (EX != EY) and bound b as of its
