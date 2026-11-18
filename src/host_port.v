@@ -59,11 +59,18 @@
  *     60 MHz). A UART framing error also throws the partial packet away.
  *   - Image and config writes are also refused inside engine_sys / engine
  *     unless halted (hardware write gates); the NAK here just tells the host.
- *   - Every strobe to engine_sys is a one-cycle pulse in the cycle the 4th
- *     byte arrives, with its address/data taken from that packet. A read and
- *     its clear ('Q', 'L') happen in that same cycle, so nothing is lost
- *     between them; a hardware set in that very cycle loses to the clear
- *     (docs/isa-timing.md 0b, diff 6).
+ *   - The packet is decoded, checked and answered in the cycle its 4th byte
+ *     arrives; its actions (writes, CRC writes, RUN / halt, IN push, OUT pop,
+ *     stats latch / clear) reach engine_sys ONE CYCLE LATER, as one-cycle
+ *     pulses from a pipeline register with their address / data / engine
+ *     (docs/isa-timing.md 0b, diff 21). Why: the decode that decides ACK /
+ *     NAK (which engine, is it halted, is its FIFO full) and the fan-out of
+ *     the strobes to ~500 flip-flops did not fit in one 16.7 ns cycle at the
+ *     slow corner once there were two engines (run 44150852691: -1.77 ns).
+ *     Packets are at least 40 cycles apart, so the host cannot tell.
+ *   - Reads and their clears ('Q' status, 'L' LOST) stay in the packet cycle:
+ *     a read and its clear happen together, so nothing is lost between them;
+ *     a hardware set in that very cycle loses to the clear (0b, diff 6).
  */
 
 `default_nettype none
@@ -156,6 +163,7 @@ module host_port #(
   reg baud_pend;  // a new bit period waits for the reply to finish
   reg [15:0] div_next;
   reg r_e;  // the engine a RUN reply waits for
+  reg rw_skip;  // RUN reply: the cycle in which the strobe is still in the pipeline register
 
   // Start a byte whenever one is waiting and the transmitter is free. The
   // transmitter's busy rises the cycle after start, so the next byte simply
@@ -188,7 +196,7 @@ module host_port #(
       default: pe = a;
     endcase
   end
-  assign h_e = pe[0];
+  // (h_e, the engine select engine_sys sees, is assigned below with the pipeline register)
   wire e_ok = (pe <= 8'd1);  // engine 0 (Referee) or 1 (Player)
   wire ref_ok = (a == 8'd0);  // the Referee-only commands: engine 0
   wire e_halted = halted[pe[0]];
@@ -269,27 +277,73 @@ module host_port #(
   wire exec = packet && !replying;  // a packet we will act on
   wire go = exec && (st == ACK);  // ... and carry out
 
-  // Strobes and their operands, straight from the packet (one-cycle pulses).
-  assign h_gwe = go && cmd == C_G;
-  assign h_gaddr = (cmd == C_RD) ? bb[2:0] : a[2:0];
-  assign h_gwdata = {bb, c};
-  assign h_gcrc_we = go && cmd == C_CRC && a == 8'd0;  // (engine e: h_crc_we, routed by h_e)
-  assign h_gcrc = {bb, c};
-  assign h_we = go && cmd == C_W;
-  assign h_addr = a[6:0];
-  assign h_wdata = {bb, c};
+  // Actions, decoded in the packet cycle ...
+  wire d_gwe = go && cmd == C_G;
+  wire d_gcrc_we = go && cmd == C_CRC && a == 8'd0;  // (engine e: d_crc_we)
+  wire d_we = go && cmd == C_W;
+  wire d_crc_we = go && cmd == C_CRC && a != 8'd0;
+  wire d_run = go && cmd == C_RUN && bb[0];
+  wire d_halt = go && cmd == C_RUN && !bb[0];
+  wire d_in_push = go && cmd == C_PUSH;
+  wire d_out_pop = go && cmd == C_POP;
+  wire d_slatch = go && cmd == C_SLATCH;
+  wire d_sclr = go && cmd == C_SCLR;
+
+  // ... and carried out one cycle later from this pipeline register (0b, diff
+  // 21; see the Rules above). The strobes are registered every cycle, so each
+  // is a one-cycle pulse; the operands are captured with the packet. All the
+  // write data of every command is {B, C}, so one 16-bit register serves them.
+  reg q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr;
+  reg q_e;           // the engine the action is for
+  reg [2:0] q_gwaddr;  // global word address ('G')
+  reg [6:0] q_addr;    // engine image address ('W')
+  reg [15:0] q_wdata;  // {B, C}
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      {q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr} <= 10'd0;
+      q_e <= 1'b0;
+      q_gwaddr <= 3'd0;
+      q_addr <= 7'd0;
+      q_wdata <= 16'd0;
+    end else begin
+      {q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr} <=
+          {d_gwe, d_gcrc_we, d_we, d_crc_we, d_run, d_halt, d_in_push, d_out_pop, d_slatch, d_sclr};
+      if (exec) begin
+        q_e <= pe[0];
+        q_gwaddr <= a[2:0];
+        q_addr <= a[6:0];
+        q_wdata <= {bb, c};
+      end
+    end
+  end
+  // An action is going out this cycle. Then the engine select and the global
+  // address shared with the read side carry the action's registered values;
+  // in every other cycle (every packet cycle, where reads and their clears
+  // happen: a packet is at least 40 cycles after the previous one) they carry
+  // the packet's own fields, exactly as before.
+  wire q_act = q_gwe | q_gcrc_we | q_we | q_crc_we | q_run | q_halt | q_in_push | q_out_pop | q_slatch | q_sclr;
+  assign h_e = q_act ? q_e : pe[0];
+  assign h_gaddr = q_gwe ? q_gwaddr : bb[2:0];  // write address, or the 'r' read address
+  assign h_gwe = q_gwe;
+  assign h_gwdata = q_wdata;
+  assign h_gcrc_we = q_gcrc_we;
+  assign h_gcrc = q_wdata;
+  assign h_we = q_we;
+  assign h_addr = q_addr;
+  assign h_wdata = q_wdata;
   assign h_raddr = bb[6:0];
-  assign h_crc_we = go && cmd == C_CRC && a != 8'd0;
-  assign h_crc = {bb, c};
-  assign h_run = go && cmd == C_RUN && bb[0];
-  assign h_halt = go && cmd == C_RUN && !bb[0];
-  assign h_in_push = go && cmd == C_PUSH;
-  assign h_in_data = bb;
-  assign h_out_pop = go && cmd == C_POP;
-  assign h_stats_latch = go && cmd == C_SLATCH;
-  assign h_stats_clear = go && cmd == C_SCLR;
-  assign h_stats_slot = bb[1:0];
-  assign h_stats_idx = bb[2:0];
+  assign h_crc_we = q_crc_we;
+  assign h_crc = q_wdata;
+  assign h_run = q_run;
+  assign h_halt = q_halt;
+  assign h_in_push = q_in_push;
+  assign h_in_data = q_wdata[15:8];
+  assign h_out_pop = q_out_pop;
+  assign h_stats_latch = q_slatch;
+  assign h_stats_clear = q_sclr;
+  assign h_stats_slot = q_wdata[9:8];
+  assign h_stats_idx = bb[2:0];  // read side ('s'): packet cycle
+  // read-and-clear: in the packet cycle, together with the read (0b, diff 6)
   assign h_lost_clear = go && cmd == C_LOST && bb[0];
   assign h_status_clear = go && cmd == C_Q && !bb[0];
 
@@ -304,6 +358,7 @@ module host_port #(
       r_status <= 8'd0;
       r_data <= 8'd0;
       r_e <= 1'b0;
+      rw_skip <= 1'b0;
       ridx <= 5'd0;
       rlen <= 5'd0;
       overrun <= 1'b0;
@@ -335,10 +390,12 @@ module host_port #(
         r_data   <= dt;
         ridx     <= 5'd0;
         rlen     <= (go && cmd == C_DRAIN) ? 5'd2 + {drain_n, 1'b0} : 5'd2;
-        // RUN: hold the reply until the image check is over (checking is
-        // high from the next cycle until the engine runs or refuses).
-        rstate   <= h_run ? R_RUNWAIT : R_SEND;
-        r_e      <= h_e;
+        // RUN: hold the reply until the image check is over. The RUN strobe
+        // reaches the engine next cycle (pipeline register), so `checking` is
+        // high only from the cycle after that: skip one cycle before looking.
+        rstate   <= d_run ? R_RUNWAIT : R_SEND;
+        rw_skip  <= d_run;
+        r_e      <= pe[0];
         if (go && cmd == C_Q && bb[0]) overrun <= 1'b0;
         if (go && cmd == C_BAUD) begin
           baud_pend <= 1'b1;
@@ -346,7 +403,9 @@ module host_port #(
         end
       end
 
-      if (rstate == R_RUNWAIT && !checking[r_e]) begin
+      if (rstate == R_RUNWAIT && rw_skip) begin
+        rw_skip <= 1'b0;
+      end else if (rstate == R_RUNWAIT && !checking[r_e]) begin
         r_status <= running[r_e] ? ACK : NAK;
         rstate   <= R_SEND;
       end
