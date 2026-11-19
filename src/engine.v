@@ -2,13 +2,38 @@
  * Copyright (c) 2026 Shreyansh
  * SPDX-License-Identifier: Apache-2.0
  *
- * engine: one Referee engine (ISA v0.3, isa.yaml; contract in docs/isa-timing.md).
+ * engine: one engine of ISA v0.3 (isa.yaml; contract in docs/isa-timing.md),
+ * in one of two configurations chosen by parameters (docs/isa-timing.md 0b,
+ * diffs 17-20):
  *
- * Contains, per engine: the image (64-word program, 16-entry bounds table,
- * claimed-pin mask) in flip-flops, the registers and flags, the snapshot of
- * edge_ts with its trigger, JUDGE with the proved verdict rule and the stats,
- * the IN / OUT / VERDICT FIFOs, and the RUN check (CRC-16 over the global and
- * engine images plus the pin-claim check).
+ *   REFEREE = 1, PROG_WORDS = 64  engine 0, the "Referee". Exactly the engine
+ *       of the one-engine chip: program, 16-entry bounds table, claimed-pin
+ *       mask, registers and flags, the snapshot of edge_ts with its trigger,
+ *       JUDGE with the proved verdict rule and the stats, the IN / OUT /
+ *       VERDICT FIFOs, LOST, and the RUN check.
+ *   REFEREE = 0, PROG_WORDS = 96  engine 1, the "Player": it only emulates.
+ *       No referee hardware at all: no snapshot or trigger, no verdict block,
+ *       no bounds table, no stats, no VERDICT FIFO, no LOST. It still sees the
+ *       four judge channels as inputs 12..15 (their synchronized levels, which
+ *       edge_ts produces for everyone), nothing else of edge_ts. The referee
+ *       instructions behave as on a Referee whose trigger never fires and whose
+ *       verdicts go nowhere: TRIG, REL and JUDGE do nothing; TSGET writes 0;
+ *       WAITS can only end by its timeout (T <- 1); S is always 0.
+ *
+ * Why one module with parameters, not two modules: the two engines must run
+ * the same ISA cycle for cycle, and every fix to fetch, decode or the RUN check
+ * (e.g. the fetch-path fix of 13 Nov) then applies to both. The Referee-only
+ * logic is cut out in two ways: the snapshot and verdict submodules are not
+ * instantiated (generate), and every other Referee-only effect is gated by the
+ * constant REFEREE, so in the Player the flip-flops behind it (stats, verdict
+ * FIFO, JUDGE pipeline, bounds, LOST, trigger, timestamp tags, X and Y) have
+ * no fanout and synthesis removes them. Checked in the synthesized netlist.
+ *
+ * Program size and addresses. The ISA's address field `a` stays 6 bits
+ * (0..63). The Player's pc is 7 bits and counts 0..95, wrapping to 0 after 95:
+ * words 64..95 run by falling through from word 63, and JMP / BR / LOOP reach
+ * only 0..63. ISA v1 widens `a` to 7 bits; then every Player program written
+ * today keeps its meaning and nothing in the pc or the fetch path changes.
  *
  * Cycle semantics (identical to tools/refmodel.py, which the lockstep tests use):
  *   - An instruction issues when running, unless a WAITD is still holding the
@@ -16,25 +41,32 @@
  *   - Every instruction takes 1 cycle; WAITP / WAITS stay at their pc until
  *     their event (T <- 0) or their timeout (T <- 1); the event wins a tie.
  *   - SET / SHO change out_val at the end of the cycle (pad at t+1).
- *   - Snapshot (src/snapshot.v): a trigger reported in cycle r (while no
- *     snapshot is pending) is captured in cycle r+2 from the edge_ts
+ *   - Snapshot (Referee; src/snapshot.v): a trigger reported in cycle r (while
+ *     no snapshot is pending) is captured in cycle r+2 from the edge_ts
  *     registers, which then hold the state latched at the end of r+1. ORD
  *     marks edges latched in r-1..r+1, except the trigger edge itself.
- *   - RUN: the check reads 8 global + 97 engine words (105 cycles); on success
- *     the first instruction issues 106 cycles after the RUN strobe. The pass /
- *     fail decision is made one cycle ahead and registered (start_r), so the
- *     RUN start that clears ~700 registers comes from a flip-flop.
- *   - JUDGE takes two pipeline cycles but issues in one, back to back: cycle 1
- *     (the issue cycle) latches m = Y - X, the tags and both bound words;
- *     cycle 2 computes the verdict and does the push, VERDICT_OVF, the stats
- *     update and the L-bit clear together. Firmware can't see the difference
- *     (JUDGE writes no register or flag the program reads); the host sees the
- *     verdict one cycle later (docs/isa-timing.md 0b, diff 13).
+ *   - RUN: the check reads 8 global + 97 engine words (105 cycles; the
+ *     Player's image is 96 program words + the claimed-pin mask, also 97); on
+ *     success the first instruction issues 106 cycles after the RUN strobe. The
+ *     pass / fail decision is made one cycle ahead and registered (start_r), so
+ *     the RUN start that clears ~700 registers comes from a flip-flop.
+ *   - JUDGE (Referee) takes two pipeline cycles but issues in one, back to
+ *     back: cycle 1 (the issue cycle) latches m = Y - X, the tags and both
+ *     bound words; cycle 2 computes the verdict and does the push,
+ *     VERDICT_OVF, the stats update and the L-bit clear together. Firmware
+ *     can't see the difference (JUDGE writes no register or flag the program
+ *     reads); the host sees the verdict one cycle later (0b, diff 13).
  */
 
 `default_nettype none
 
-module engine (
+module engine #(
+    // 1: engine 0, the Referee (all referee hardware); 0: engine 1, the Player
+    parameter integer REFEREE = 1,
+    // program words: a multiple of 16, 64..96 (the Referee has 64). The image
+    // must stay at most 97 words (see IMG_WORDS below)
+    parameter integer PROG_WORDS = 64
+) (
     input  wire        clk,
     input  wire        rst_n,
     input  wire [15:0] now,
@@ -50,7 +82,8 @@ module engine (
     input  wire [ 3:0] et_fall_stale,
     input  wire [ 3:0] et_missed,
     input  wire [ 3:0] et_last_fall,
-    output wire        et_clear_missed,  // pulse when a RUN starts
+    output wire        et_clear_missed,  // pulse when a RUN starts (Referee only; 0 in the Player)
+    output wire        run_start,        // pulse when a RUN starts (either engine)
 
     // global config (decoded by engine_sys)
     input  wire [14:0] owned,     // output pins this engine may drive
@@ -87,7 +120,7 @@ module engine (
     output wire [15:0] stats_rdata,
     input  wire        h_stats_clear,
     input  wire        h_lost_clear,
-    output reg  [ 7:0] lost,
+    output wire [ 7:0] lost,
     input  wire        h_status_clear,
     output wire        halted,
     output wire        running,
@@ -166,12 +199,32 @@ module engine (
   // END GENERATED
 
   localparam [1:0] ST_HALTED = 2'd0, ST_CHECK = 2'd1, ST_RUN = 2'd2;
-  localparam [6:0] CHECK_LAST = 7'd104;  // 8 global + 97 engine words
+  // pc width: 6 bits for 64 words, 7 for the Player's 96
+  localparam integer PC_W = $clog2(PROG_WORDS);
+  // the program is read in banks of 16 words, each addressed by its own pc copy
+  localparam integer NBANK = PROG_WORDS / 16;
+  // Image: program, then (Referee only) 16 bounds x 2 words, then the claimed-pin
+  // mask. 64 + 32 + 1 = 97 for the Referee and 96 + 1 = 97 for the Player, so
+  // both RUN checks take 8 + 97 = 105 cycles and C_START is 106 for both. The
+  // host's 'W' packet carries a 7-bit image address (e is A[7]), so an image
+  // can't grow past 128 words; the Player has no bounds partly for that reason
+  // (docs/isa-timing.md 0b, diff 19).
+  localparam integer IMG_WORDS = PROG_WORDS + (REFEREE != 0 ? 32 : 0) + 1;
+  // the same sizes as 7-bit constants for the address compares (all < 128)
+  localparam [6:0] PW = PROG_WORDS[6:0];  // first word after the program
+  localparam [6:0] BND_END = PW + 7'd32;  // first word after the bounds (Referee)
+  localparam [6:0] CLAIMS_ADDR = IMG_WORDS[6:0] - 7'd1;  // 96 for both engines
+  localparam [6:0] CHECK_LAST = IMG_WORDS[6:0] + 7'd7;  // 104: 8 global + 97 engine words
+  // pc + 1, wrapping to 0 after the last word. For 64 words that is the plain
+  // 6-bit increment (exactly the one-engine Referee); for 96 the wrap is a compare
+  localparam integer POW2 = (PROG_WORDS == (1 << PC_W)) ? 1 : 0;
 
   // ---------------------------------------------------------------------------
   // Image (flip-flops; contents undefined until loaded: the CRC check guards RUN)
   // ---------------------------------------------------------------------------
-  reg [15:0] prog [0:63];
+  reg [15:0] prog [0:PROG_WORDS-1];
+  // Bounds table: Referee only. In the Player it is never written (REFEREE gates
+  // the write) and nothing reads it, so synthesis removes it.
   reg [15:0] bnd  [0:31];
   reg [15:0] claims;
 
@@ -193,12 +246,52 @@ module engine (
   // missed 60 MHz. At 33% of 8x4 the second mux (about 13,000 um2) is cheap.
   // Nothing on this side is timing-critical: chk_idx and h_raddr are
   // registers, and the result feeds the CRC register or the host reply.
-  wire [6:0] img_addr = checking ? (chk_idx - 7'd8) : h_raddr;
-  wire [15:0] rb_word = prog[img_addr[5:0]];  // readback / RUN-check port
+  // (The Player's mux is 96:1; words 96..127 don't exist, and the claimed-pin
+  // mask at 96 is picked before the program mux's output is used.)
+  //
+  // The address is REGISTERED (ra), with one kept copy of its low 4 bits per
+  // 16-word bank, the structure the fetch port got on 13 Nov. Why: in the first
+  // two-engine hardening run with the host-port fix (44226517009, 18 Nov) the
+  // one path that missed 60 MHz (-0.19 ns at the slow corner) went from the host
+  // read address through ~4.5 ns of fan-out buffers into this mux (96 words in
+  // the Player) and on through the CRC update. ra loads the address of the word
+  // to read in the NEXT cycle, so nothing changes in the RUN check's schedule:
+  //   - RUN accepted (the check starts next cycle with chk_idx 0): 0 - 8;
+  //   - during the check: chk_idx + 1 - 8, the next check word;
+  //   - otherwise: the host's read address. That is packet byte B, which arrived
+  //     at least a UART byte time (>= 20 cycles) before the packet completes, so
+  //     ra already holds it when the host port reads h_rdata: no reply change.
+  // Formal (12b): the copies always equal ra, and during the check ra is always
+  // chk_idx - 8, the word the check means to read (docs/isa-timing.md 0b, diff 22).
+  reg [6:0] ra;
+  wire [6:0] ra_d = (h_run && halted) ? 7'd120   // 0 - 8 (mod 128)
+                  : checking ? (chk_idx - 7'd7)  // (chk_idx + 1) - 8
+                  : h_raddr;
+  always @(posedge clk) ra <= !rst_n ? 7'd0 : ra_d;
+  wire [6:0] img_addr = ra;
+  wire [16*NBANK-1:0] rq;   // bank k's word at rq[16k +: 16], each bank read by its own copy
+  wire [4*NBANK-1:0] ra_copies;
+  genvar kr;
+  generate
+    for (kr = 0; kr < NBANK; kr = kr + 1) begin : g_rbank
+      // one (* keep *) process per copy, as the pc copies (opt_merge would fold them)
+      (* keep *) reg [3:0] ra_q;
+      (* keep *) always @(posedge clk) ra_q <= !rst_n ? 4'd0 : ra_d[3:0];
+      localparam [7:0] RBASE = 16 * kr;
+      wire [7:0] raddr8 = RBASE | {4'd0, ra_q};
+      wire [PC_W-1:0] raddr = raddr8[PC_W-1:0];
+      wire _unused_ra = &{1'b0, raddr8[7:PC_W]};
+      assign rq[16*kr+:16] = prog[raddr];
+      assign ra_copies[4*kr+:4] = ra_q;
+    end
+  endgenerate
+  // (bank 6 / 7 of the Player's 7-bit address do not exist: ra >= 96 is the
+  // claimed-pin mask, picked below before rb_word is used)
+  wire [15:0] rb_word = rq[16*ra[PC_W-1:4]+:16];  // readback / RUN-check port
   reg  [15:0] img_word;
   always @(*) begin
-    if (img_addr < 7'd64) img_word = rb_word;
-    else if (img_addr < 7'd96) img_word = bnd[img_addr[4:0]];
+    if (img_addr < PW) img_word = rb_word;
+    else if (REFEREE != 0 && img_addr < BND_END) img_word = bnd[img_addr[4:0]];
     else img_word = claims;
   end
   assign h_rdata = img_word;
@@ -206,9 +299,9 @@ module engine (
 
   always @(posedge clk) begin
     if (h_we && halted) begin
-      if (h_addr < 7'd64) prog[h_addr[5:0]] <= h_wdata;
-      else if (h_addr < 7'd96) bnd[h_addr[4:0]] <= h_wdata;
-      else if (h_addr == 7'd96) claims <= h_wdata;
+      if (h_addr < PW) prog[h_addr[PC_W-1:0]] <= h_wdata;
+      else if (REFEREE != 0 && h_addr < BND_END) bnd[h_addr[4:0]] <= h_wdata;
+      else if (h_addr == CLAIMS_ADDR) claims <= h_wdata;
     end
   end
 
@@ -226,15 +319,17 @@ module engine (
   // ---------------------------------------------------------------------------
   // Registers
   // ---------------------------------------------------------------------------
-  // The pc, plus four copies that only address the program read port. Fetching
-  // reads 64 words x 16 bits, so a single pc bit drove ~100 mux inputs through
-  // a chain of 9 small buffers: 4.8 ns at the slow corner, the first third of
-  // the critical path. Each copy addresses one quarter of the program (16
-  // words) and `pc` picks the quarter. All five load the same next pc (pc_d)
-  // in every cycle; (* keep *) stops synthesis from merging the identical
-  // flip-flops back into one, and formal asserts the copies always equal pc.
-  reg [5:0] pc;
-  (* keep *) reg [5:0] pc_q0, pc_q1, pc_q2, pc_q3;
+  // The pc, plus one copy per 16-word bank that only addresses the program
+  // read port (4 copies in the Referee, 6 in the Player). Fetching reads 64
+  // words x 16 bits, so a single pc bit drove ~100 mux inputs through a chain
+  // of 9 small buffers: 4.8 ns at the slow corner, the first third of the
+  // critical path. Each copy addresses one bank (16 words) and `pc` picks the
+  // bank. All copies load the same next pc (pc_d) in every cycle; (* keep *)
+  // stops synthesis from merging the identical flip-flops back into one (one
+  // kept process per copy, in g_bank below), and formal asserts the copies
+  // always equal pc.
+  reg [PC_W-1:0] pc;
+  wire [PC_W*NBANK-1:0] pc_copies;  // every bank's copy, for formal and lint
   reg [15:0] X, Y, SR, DL, TO;
   reg [7:0] RC;
   reg T, C, E;
@@ -244,6 +339,7 @@ module engine (
   reg trig_en, trig_e;
   reg [1:0] trig_ch;
   reg lost_since;
+  reg [7:0] lost_r;
   reg out_ovf, vf_ovf, in_underrun, pin_fault, crc_fail;
 
   // snapshot (src/snapshot.v; instantiated below)
@@ -252,22 +348,40 @@ module engine (
   wire [63:0] sn_rts, sn_fts;
   wire [3:0] sn_rstale, sn_fstale, sn_missed, sn_last, sn_ord_r, sn_ord_f;
 
-  assign status = {checking, running, S, crc_fail, pin_fault, in_underrun, vf_ovf, out_ovf};
+  // The Player has no VERDICT FIFO, so VERDICT_OVF reads 0 there (and S is 0)
+  assign status = {checking, running, S, crc_fail, pin_fault, in_underrun, (REFEREE != 0) && vf_ovf, out_ovf};
+  assign lost = (REFEREE != 0) ? lost_r : 8'd0;
 
   // ---------------------------------------------------------------------------
   // Program read port (fetch) and decode
   // ---------------------------------------------------------------------------
   // It always reads prog[pc]: nothing but the pc and its copies is in front
-  // of the mux (no `running`, no host address). Quarter k (words 16k..16k+15)
-  // is addressed by its own pc copy, then pc[5:4] picks the quarter. While
+  // of the mux (no `running`, no host address). Bank k (words 16k..16k+15)
+  // is addressed by its own pc copy, then pc[PC_W-1:4] picks the bank. While
   // the engine is not running the fetched word is ignored (every use below is
   // gated by `issue`, which implies running), so it does not matter what the
-  // pc points at.
-  wire [15:0] pq0 = prog[{2'd0, pc_q0[3:0]}];
-  wire [15:0] pq1 = prog[{2'd1, pc_q1[3:0]}];
-  wire [15:0] pq2 = prog[{2'd2, pc_q2[3:0]}];
-  wire [15:0] pq3 = prog[{2'd3, pc_q3[3:0]}];
-  wire [15:0] instr = (pc[5:4] == 2'd0) ? pq0 : (pc[5:4] == 2'd1) ? pq1 : (pc[5:4] == 2'd2) ? pq2 : pq3;
+  // pc points at. (In the Player, pc[6:4] = 6 or 7 would select no bank; the pc
+  // never gets there: formal asserts pc < PROG_WORDS.)
+  reg  [PC_W-1:0] pc_d;  // next pc, loaded by pc and every copy (computed below)
+  wire [16*NBANK-1:0] pq;  // bank k's word at pq[16k +: 16]
+  genvar k;
+  generate
+    for (k = 0; k < NBANK; k = k + 1) begin : g_bank
+      // One (* keep *) process per copy: Yosys's opt_merge would otherwise fold
+      // flip-flops with identical inputs into one (a keep on the reg alone only
+      // keeps the wire name, which then becomes `assign pc_q = pc`). Checked in
+      // the synthesized netlist: (NBANK + 1) x PC_W flip-flops.
+      (* keep *) reg [PC_W-1:0] pc_q;
+      (* keep *) always @(posedge clk) pc_q <= !rst_n ? {PC_W{1'b0}} : pc_d;
+      localparam [7:0] BASE = 16 * k;  // first word of this bank
+      wire [7:0] addr8 = BASE | {4'd0, pc_q[3:0]};  // {k, the copy's low 4 bits}
+      wire [PC_W-1:0] addr = addr8[PC_W-1:0];
+      wire _unused_a = &{1'b0, addr8[7:PC_W]};  // above the pc width
+      assign pq[16*k+:16] = prog[addr];
+      assign pc_copies[PC_W*k+:PC_W] = pc_q;
+    end
+  endgenerate
+  wire [15:0] instr = pq[16*pc[PC_W-1:4]+:16];
   wire [ 4:0] op = instr[15:11];
   wire [ 3:0] f_p = instr[F_P_HI:F_P_LO];
   wire [ 3:0] f_q = instr[F_Q_HI:F_Q_LO];
@@ -290,7 +404,12 @@ module engine (
   wire        issue = running && !(wd_stall && $signed(now - DL) < 0);
   wire        in_bit = in_sync[f_q];
   wire        timed_out = $signed(now - TO) >= 0;
-  wire [ 5:0] pc_inc = pc + 6'd1;
+  wire [PC_W-1:0] pc_last = PW[PC_W-1:0] - 1'b1;  // (PW[5:0] - 1 = 63 for 64 words)
+  wire [PC_W-1:0] pc_inc = (POW2 != 0 || pc != pc_last) ? pc + 1'b1 : {PC_W{1'b0}};
+  // jump / branch / loop target: the 6-bit field, zero-extended. Until ISA v1
+  // widens `a`, the Player's words 64..95 can't be a target (only fall-through)
+  wire [7:0] f_a8 = {2'b00, f_a};  // (8 bits: wide enough for any PC_W)
+  wire [PC_W-1:0] tgt = f_a8[PC_W-1:0];
   wire [15:0] tval = f_x16 ? {2'b00, f_t, 4'b0000} : {6'd0, f_t};
   wire        pin_ok = (f_p != 4'd15) && owned[f_p];
   wire        sho_bit = f_msb ? SR[15] : SR[0];
@@ -327,12 +446,22 @@ module engine (
   // JUDGE, cycle 2
   wire [15:0] m = j_m;
   wire        v_pass, v_viol;
-  verdict #(
-      .M_W(16), .FRAC_W(4), .N_W(20), .U_FX(2 << 4), .SHARP(1)
-  ) u_verdict (
-      .m(m), .n_lo({j_bhi, j_blo[5:2]}), .inexact(j_blo[1]), .is_max(j_blo[0]),
-      .invalid(j_invalid), .pass(v_pass), .violation(v_viol)
-  );
+  generate
+    if (REFEREE != 0) begin : g_verdict
+      verdict #(
+          .M_W(16), .FRAC_W(4), .N_W(20), .U_FX(2 << 4), .SHARP(1)
+      ) u_verdict (
+          .m(m), .n_lo({j_bhi, j_blo[5:2]}), .inexact(j_blo[1]), .is_max(j_blo[0]),
+          .invalid(j_invalid), .pass(v_pass), .violation(v_viol)
+      );
+    end else begin : g_no_verdict
+      // Player: no verdict block. JUDGE never starts a cycle 2 here (is_judge
+      // is 0), so nothing reads these.
+      assign v_pass = 1'b0;
+      assign v_viol = 1'b0;
+      wire _unused_j = &{1'b0, j_bhi, j_blo};
+    end
+  endgenerate
   wire [ 1:0] vcode = v_pass ? 2'd1 : v_viol ? 2'd2 : 2'd0;
   wire [ 2:0] msat = ($signed(m) < -16'sd4) ? 3'b100 : ($signed(m) > 16'sd3) ? 3'b011 : m[2:0];
   wire        do_push = j_v && ((j_push == PUSH_ALL) || ((j_push == PUSH_NONPASS) && !v_pass));
@@ -354,8 +483,10 @@ module engine (
   assign in_full = (fin_n == 3'd4);
   assign out_empty = (fout_n == 3'd0);
   assign out_data = fout[fout_rp];
-  assign vf_data = fv[fv_rp];
-  assign vf_count = fv_n;
+  // Player: no VERDICT FIFO. The outputs are 0, so the FIFO's flip-flops have
+  // no fanout and synthesis drops them (they could never fill anyway).
+  assign vf_data = (REFEREE != 0) ? fv[fv_rp] : 16'd0;
+  assign vf_count = (REFEREE != 0) ? fv_n : 4'd0;
 
   wire is_pull = issue && (op == OP_PULL);
   wire pull_ok = is_pull && (fin_n != 3'd0);
@@ -363,7 +494,9 @@ module engine (
   wire is_push = issue && (op == OP_PUSH);
   wire push_ok = is_push && (fout_n != 3'd4);
   wire host_out = h_out_pop && !out_empty;
-  wire is_judge = issue && (op == OP_JUDGE);  // JUDGE cycle 1
+  // JUDGE cycle 1. In the Player JUDGE does nothing at all: no cycle 2, no
+  // push, no stats, no VERDICT_OVF (docs/isa-timing.md 0b, diff 17)
+  wire is_judge = (REFEREE != 0) && issue && (op == OP_JUDGE);
   // JUDGE cycle 2: room is checked against the level at the start of the cycle
   // (a host pop in the same cycle frees its slot only from the next one)
   wire [3:0] vf_need = {3'd0, j_raw} + 4'd1;
@@ -377,7 +510,8 @@ module engine (
   reg [15:0] st_pass[0:3], st_viol[0:3], st_indet[0:3], st_min[0:3], st_max[0:3];
   reg [3:0] st_seen;
   reg [15:0] shadow[0:4];
-  assign stats_rdata = (h_stats_idx <= 3'd4) ? shadow[h_stats_idx] : 16'd0;
+  // Player: no stats (output 0; the counters then have no fanout and go away)
+  assign stats_rdata = (REFEREE != 0 && h_stats_idx <= 3'd4) ? shadow[h_stats_idx] : 16'd0;
   wire stats_upd = j_v && (j_b[3:2] == 2'b00);  // JUDGE cycle 2, bound slots 0..3
 
   // ---------------------------------------------------------------------------
@@ -406,10 +540,52 @@ module engine (
       (crc_got_g == g_crc_exp) && (crc_e_final == crc_exp_e) && claims_ok;
   reg start_r;  // the last check cycle is now, and the check passed
   wire start = start_r;
-  assign et_clear_missed = start;
+  assign run_start = start;
+  // Only the Referee's RUN clears edge_ts's `missed` (0b, diff 3). edge_ts is
+  // shared: if the Player's RUN cleared it while the Referee runs, a `missed`
+  // the Referee has not yet snapshotted would vanish, and a verdict built on
+  // the bad timestamp could be a false PASS (0b, diff 20).
+  assign et_clear_missed = (REFEREE != 0) && start;
 
-  // next pc, loaded by pc and all four copies
-  reg  [ 5:0] pc_d;
+  // The two computed CRCs, crc_got_g (global image) and crc_got_e (this
+  // engine's image). They start from the CRC seed 0xFFFF at reset and when a
+  // RUN is accepted, then take one word per check cycle (global words in
+  // chk_idx 0..7, engine words in 8..104), and otherwise hold (the host reads
+  // them back at 'r' addr 0x80).
+  //
+  // Written as ONE next-state expression per register: the update term
+  // (crc_*_upd: the next CRC or the held value) is computed separately, and
+  // reset and a RUN accepted force the seed through their own term, an OR of
+  // crc_init into every bit (the seed is all ones). Why: in the first
+  // two-engine gate-level run (hardening run 44309280727, 18 Nov 2026) the flop
+  // u_sys.crc_got_e0[14] stayed X through reset. Synthesis had folded the
+  // reset into the hold path as D = o21ai(q, n1, o21ai(n2, n3, q)); during
+  // reset n1 = 0 and n2 = 1, so D = NOT(q AND NOT q): 1 in silicon, but X in an
+  // X-propagating simulation that starts with q = X (gate-level X pessimism;
+  // the chip would have worked). The written form keeps the reset term apart
+  // from the term that reads the register, so the natural mapping is an OR /
+  // NOR with crc_init as one input, which is 1 whatever q is. RTL cannot
+  // dictate the gate structure, though: the hardening run's gate-level test
+  // decides, and a flop that still stays X there gets an explicit, reviewed
+  // waiver (test/README.md), never a relaxed test. The behaviour is cycle for
+  // cycle the old one (formal property 14 proves it against shadow copies
+  // written as the old code; the old `start` assignment of crc_e_next is
+  // covered by crc_e_step, since start is the last check cycle: 7b).
+  wire crc_init = !rst_n || (h_run && halted);  // reset, or a RUN accepted: seed
+  wire crc_g_step = checking && (chk_idx < 7'd8);  // a global word this cycle
+  wire crc_e_step = checking && (chk_idx >= 7'd8);  // an engine word this cycle
+  // (* keep *): synthesis (abc) treats a kept net as a cut point, so each
+  // flop's D is a function of crc_*_upd and crc_init only: upd appears once in
+  // D's cone, and an X-propagating simulation then gives D = 1 during reset
+  // even while upd is X (review 6, 18 Nov; about 32 nets of lost optimisation).
+  (* keep *) wire [15:0] crc_g_upd = crc_g_step ? crc_g_next : crc_got_g;
+  (* keep *) wire [15:0] crc_e_upd = crc_e_step ? crc_e_next : crc_got_e;
+  always @(posedge clk) begin
+    crc_got_g <= crc_g_upd | {16{crc_init}};
+    crc_got_e <= crc_e_upd | {16{crc_init}};
+  end
+
+  // next pc, loaded by pc and every copy (pc_d is declared with the fetch port)
   always @(*) begin
     pc_d = pc;
     if (issue) begin
@@ -417,43 +593,58 @@ module engine (
       case (op)
         OP_HALT: pc_d = pc;
         OP_WAITP, OP_WAITS: if (!wait_event && !timed_out) pc_d = pc;  // keep waiting
-        OP_JMP: pc_d = f_a;
-        OP_BR: if (br_flag ^ f_c[0]) pc_d = f_a;
-        OP_LOOP: if (RC != 8'd0) pc_d = f_a;
+        OP_JMP: pc_d = tgt;
+        OP_BR: if (br_flag ^ f_c[0]) pc_d = tgt;
+        OP_LOOP: if (RC != 8'd0) pc_d = tgt;
         default: ;
       endcase
     end
-    if (start) pc_d = 6'd0;
+    if (start) pc_d = {PC_W{1'b0}};
   end
 
-  // One (* keep *) process per copy: Yosys's opt_merge would otherwise fold
-  // flip-flops with identical inputs into one (a keep on the reg alone only
-  // keeps the wire name, which then becomes `assign pc_q0 = pc`). Checked in
-  // the synthesized netlist: 5 x 6 flip-flops.
-  (* keep *) always @(posedge clk) pc <= !rst_n ? 6'd0 : pc_d;
-  (* keep *) always @(posedge clk) pc_q0 <= !rst_n ? 6'd0 : pc_d;
-  (* keep *) always @(posedge clk) pc_q1 <= !rst_n ? 6'd0 : pc_d;
-  (* keep *) always @(posedge clk) pc_q2 <= !rst_n ? 6'd0 : pc_d;
-  (* keep *) always @(posedge clk) pc_q3 <= !rst_n ? 6'd0 : pc_d;
+  // the pc itself (its copies are in g_bank above)
+  (* keep *) always @(posedge clk) pc <= !rst_n ? {PC_W{1'b0}} : pc_d;
 
 `ifdef FORMAL
   wire [1:0] f_snap_stage;
 `endif
-  snapshot #(
-      .N(4), .CH_W(2), .TS_W(16)
-  ) u_snap (
-      .clk(clk), .rst_n(rst_n), .clear(start),
-      .arm(running && trig_en), .trig_ch(trig_ch), .trig_e(trig_e), .rel(rel_now),
-      .et_rise(et_rise), .et_fall(et_fall), .et_rise_ts(et_rise_ts), .et_fall_ts(et_fall_ts),
-      .et_rise_stale(et_rise_stale), .et_fall_stale(et_fall_stale), .et_missed(et_missed),
-      .et_last_fall(et_last_fall),
-      .S(S), .valid(valid), .epoch(epoch), .lost_now(lost_now),
-      .sn_rts(sn_rts), .sn_fts(sn_fts), .sn_rstale(sn_rstale), .sn_fstale(sn_fstale),
-      .sn_missed(sn_missed), .sn_last(sn_last), .sn_ord_r(sn_ord_r), .sn_ord_f(sn_ord_f)
+  generate
+    if (REFEREE != 0) begin : g_snap
+      snapshot #(
+          .N(4), .CH_W(2), .TS_W(16)
+      ) u_snap (
+          .clk(clk), .rst_n(rst_n), .clear(start),
+          .arm(running && trig_en), .trig_ch(trig_ch), .trig_e(trig_e), .rel(rel_now),
+          .et_rise(et_rise), .et_fall(et_fall), .et_rise_ts(et_rise_ts), .et_fall_ts(et_fall_ts),
+          .et_rise_stale(et_rise_stale), .et_fall_stale(et_fall_stale), .et_missed(et_missed),
+          .et_last_fall(et_last_fall),
+          .S(S), .valid(valid), .epoch(epoch), .lost_now(lost_now),
+          .sn_rts(sn_rts), .sn_fts(sn_fts), .sn_rstale(sn_rstale), .sn_fstale(sn_fstale),
+          .sn_missed(sn_missed), .sn_last(sn_last), .sn_ord_r(sn_ord_r), .sn_ord_f(sn_ord_f)
 `ifdef FORMAL
-      , .f_cap_stage(f_snap_stage), .f_tm_r(), .f_tm_f()
+          , .f_cap_stage(f_snap_stage), .f_tm_r(), .f_tm_f()
 `endif
-  );
+      );
+    end else begin : g_no_snap
+      // Player: no snapshot, no trigger. It behaves as a Referee whose trigger
+      // never fires: S = 0 forever (WAITS can only time out, `js` is never
+      // taken), and TSGET reads "no valid snapshot": value 0, F = 1, O = 0,
+      // epoch 0 (docs/isa-timing.md 0b, diff 17).
+      assign S = 1'b0;
+      assign valid = 1'b0;
+      assign epoch = 2'd0;
+      assign lost_now = 1'b0;
+      assign sn_rts = 64'd0;
+      assign sn_fts = 64'd0;
+      assign {sn_rstale, sn_fstale, sn_missed, sn_last, sn_ord_r, sn_ord_f} = 24'd0;
+`ifdef FORMAL
+      assign f_snap_stage = 2'd0;
+`endif
+      // edge_ts's timestamps reach the Player's ports but go nowhere
+      wire _unused_et = &{1'b0, et_rise, et_fall, et_rise_ts, et_fall_ts, et_rise_stale, et_fall_stale,
+                          et_missed, et_last_fall, trig_en, trig_e, trig_ch, rel_now};
+    end
+  endgenerate
 
   integer i;
 
@@ -474,8 +665,7 @@ module engine (
 `ifndef ENGINE_FORMAL_START_RUNNING
       crc_exp_e <= 16'd0;
 `endif
-      crc_got_g <= 16'hFFFF;
-      crc_got_e <= 16'hFFFF;
+      // (crc_got_g / crc_got_e: their own block below)
       crc_fail <= 1'b0;
       start_r <= 1'b0;
       {X, Y, SR, DL, TO} <= 80'd0;
@@ -487,7 +677,7 @@ module engine (
       {trig_en, trig_e} <= 2'b00;
       trig_ch <= 2'd0;
       lost_since <= 1'b0;
-      lost <= 8'd0;
+      lost_r <= 8'd0;
       {out_ovf, vf_ovf, in_underrun, pin_fault} <= 4'd0;
       out_val <= {15{1'b1}};
       {fin_rp, fin_wp, fout_rp, fout_wp} <= 8'd0;
@@ -516,16 +706,12 @@ module engine (
       // the expected CRC is part of what the RUN check verifies: written only
       // while halted, so it can't change between RUN and the check's verdict
       if (h_crc_we && halted) crc_exp_e <= h_crc;
-      if (h_run && halted) begin
+      if (h_run && halted) begin  // (the CRCs restart from 0xFFFF: crc_init below)
         st <= ST_CHECK;
         chk_idx <= 7'd0;
-        crc_got_g <= 16'hFFFF;
-        crc_got_e <= 16'hFFFF;
       end
       start_r <= check_ok_ahead;
-      if (checking) begin
-        if (chk_idx < 7'd8) crc_got_g <= crc_g_next;
-        else crc_got_e <= crc_e_next;
+      if (checking) begin  // (the CRC updates: crc_g_step / crc_e_step below)
         chk_idx <= chk_idx + 7'd1;
         if (check_last && !start_r) begin
           st <= ST_HALTED;
@@ -585,12 +771,13 @@ module engine (
             in_underrun <= 1'b1;
           end
           OP_PUSH: if (!push_ok) out_ovf <= 1'b1;
-          OP_TRIG: begin
+          OP_TRIG:  // Player: no trigger, TRIG does nothing
+          if (REFEREE != 0) begin
             trig_en <= 1'b1;
             trig_ch <= f_ch;
             trig_e  <= f_e[0];
           end
-          OP_TSGET:
+          OP_TSGET:  // (Player: ts_val = 0, ts_f = 1, ts_o = 0, epoch = 0; see g_no_snap)
           if (f_r) begin
             Y <= ts_val; FY <= ts_f; OY <= ts_o; EY <= epoch;
           end else begin
@@ -669,7 +856,7 @@ module engine (
       fv_n <= fv_n + (judge_push ? vf_need : 4'd0) - {3'd0, host_v};
 
       // ---- lost triggers (the snapshot itself is in src/snapshot.v) ---------------
-      if (lost_now) lost <= (&lost) ? lost : lost + 8'd1;
+      if (lost_now) lost_r <= (&lost_r) ? lost_r : lost_r + 8'd1;
       // a JUDGE reports lost_since in its header's L bit and clears it in its
       // cycle 2; a trigger lost in that same cycle sets it again (set wins)
       if (lost_now) lost_since <= 1'b1;
@@ -677,7 +864,7 @@ module engine (
 
       // ---- host clears win over same-cycle sets ----------------------------------
       if (h_status_clear) {out_ovf, vf_ovf, in_underrun, pin_fault, crc_fail} <= 5'd0;
-      if (h_lost_clear) lost <= 8'd0;
+      if (h_lost_clear) lost_r <= 8'd0;
 
       // ---- host halt ------------------------------------------------------------
       if (h_halt && running) begin
@@ -688,7 +875,7 @@ module engine (
       // ---- RUN starts (highest priority) ----------------------------------------
       if (start) begin
         st <= ST_RUN;
-        crc_got_e <= crc_e_next;
+        // (crc_got_e takes crc_e_next in this cycle too: start is the last check cycle)
         {X, Y, SR} <= 48'd0;  // (pc: pc_d = 0)
         RC <= 8'd0;
         DL <= now + 16'd1;
@@ -706,7 +893,8 @@ module engine (
     end
   end
 
-  wire _unused = &{1'b0, f_n[10:0], b_lo[9:0], f_e[1], pc_q0[5:4], pc_q1[5:4], pc_q2[5:4], pc_q3[5:4]};
+  // (the copies' bits above bit 3 only exist so that every copy equals pc)
+  wire _unused = &{1'b0, f_n[10:0], b_lo[9:0], f_e[1], pc_copies, ra_copies, f_a8[7:6]};
 
 `ifdef FORMAL
   // ===========================================================================
@@ -725,7 +913,7 @@ module engine (
   // capture pending; both CRCs matched; every claimed pin owned in a driving
   // mode. (LOST, stats, FIFO contents and pin values are kept from before the
   // RUN, so their reset values are one valid case of "before".)
-  wire f_post_run = running && pc == 6'd0 && X == 16'd0 && Y == 16'd0 && SR == 16'd0 && RC == 8'd0 &&
+  wire f_post_run = running && pc == {PC_W{1'b0}} && X == 16'd0 && Y == 16'd0 && SR == 16'd0 && RC == 8'd0 &&
       DL == now && TO == now && {T, C, E, wd_stall} == 4'd0 && {FX, OX, FY, OY} == 4'd0 &&
       EX == 2'd0 && EY == 2'd0 && {trig_en, trig_e} == 2'b00 && trig_ch == 2'd0 && !lost_since &&
       {out_ovf, vf_ovf, in_underrun, pin_fault, crc_fail} == 5'd0 &&
@@ -738,13 +926,17 @@ module engine (
   wire f_wait = (op == OP_WAITD) || (op == OP_WAITP) || (op == OP_WAITS);
   wire f_halting_now = (issue && op == OP_HALT) || (h_halt && running);
   // the pc a non-waiting instruction hands over to
-  wire [5:0] f_next = (op == OP_JMP) ? f_a :
-                      (op == OP_BR && (br_flag ^ f_c[0])) ? f_a :
-                      (op == OP_LOOP && RC != 8'd0) ? f_a : pc_inc;
+  // (the jump target is the 6-bit field; straight-line code goes to pc + 1,
+  // and from the last word to 0: the Player runs 63 -> 64 -> ... -> 95 -> 0)
+  wire [PC_W-1:0] f_seq = (pc == PROG_WORDS - 1) ? {PC_W{1'b0}} : pc + 1'b1;
+  wire [PC_W-1:0] f_next = (op == OP_JMP) ? tgt :
+                           (op == OP_BR && (br_flag ^ f_c[0])) ? tgt :
+                           (op == OP_LOOP && RC != 8'd0) ? tgt : f_seq;
   wire f_set = issue && (op == OP_SET || op == OP_SHO);
   assign f_drive = (f_set && pin_ok) ? (15'd1 << f_p) : 15'd0;
   assign f_halting = f_halting_now;
 
+  localparam integer F_CPIN = (REFEREE != 0) ? 0 : 4;  // a pin this engine owns in the fast start
   (* anyconst *) reg [6:0] f_widx;  // any image word
   (* anyconst *) reg [3:0] f_pin;  // any output pin
   (* anyconst *) reg [1:0] f_slot;  // any stats slot
@@ -758,6 +950,27 @@ module engine (
     {f_push_2, f_raw_2} <= {f_push_1, f_raw_1};
     f_pass_1 <= v_pass;
   end
+  // property 14: the CRC registers in their form before 18 Nov (nested ifs in
+  // the main register block: reset, RUN accepted, one word per check cycle,
+  // and the RUN start's own update of crc_got_e)
+  reg [15:0] f_crc_g, f_crc_e;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      f_crc_g <= 16'hFFFF;
+      f_crc_e <= 16'hFFFF;
+    end else begin
+      if (h_run && halted) begin
+        f_crc_g <= 16'hFFFF;
+        f_crc_e <= 16'hFFFF;
+      end
+      if (checking) begin
+        if (chk_idx < 7'd8) f_crc_g <= crc16_word(f_crc_g, gw_data);
+        else f_crc_e <= crc16_word(f_crc_e, img_word);
+      end
+      if (start) f_crc_e <= crc16_word(f_crc_e, img_word);
+    end
+  end
+
   wire       f_want = (f_push_2 == PUSH_ALL) || ((f_push_2 == PUSH_NONPASS) && !f_pass_1);
   wire [3:0] f_need = 4'd1 + {3'd0, f_raw_2};
 
@@ -803,18 +1016,18 @@ module engine (
       if ($past(f_halting_now) && f_pin < 4'd8 && $past(od_mode[f_pin[2:0]])) assert (out_val[f_pin]);
 
       // -- 6. image writes only while halted
-      if (f_widx < 7'd64 && prog[f_widx[5:0]] != $past(prog[f_widx[5:0]]))
+      if (f_widx < PROG_WORDS && prog[f_widx[PC_W-1:0]] != $past(prog[f_widx[PC_W-1:0]]))
         assert ($past(h_we && halted && h_addr == f_widx));
-      if (f_widx >= 7'd64 && f_widx < 7'd96 && bnd[f_widx[4:0]] != $past(bnd[f_widx[4:0]]))
+      if (REFEREE != 0 && f_widx >= 7'd64 && f_widx < 7'd96 && bnd[f_widx[4:0]] != $past(bnd[f_widx[4:0]]))
         assert ($past(h_we && halted && h_addr == f_widx));
-      if (claims != $past(claims)) assert ($past(h_we && halted && h_addr == 7'd96));
+      if (claims != $past(claims)) assert ($past(h_we && halted && h_addr == CLAIMS_ADDR));
       if (crc_exp_e != $past(crc_exp_e)) assert ($past(h_crc_we && halted));
       // -- 6b. from RUN until the engine runs or the check fails (and while it
       //        runs), the image and the expected CRC are constant: the image
       //        that runs is exactly the image whose CRC the check verified
       if (!$past(halted)) begin
-        assert (prog[f_widx[5:0]] == $past(prog[f_widx[5:0]]));
-        assert (bnd[f_widx[4:0]] == $past(bnd[f_widx[4:0]]));
+        if (f_widx < PROG_WORDS) assert (prog[f_widx[PC_W-1:0]] == $past(prog[f_widx[PC_W-1:0]]));
+        if (REFEREE != 0) assert (bnd[f_widx[4:0]] == $past(bnd[f_widx[4:0]]));
         assert (claims == $past(claims));
         assert (crc_exp_e == $past(crc_exp_e));
       end
@@ -835,9 +1048,21 @@ module engine (
       // -- RUN start state: the cycle after a successful check is f_post_run
       if ($past(start)) assert (f_post_run);
 
-      // -- 12. the four pc copies that address the program read port always
-      //        equal pc (they exist only to split its fanout)
-      assert (pc_q0 == pc && pc_q1 == pc && pc_q2 == pc && pc_q3 == pc);
+      // -- 12. the pc copies that address the program read port (one per
+      //        16-word bank) always equal pc (they exist only to split its
+      //        fanout), and the pc stays inside the program (the Player's 7-bit
+      //        pc never reaches 96..127, where no bank exists)
+      assert (pc_copies == {NBANK{pc}});
+      assert (pc < PROG_WORDS);
+      // -- 12b. the readback address copies always equal ra, and during the RUN
+      //         check ra is exactly the word the check means to read
+      assert (ra_copies == {NBANK{ra[3:0]}});
+      if (checking) assert (ra == chk_idx - 7'd8);
+      // -- 14. the CRC registers, written since 18 Nov as one next-state
+      //        expression each (the gate-level X-pessimism fix above), are cycle
+      //        for cycle the registers as they were written before: f_crc_g /
+      //        f_crc_e below are exactly the old code
+      assert (crc_got_g == f_crc_g && crc_got_e == f_crc_e);
 
       // -- 8. JUDGE feeds the verdict block, in its cycle 2, exactly Y - X,
       //       invalid = FX | FY | OX | OY | (EX != EY) and bound b as of its
@@ -883,9 +1108,23 @@ module engine (
 
       // -- 9. LOST counts exactly the triggers that arrive while a snapshot is
       //       held or pending, saturating; only the host clears it
-      if ($past(h_lost_clear)) assert (lost == 8'd0);
-      else if ($past(lost_now) && $past(lost) != 8'hff) assert (lost == $past(lost) + 8'd1);
-      else assert (lost == $past(lost));
+      if ($past(h_lost_clear)) assert (lost_r == 8'd0);
+      else if ($past(lost_now) && $past(lost_r) != 8'hff) assert (lost_r == $past(lost_r) + 8'd1);
+      else assert (lost_r == $past(lost_r));
+
+      // -- 13. the Player has no referee hardware, and its referee
+      //        instructions do what docs/isa-timing.md 0b diff 17 says: S is
+      //        always 0 (so WAITS ends only by its timeout, T <- 1), JUDGE never
+      //        starts a cycle 2 (no push, stats, VERDICT_OVF), TSGET writes 0,
+      //        and the host sees no verdicts, stats or LOST
+      if (REFEREE == 0) begin
+        assert (!S && !j_v && !vf_ovf && lost == 8'd0 && vf_count == 4'd0 && stats_rdata == 16'd0);
+        assert (status[5] == 1'b0 && status[1] == 1'b0);
+        if ($past(issue) && $past(op) == OP_WAITS && $past(timed_out)) assert (T && pc == $past(pc_inc));
+        if ($past(issue) && $past(op) == OP_WAITS && !$past(timed_out)) assert (pc == $past(pc));
+        if ($past(issue) && $past(op) == OP_TSGET && !$past(start)) assert ($past(f_r) ? Y == 16'd0 : X == 16'd0);
+        assert (!et_clear_missed);
+      end
     end
     // -- 8b. the header carries the verdict of cycle 2
     if (rst_n && j_v) begin
@@ -912,10 +1151,15 @@ module engine (
     if (f_ok) begin
       cover ($past(running && wd_stall && !issue) && issue);  // a WAITD that really waited
       cover ($past(issue) && $past(op) == OP_WAITP && $past(in_bit) == $past(f_v) && $past(timed_out));  // a tie
-      cover (lost == 8'd2);
-      cover ($past(judge_push) && judge_push);  // JUDGEs back to back, both pushed
-      cover ($past(judge_push) && do_push && !vf_room);  // ... the second one finds the FIFO full
-      cover ($past(f_halting_now) && $past(od_mode[0]) && !$past(out_val[0]));  // halt releases a held-low pin
+      if (REFEREE != 0) cover (lost == 8'd2);
+      // the Player runs past word 63 by falling through, and wraps after 95
+      if (REFEREE == 0) cover (issue && pc == 7'd64);
+      if (REFEREE == 0) cover ($past(issue) && $past(pc) == 7'd95 && pc == 7'd0);
+      if (REFEREE != 0) cover ($past(judge_push) && judge_push);  // JUDGEs back to back, both pushed
+      if (REFEREE != 0) cover ($past(judge_push) && do_push && !vf_room);  // ... the second one finds the FIFO full
+      // halt releases a held-low pin (the formal fast start gives the Referee
+      // uio[0..3] and the Player uio[4..7], all open-drain: src/engine_sys.v)
+      cover ($past(f_halting_now) && $past(od_mode[F_CPIN]) && !$past(out_val[F_CPIN]));
     end
   end
 `endif

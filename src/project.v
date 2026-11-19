@@ -4,9 +4,11 @@
  *
  * Referee: programmable protocol emulator and bus referee.
  *
- * This build: one Referee engine (ISA v0.3, docs/isa-timing.md) with its
- * edge-timestamp unit, snapshot, verdict block and stats, loaded and run by a
- * host over a UART.
+ * This build: two engines of ISA v0.3 (docs/isa-timing.md), loaded and run by
+ * a host over a UART. Engine 0, the Referee (64 words), has the snapshot,
+ * verdict block, bounds, stats and VERDICT FIFO; engine 1, the Player (96
+ * words), only emulates. They share the edge-timestamp unit, the judge
+ * channels and the pins; each pin has one owner in the global config.
  *
  *   host (PC or the demo board's RP2350)
  *     -> ui_in[3] -> uart_rx -> host_port (v2) -> engine_sys -> pins
@@ -19,7 +21,9 @@
  *   ui_in[4..7]    judge channels 0..3 (default mux): input-only pads, so judging
  *                  them can't disturb the bus (non-intrusive, NI)
  *   ui_in[0..2]    engine inputs 8..10 (ui_in[3], the host RX, is input 11)
- *   uio[0..7]      engine pins 0..7: input, push-pull or open-drain (global config)
+ *   uio[0..7]      engine pins 0..7: input, push-pull or open-drain (global config);
+ *                  a judge channel can watch uio_in[k], so the Referee can judge
+ *                  a bus the Player drives
  *   uo_out[0..3,5..7]  engine pins 8..14 (push-pull)
  * Host protocol: src/host_port.v, tools/referee_host.py.
  */
@@ -82,7 +86,8 @@ module tt_um_shreyansh_referee #(
   wire [7:0] h_in_data, out_data, lost, status;
   wire [1:0] h_stats_slot;
   wire [3:0] vf_count;
-  wire in_full, out_empty, halted, running, checking, ni;
+  wire in_full, out_empty, ni, h_e;
+  wire [1:0] halted, running, checking;  // per engine
 
   host_port #(
       .DIV_RESET(CLKS_PER_BIT)
@@ -91,7 +96,7 @@ module tt_um_shreyansh_referee #(
       .rx_data(rx_data), .rx_valid(rx_valid), .rx_ferr(rx_ferr),
       .tx_data(tx_data), .tx_start(tx_start), .tx_busy(tx_busy), .div(div),
       .h_gwe(h_gwe), .h_gaddr(h_gaddr), .h_gwdata(h_gwdata), .h_grdata(h_grdata),
-      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc),
+      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc), .h_e(h_e),
       .h_we(h_we), .h_addr(h_addr), .h_wdata(h_wdata), .h_raddr(h_raddr), .h_rdata(h_rdata),
       .h_crc_we(h_crc_we), .h_crc(h_crc), .h_run(h_run), .h_halt(h_halt),
       .h_in_push(h_in_push), .h_in_data(h_in_data), .in_full(in_full),
@@ -109,7 +114,7 @@ module tt_um_shreyansh_referee #(
       .clk(clk), .rst_n(rst_s), .ui_in(ui_in), .uio_in(uio_in), .uio_out(uio_out), .uio_oe(uio_oe),
       .uo_eng(uo_eng),
       .h_gwe(h_gwe), .h_gaddr(h_gaddr), .h_gwdata(h_gwdata), .h_grdata(h_grdata),
-      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc),
+      .h_gcrc_we(h_gcrc_we), .h_gcrc(h_gcrc), .h_e(h_e),
       .h_we(h_we), .h_addr(h_addr), .h_wdata(h_wdata), .h_raddr(h_raddr), .h_rdata(h_rdata),
       .h_crc_we(h_crc_we), .h_crc(h_crc), .h_run(h_run), .h_halt(h_halt),
       .h_in_push(h_in_push), .h_in_data(h_in_data), .in_full(in_full),

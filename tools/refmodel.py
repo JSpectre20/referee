@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cycle-accurate reference model of the Referee engine subsystem (one engine).
+"""Cycle-accurate reference model of the Referee engine subsystem (two engines).
 
 Written from docs/isa-timing.md (the timing contract), not from the RTL, so the
 lockstep tests compare two independent descriptions. Encodings come from the
@@ -7,15 +7,20 @@ generated tools/isa_tables.py.
 
 What it models, per clock cycle:
   - input synchronizers for engine inputs 0..11 (uio_in[0..7], ui_in[0..3])
-  - the judge-channel mux and edge_ts (4 channels, 16-bit timestamps)
-  - the engine's snapshot (trigger, one-cycle delay, ORD window r-1..r+1, epoch, LOST)
-  - the engine: every instruction, deadlines DL/TO, flags, FIFOs, JUDGE + stats
-    (JUDGE in two cycles: issue latches its inputs; the next cycle computes the
+  - the judge-channel mux and edge_ts (4 channels, 16-bit timestamps), shared
+  - the global config (pin owner none / engine 0 / engine 1 + mode, channel mux),
+    writable only while both engines are halted
+  - engine 0, the Referee: every instruction, deadlines DL/TO, flags, FIFOs, the
+    snapshot (trigger, one-cycle delay, ORD window r-1..r+1, epoch, LOST), JUDGE +
+    stats (JUDGE in two cycles: issue latches its inputs; the next cycle computes the
     verdict and does the push, VERDICT_OVF, stats and the L clear together)
-  - images, the RUN check (CRC + pin claims), halt, open-drain release
+  - engine 1, the Player (docs/isa-timing.md 0b, diffs 17-20): the same instructions
+    with a 96-word program (pc + 1 wraps after 95; targets 0..63) and no referee
+    hardware: TRIG, REL, JUDGE do nothing, TSGET writes 0, S stays 0
+  - images, the RUN check (CRC + pin claims), halt, open-drain release, per engine
 
-Host operations are methods called between cycles; `step(ui_in, uio_in)` runs one
-cycle and returns the observable state.
+Host operations are methods called between cycles (engine ones take `e`, default 0);
+`step(ui_in, uio_in)` runs one cycle. Per-engine state is in `Model.eng[e]`.
 """
 
 import sys
@@ -23,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import isa_tables as T  # noqa: E402
-from refasm import IMAGE_WORDS, GLOBAL_WORDS, crc16, decode_word  # noqa: E402
+from refasm import ENGINES, IMAGE_WORDS, GLOBAL_WORDS, crc16, decode_word  # noqa: E402
 
 M16 = 0xFFFF
 TS_W = 16
@@ -105,16 +110,17 @@ class EdgeTs:
             self.warm += 1
 
 
-class Model:
-    def __init__(self):
-        self.now = 0
-        self.glob = [0] * GLOBAL_WORDS
+class Engine:
+    """One engine's state. `referee` False = the Player (no referee hardware)."""
+
+    def __init__(self, sysm, idx):
+        cfg = ENGINES[idx]
+        self.sys, self.idx = sysm, idx
+        self.referee = cfg["referee_hardware"]
+        self.words = cfg["program_words"]
         self.img = [0] * IMAGE_WORDS
-        self.crc_exp = [0, 0]  # global, engine
-        self.crc_got = [0, 0]
-        self.edge = EdgeTs()
-        self.sync1 = [0] * 12
-        self.sync2 = [0] * 12
+        self.crc_exp = 0
+        self.crc_got = [0, 0]  # (global, engine) as computed by this engine's last RUN check
         self.state = "halted"  # halted | check | running
         self._state0 = "halted"  # the state at the start of the last step (gates host writes)
         self.check_idx = 0
@@ -124,7 +130,7 @@ class Model:
         self.lost = 0
         self.sticky = {"OUT_OVF": 0, "VERDICT_OVF": 0, "IN_UNDERRUN": 0, "PIN_FAULT": 0}
         self.out_val = [1] * 15
-        self.ran = 0  # a RUN has started since reset: before that no pin is driven
+        self.ran = 0  # a RUN of this engine has started since reset: before that its pins are not driven
         self.j_pend = None  # a JUDGE issued last cycle: its cycle 2 runs at the start of this step
         self._popped_v = 0  # a host verdict pop happened before this step (frees room only next cycle)
         self._reset_core()
@@ -146,98 +152,19 @@ class Model:
         self.snap = None
         self.hist = [[[0, 0] for _ in range(4)] for _ in range(3)]  # pulses at c-1, c-2, c-3
 
-    # -- config decode ----------------------------------------------------
-
-    def pin_cfg(self, p):
-        nib = (self.glob[2 + p // 4] >> (4 * (p % 4))) & 0xF
-        return nib >> 2, nib & 3  # owner, mode
-
-    def mux(self, ch):
-        return (self.glob[6] >> (4 * ch)) & 0xF
-
-    def non_intrusive(self):
-        return int(all(self.mux(ch) == 0 for ch in range(4)))
-
     def owned(self, p):
-        owner, mode = self.pin_cfg(p)
-        return owner == 1 and mode != 0 and (p < 8 or mode == 1)
+        owner, mode = self.sys.pin_cfg(p)
+        return owner == self.idx + 1 and mode != 0 and (p < 8 or mode == 1)
 
     def claims_ok(self):
         mask = self.img[IMAGE_WORDS - 1]
         return all(self.owned(p) for p in range(15) if mask >> p & 1) and not mask >> 15
 
-    # -- host operations (between cycles) ---------------------------------
-
-    # Host writes are gated by the run state at the START of the cycle they
-    # arrive in (as the RTL's `halted`), so none lands during a RUN check.
-    def write_global(self, addr, word):
-        if self._state0 != "halted":
-            return False
-        self.glob[addr] = word & M16
-        return True
-
-    def write_engine(self, addr, word):
-        if self._state0 != "halted":
-            return False
-        self.img[addr] = word & M16
-        return True
-
-    def set_crc(self, sel, value):
-        if self._state0 != "halted":
-            return False
-        self.crc_exp[sel] = value & M16
-        return True
-
-    def run(self):
-        if self.state != "halted":
-            return False
-        self.state, self.check_idx = "check", 0  # called after the RUN cycle: the check starts next cycle
-        return True
-
-    def halt(self):
-        if self.state == "running":
-            self._halt()
-        elif self.state == "check":
-            self.state = "halted"
-
     def _halt(self):
         self.state = "halted"
         for p in range(8):  # release open-drain pins
-            if self.pin_cfg(p)[1] == 2:
+            if self.sys.pin_cfg(p)[1] == 2:
                 self.out_val[p] = 1
-
-    def in_push(self, b):
-        if len(self.fifo_in) >= 4:
-            return False
-        self.fifo_in.append(b & 0xFF)
-        return True
-
-    def out_pop(self):
-        return self.fifo_out.pop(0) if self.fifo_out else None
-
-    def verdict_pop(self):
-        if not self.fifo_v:
-            return None
-        self._popped_v = 1
-        return self.fifo_v.pop(0)
-
-    def stats_latch(self, slot):
-        st = self.stats[slot]
-        self.shadow = [st[0], st[1], st[2], (st[3] or 0) & M16, (st[4] or 0) & M16]
-
-    def stats_read(self, idx):
-        return getattr(self, "shadow", [0] * 5)[idx]
-
-    def stats_clear(self, slot):
-        self.stats[slot] = [0, 0, 0, None, None]
-
-    def lost_clear(self):
-        self.lost = 0
-
-    def status_clear(self):
-        for k in self.sticky:
-            self.sticky[k] = 0
-        self.crc_fail = 0
 
     def status(self):
         st = self.sticky
@@ -245,124 +172,39 @@ class Model:
                 | self.crc_fail << 4 | st["PIN_FAULT"] << 3 | st["IN_UNDERRUN"] << 2
                 | st["VERDICT_OVF"] << 1 | st["OUT_OVF"])
 
-    # -- observable outputs -----------------------------------------------
-
-    def pins(self):
-        """-> (uio_out, uio_oe, uo_out_bits) driven by the engine."""
-        uio_out = uio_oe = uo = 0
-        if not self.ran:  # nothing is driven before the first RUN since reset
-            return 0, 0, 0
-        for p in range(8):
-            owner, mode = self.pin_cfg(p)
-            if owner == 1 and mode == 1:
-                uio_oe |= 1 << p
-                uio_out |= self.out_val[p] << p
-            elif owner == 1 and mode == 2 and not self.out_val[p]:
-                uio_oe |= 1 << p
-        for k, bit in enumerate(UO_PINS):
-            p = 8 + k
-            owner, mode = self.pin_cfg(p)
-            if owner == 1 and mode == 1:
-                uo |= self.out_val[p] << bit
-        return uio_out, uio_oe, uo
-
     def observe(self):
-        uio_out, uio_oe, uo = self.pins()
         return {
             "state": self.state, "pc": self.pc, "X": self.X, "Y": self.Y, "SR": self.SR,
             "RC": self.RC, "DL": self.DL, "TO": self.TO, "T": self.T, "C": self.C, "E": self.E,
             "S": self.S, "epoch": self.epoch, "lost": self.lost,
-            "uio_out": uio_out, "uio_oe": uio_oe, "uo": uo,
             "n_in": len(self.fifo_in), "n_out": len(self.fifo_out), "n_v": len(self.fifo_v),
         }
 
-    # -- one clock cycle ----------------------------------------------------
+    # -- the RUN check (one step of it) ---------------------------------------
 
-    def step(self, ui_in, uio_in):
-        self._state0 = self.state
-        now = self.now
-        ed = self.edge
-        pulses = ed.pulses()
-        in_now = self.sync2 + [ed.s2[ch] for ch in range(4)]  # engine inputs 0..15 this cycle
-        raw_sync = [(uio_in >> i) & 1 for i in range(8)] + [(ui_in >> i) & 1 for i in range(4)]
-        raw_ch = []
-        for ch in range(4):
-            src = self.mux(ch)
-            raw_ch.append((ui_in >> (4 + ch)) & 1 if src == 0 else (uio_in >> (src - 1)) & 1)
-
-        clear_missed = False
-        start_core = False
-        rel = 0
-        # JUDGE cycle 2 for a JUDGE issued last cycle, on the state this cycle starts
-        # from (lost_since, FIFO level before this cycle's pop); a trigger lost in this
-        # same cycle sets lost_since again below (set wins over the clear)
-        jp, self.j_pend = self.j_pend, None
-        if jp is not None:
-            self._judge2(jp)
-        # Registered state at the start of the cycle: an instruction issued in this
-        # cycle (trig, halt) only takes effect from the next one.
-        was_running, trig_before = self.state == "running", self.trig
-        if self.state == "check":
-            if self.check_idx >= 0:
-                if self.check_idx == CHECK_CYCLES - 1:
-                    ok = (crc16(self.glob) == self.crc_exp[0] and crc16(self.img) == self.crc_exp[1]
-                          and self.claims_ok())
-                    self.crc_got = [crc16(self.glob), crc16(self.img)]
-                    if ok:
-                        start_core = True
-                    else:
-                        self.crc_fail = 1
-                        self.state = "halted"
-            self.check_idx += 1
-        elif self.state == "running":
-            rel = self._execute(now, in_now)
-
-        # Snapshot logic. A trigger reported in cycle r is captured in cycle r+2 from
-        # the edge_ts registers, which then hold exactly the state latched at the end
-        # of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses 3, 2, 1 cycles ago),
-        # except the trigger edge's own report in r: its order relative to the trigger
-        # is known (it is the trigger).
-        snap_next = None
-        if self.cap_stage == 2:
-            ordb = [[int(self.hist[0][i][e] or (self.hist[1][i][e] and (i, e) != self.trig_pend)
-                         or self.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
-            snap_next = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
-                         "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb}
-        hit = was_running and trig_before is not None and pulses[trig_before[0]][trig_before[1]]
-        lost_now = 0
-        new_pending = 0
-        if hit:
-            if self.S or self.cap_stage:
-                lost_now = 1
+    def _check_step(self):
+        """-> True if the check passes in this cycle (the engine starts this cycle)."""
+        start = False
+        if self.check_idx == CHECK_CYCLES - 1:
+            g = self.sys.glob
+            ok = (crc16(g) == self.sys.crc_exp_g and crc16(self.img) == self.crc_exp and self.claims_ok())
+            self.crc_got = [crc16(g), crc16(self.img)]
+            if ok:
+                start = True
             else:
-                new_pending = 1
-                self.trig_pend = trig_before
-        if snap_next is not None:
-            self.snap = snap_next
-            self.epoch = (self.epoch + 1) & 3
-            self.S, self.valid = 1, 1
-        elif rel:
-            self.S = 0
-        self.cap_stage = 1 if new_pending else (2 if self.cap_stage == 1 else 0)
-        if lost_now:
-            self.lost = min(self.lost + 1, 255)
-            self.lost_since = 1
+                self.crc_fail = 1
+                self.state = "halted"
+        self.check_idx += 1
+        return start
 
-        if start_core:
-            self.ran = 1
-            self.state = "running"
-            self._reset_core()
-            self.DL = self.TO = (now + 1) & M16
-            for k in self.sticky:
-                self.sticky[k] = 0
-            self.crc_fail = 0
-            clear_missed = True
-
-        self.hist = [pulses, self.hist[0], self.hist[1]]
-        ed.commit(now, pulses, raw_ch, clear_missed)
-        self.sync2, self.sync1 = list(self.sync1), raw_sync
-        self.now = (now + 1) & M16
-        self._popped_v = 0
+    def _start(self, now):
+        self.ran = 1
+        self.state = "running"
+        self._reset_core()
+        self.DL = self.TO = (now + 1) & M16
+        for k in self.sticky:
+            self.sticky[k] = 0
+        self.crc_fail = 0
 
     # -- the engine ----------------------------------------------------------
 
@@ -372,7 +214,7 @@ class Model:
             return 0
         self.wd_stall = 0
         m, f = decode_word(self.img[self.pc])
-        nxt = (self.pc + 1) & 63
+        nxt = (self.pc + 1) % self.words  # the Player runs 63 -> 64 .. 95 -> 0
         rel = 0
         if m is None or m == "nop":
             pass
@@ -404,6 +246,7 @@ class Model:
             self.DL = (self.DL + f["n"]) & M16
             self.wd_stall = 1
         elif m in ("waitp", "waits"):
+            # (the Player's S is always 0: its WAITS ends only by the timeout)
             ev = (inp[f["q"]] == f["v"]) if m == "waitp" else bool(self.S)
             if ev:
                 self.T = 0
@@ -443,12 +286,13 @@ class Model:
             else:
                 self.sticky["OUT_OVF"] = 1
         elif m == "trig":
-            self.trig = (f["ch"], f["e"] & 1)
+            if self.referee:  # Player: no trigger
+                self.trig = (f["ch"], f["e"] & 1)
         elif m == "rel":
-            rel = 1
+            rel = int(self.referee)  # Player: S is always 0 anyway
         elif m == "tsget":
             ch, e = f["ch"], f["e"]
-            sn = self.snap
+            sn = self.snap  # the Player never has one: 0, F = 1, O = 0, epoch 0
             if sn is None:
                 val, F, O = 0, 1, 0
             else:
@@ -460,7 +304,8 @@ class Model:
             setattr(self, reg, val)
             self.tag[reg] = [F, O, self.epoch]
         elif m == "judge":
-            self._judge(f)
+            if self.referee:  # Player: nothing at all
+                self._judge(f)
         self.pc = nxt
         return rel
 
@@ -472,7 +317,8 @@ class Model:
         self.j_pend = {
             "m": s16(self.Y - self.X), "fx": fx, "fy": fy, "ord": int(ox or oy), "tagbad": int(ex != ey),
             "invalid": int(fx or fy or ox or oy or ex != ey), "b": b, "raw": f["raw"], "push": f["push"],
-            "w_hi": self.img[64 + 2 * b], "w_lo": self.img[65 + 2 * b], "ni": self.non_intrusive(),
+            "w_hi": self.img[self.words + 2 * b], "w_lo": self.img[self.words + 1 + 2 * b],
+            "ni": self.sys.non_intrusive(),
         }
 
     def _judge2(self, jp):
@@ -505,3 +351,224 @@ class Model:
             else:
                 self.sticky["VERDICT_OVF"] = 1
         self.lost_since = 0
+
+
+class Model:
+    """The subsystem: shared time base, inputs, edge_ts and global config; eng[0] the
+    Referee, eng[1] the Player."""
+
+    def __init__(self):
+        self.now = 0
+        self.glob = [0] * GLOBAL_WORDS
+        self.crc_exp_g = 0
+        self.edge = EdgeTs()
+        self.sync1 = [0] * 12
+        self.sync2 = [0] * 12
+        self.eng = [Engine(self, e) for e in range(len(ENGINES))]
+        self.ref = self.eng[0]
+
+    # -- config decode ----------------------------------------------------
+
+    def pin_cfg(self, p):
+        nib = (self.glob[2 + p // 4] >> (4 * (p % 4))) & 0xF
+        return nib >> 2, nib & 3  # owner (0 none, 1 engine 0, 2 engine 1, 3 none), mode
+
+    def mux(self, ch):
+        return (self.glob[6] >> (4 * ch)) & 0xF
+
+    def non_intrusive(self):
+        return int(all(self.mux(ch) == 0 for ch in range(4)))
+
+    def all_halted0(self):
+        return all(e._state0 == "halted" for e in self.eng)
+
+    # -- host operations (between cycles) ---------------------------------
+
+    # Host writes are gated by the run state at the START of the cycle they
+    # arrive in (as the RTL's `halted`), so none lands during a RUN check. The
+    # global config (and its CRC) needs BOTH engines halted.
+    def write_global(self, addr, word):
+        if not self.all_halted0():
+            return False
+        self.glob[addr] = word & M16
+        return True
+
+    def write_engine(self, addr, word, e=0):
+        if self.eng[e]._state0 != "halted":
+            return False
+        self.eng[e].img[addr] = word & M16
+        return True
+
+    def set_crc(self, sel, value):
+        """sel 0 = global, 1 + e = engine e (as the host's 'C' command)."""
+        if sel == 0:
+            if not self.all_halted0():
+                return False
+            self.crc_exp_g = value & M16
+            return True
+        en = self.eng[sel - 1]
+        if en._state0 != "halted":
+            return False
+        en.crc_exp = value & M16
+        return True
+
+    def run(self, e=0):
+        en = self.eng[e]
+        if en.state != "halted":
+            return False
+        en.state, en.check_idx = "check", 0  # called after the RUN cycle: the check starts next cycle
+        return True
+
+    def halt(self, e=0):
+        en = self.eng[e]
+        if en.state == "running":
+            en._halt()
+        elif en.state == "check":
+            en.state = "halted"
+
+    def in_push(self, b, e=0):
+        en = self.eng[e]
+        if len(en.fifo_in) >= 4:
+            return False
+        en.fifo_in.append(b & 0xFF)
+        return True
+
+    def out_pop(self, e=0):
+        en = self.eng[e]
+        return en.fifo_out.pop(0) if en.fifo_out else None
+
+    # Referee only (engine 0): verdicts, stats, LOST
+    def verdict_pop(self):
+        r = self.ref
+        if not r.fifo_v:
+            return None
+        r._popped_v = 1
+        return r.fifo_v.pop(0)
+
+    def stats_latch(self, slot):
+        st = self.ref.stats[slot]
+        self.ref.shadow = [st[0], st[1], st[2], (st[3] or 0) & M16, (st[4] or 0) & M16]
+
+    def stats_read(self, idx):
+        return getattr(self.ref, "shadow", [0] * 5)[idx]
+
+    def stats_clear(self, slot):
+        self.ref.stats[slot] = [0, 0, 0, None, None]
+
+    def lost_clear(self):
+        self.ref.lost = 0
+
+    def status_clear(self, e=0):
+        en = self.eng[e]
+        for k in en.sticky:
+            en.sticky[k] = 0
+        en.crc_fail = 0
+
+    def status(self, e=0):
+        return self.eng[e].status()
+
+    # -- observable outputs -----------------------------------------------
+
+    def pins(self):
+        """-> (uio_out, uio_oe, uo_out_bits): each pin follows its owner, once that
+        owner has had a RUN start since reset."""
+        uio_out = uio_oe = uo = 0
+        for p in range(8):
+            owner, mode = self.pin_cfg(p)
+            if owner not in (1, 2) or not self.eng[owner - 1].ran:
+                continue
+            val = self.eng[owner - 1].out_val[p]
+            if mode == 1:
+                uio_oe |= 1 << p
+                uio_out |= val << p
+            elif mode == 2 and not val:
+                uio_oe |= 1 << p
+        for k, bit in enumerate(UO_PINS):
+            p = 8 + k
+            owner, mode = self.pin_cfg(p)
+            if owner in (1, 2) and self.eng[owner - 1].ran and mode == 1:
+                uo |= self.eng[owner - 1].out_val[p] << bit
+        return uio_out, uio_oe, uo
+
+    def observe(self, e=0):
+        uio_out, uio_oe, uo = self.pins()
+        return dict(self.eng[e].observe(), uio_out=uio_out, uio_oe=uio_oe, uo=uo)
+
+    # -- one clock cycle ----------------------------------------------------
+
+    def step(self, ui_in, uio_in):
+        for en in self.eng:
+            en._state0 = en.state
+        now = self.now
+        ed = self.edge
+        ref = self.ref
+        pulses = ed.pulses()
+        in_now = self.sync2 + [ed.s2[ch] for ch in range(4)]  # engine inputs 0..15 this cycle
+        raw_sync = [(uio_in >> i) & 1 for i in range(8)] + [(ui_in >> i) & 1 for i in range(4)]
+        raw_ch = []
+        for ch in range(4):
+            src = self.mux(ch)
+            raw_ch.append((ui_in >> (4 + ch)) & 1 if src == 0 else (uio_in >> (src - 1)) & 1)
+
+        # JUDGE cycle 2 for a JUDGE issued last cycle, on the state this cycle starts
+        # from (lost_since, FIFO level before this cycle's pop); a trigger lost in this
+        # same cycle sets lost_since again below (set wins over the clear)
+        jp, ref.j_pend = ref.j_pend, None
+        if jp is not None:
+            ref._judge2(jp)
+        # Registered state at the start of the cycle: an instruction issued in this
+        # cycle (trig, halt) only takes effect from the next one.
+        was_running, trig_before = ref.state == "running", ref.trig
+        starts, rel = [], 0
+        for en in self.eng:
+            if en.state == "check":
+                if en._check_step():
+                    starts.append(en)
+            elif en.state == "running":
+                r = en._execute(now, in_now)
+                if en is ref:
+                    rel = r
+
+        # Snapshot logic (the Referee only). A trigger reported in cycle r is captured
+        # in cycle r+2 from the edge_ts registers, which then hold exactly the state
+        # latched at the end of r+1. ORD marks edges latched in r-1, r, r+1 (= pulses
+        # 3, 2, 1 cycles ago), except the trigger edge's own report in r: its order
+        # relative to the trigger is known (it is the trigger).
+        snap_next = None
+        if ref.cap_stage == 2:
+            ordb = [[int(ref.hist[0][i][e] or (ref.hist[1][i][e] and (i, e) != ref.trig_pend)
+                         or ref.hist[2][i][e]) for e in (0, 1)] for i in range(4)]
+            snap_next = {"ts": [list(t) for t in ed.ts], "stale": [list(x) for x in ed.stale],
+                         "last": list(ed.last_fall), "missed": list(ed.missed), "ord": ordb}
+        hit = was_running and trig_before is not None and pulses[trig_before[0]][trig_before[1]]
+        lost_now = 0
+        new_pending = 0
+        if hit:
+            if ref.S or ref.cap_stage:
+                lost_now = 1
+            else:
+                new_pending = 1
+                ref.trig_pend = trig_before
+        if snap_next is not None:
+            ref.snap = snap_next
+            ref.epoch = (ref.epoch + 1) & 3
+            ref.S, ref.valid = 1, 1
+        elif rel:
+            ref.S = 0
+        ref.cap_stage = 1 if new_pending else (2 if ref.cap_stage == 1 else 0)
+        if lost_now:
+            ref.lost = min(ref.lost + 1, 255)
+            ref.lost_since = 1
+
+        # RUN starts. Only the Referee's clears edge_ts's `missed` (0b, diffs 3, 20).
+        clear_missed = False
+        for en in starts:
+            en._start(now)
+            clear_missed |= en.referee
+
+        ref.hist = [pulses, ref.hist[0], ref.hist[1]]
+        ed.commit(now, pulses, raw_ch, clear_missed)
+        self.sync2, self.sync1 = list(self.sync1), raw_sync
+        self.now = (now + 1) & M16
+        for en in self.eng:
+            en._popped_v = 0

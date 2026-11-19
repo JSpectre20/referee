@@ -70,12 +70,12 @@ codes) wait for long-interval timestamps.
 
 | Part | State |
 | --- | --- |
-| Engines | **One engine today.** Two are planned: a "Referee" (this engine) and a leaner "Player" that only emulates, so the chip can speak a protocol and judge a bus at the same time |
+| Engines | **Two in the RTL (17 November), not yet hardened:** the "Referee" (the one-engine chip's engine, unchanged) and a leaner "Player" (96-word program, no judging hardware) that only emulates, so the chip can speak a protocol and judge a bus at the same time. A chip-level test runs the I2C controller on the Player and judges its bus on the Referee |
 | Firmware that runs today (in simulation) | UART transmit and receive; I2C controller (400 kHz, clock stretching); SPI controller, modes 0 to 3; an I2C setup-time referee |
 | Not there yet | I2C and SPI targets, parity and CRC (so no UART parity, CAN or USB yet), the full set of I2C timing rules, the per-bus guard band |
-| Tests | 14 chip-level tests through the pins (cocotb), including an independent oracle that checks every verdict against the interval it generated; 24 unit tests, including the engine RTL run in lockstep with a reference model (the model's tables and the RTL's are generated from the same ISA file). One of the 24 covers `seq`, an earlier sequencer that is no longer in the chip |
+| Tests | 17 chip-level tests through the pins (cocotb), including an independent oracle that checks every verdict against the interval it generated; 24 unit tests, including the engine RTL run in lockstep with a reference model (the model's tables and the RTL's are generated from the same ISA file). One of the 24 covers `seq`, an earlier sequencer that is no longer in the chip |
 | Proofs | verdict soundness, edge timestamps, engine properties, UART; each has negative controls that must fail |
-| Hardening | One engine on 8x4 tiles, the competition's final size: hardening, the Tiny Tapeout precheck and the gate-level tests pass (13 November). 60 MHz is met at the slow corner with +2.7 ns (typical +7.8 ns), hold is clean, and the design uses 34.5% of the core (25,392 cells). The first 8x4 run missed the slow corner by 0.41 ns on one group of paths; an RTL change (instruction fetch got its own read path) fixed it |
+| Hardening | (The numbers below are the one-engine chip; a local synthesis estimate for two engines is about 55% of the core.) One engine on 8x4 tiles, the competition's final size: hardening, the Tiny Tapeout precheck and the gate-level tests pass (13 November). 60 MHz is met at the slow corner with +2.7 ns (typical +7.8 ns), hold is clean, and the design uses 34.5% of the core (25,392 cells). The first 8x4 run missed the slow corner by 0.41 ns on one group of paths; an RTL change (instruction fetch got its own read path) fixed it |
 | Real hardware | none yet: no chip, no FPGA run, no bench measurement |
 
 ## Try it
@@ -88,7 +88,7 @@ Simulation needs Python 3.11 or newer, `make` and
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r test/requirements.txt
 
-cd test && make                                     # 14 chip-level tests, a few minutes
+cd test && make                                     # 17 chip-level tests, a few minutes
 pytest tools engine seq uart edge_ts -q             # unit and lockstep tests
 cd ../formal && sby -f engine.sby                   # engine properties, under a minute
 sby -j 4 -f verdict.sby                             # verdict soundness, about 30 minutes

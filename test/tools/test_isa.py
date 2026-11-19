@@ -157,7 +157,7 @@ def test_model_refuses_bad_crc_and_unowned_pins():
     md.run()
     for _ in range(120):
         md.step(0, 0)
-    assert md.state == "halted" and md.crc_fail
+    assert md.ref.state == "halted" and md.ref.crc_fail
     a = refasm.Assembler(60e6)
     img = a.image(a.assemble("set 3, 1"))  # claims pin 3, not owned
     md = Model()
@@ -169,7 +169,7 @@ def test_model_refuses_bad_crc_and_unowned_pins():
     md.run()
     for _ in range(120):
         md.step(0, 0)
-    assert md.state == "halted" and md.crc_fail
+    assert md.ref.state == "halted" and md.ref.crc_fail
 
 
 def test_model_uart_tx_edges_at_t0_plus_2_plus_k_bit():
@@ -182,7 +182,7 @@ def test_model_uart_tx_edges_at_t0_plus_2_plus_k_bit():
         before = md.observe()
         md.step(cts_low, 0)
         trace.append(md.pins()[0] & 1)
-        if mark_cycle is None and before["state"] == "running" and md.DL == md.now - 1 and before["pc"] == 5:
+        if mark_cycle is None and before["state"] == "running" and md.ref.DL == md.now - 1 and before["pc"] == 5:
             mark_cycle = md.now - 1  # cycle in which MARK issued (pc 5 in uart_tx.s)
     assert mark_cycle is not None
     # trace[c] is the pad level in cycle c+1. Expected: start bit from t0+2, bit k from t0+2+k*BIT.
@@ -215,7 +215,7 @@ def test_model_spi_sck_half_periods_exact(cpha, cpol, half, cycles):
         md.step(0, 0)
         uio = md.pins()[0]
         sck, cs = uio >> 4 & 1, uio >> 6 & 1
-        if cs == 0 and md.ran:
+        if cs == 0 and md.ref.ran:
             cs_seen_low = True
             if prev is not None and sck != prev:
                 edges.append((c, sck))
@@ -232,3 +232,64 @@ def test_model_spi_sck_half_periods_exact(cpha, cpol, half, cycles):
         if k:
             gap = byte[0][0] - edges[16 * k - 1][0]
             assert gap >= cycles, f"byte {k}: gap {gap} < HALF"
+
+
+# -----------------------------------------------------------------------------
+# Two engines: the Player (engine 1)
+# -----------------------------------------------------------------------------
+
+
+def test_player_image_layout_and_limits():
+    """The Player's image is 96 program words + the claimed-pin mask (97, like the
+    Referee's), no bounds; targets stay below 64 (words 64..95 by fall-through only)."""
+    a = refasm.Assembler(60e6, refasm.PLAYER)
+    src = "set 2, 1\n" + "nop\n" * 62 + "x: set 5, 0\n" + "nop\n" * 31 + "jmp 0\n"
+    words = a.assemble(src)
+    assert len(words) == 96
+    img = a.image(words)
+    assert len(img) == refasm.IMAGE_WORDS == 97 and img[:96] == words and img[96] == (1 << 2) | (1 << 5)
+    short = a.image(a.assemble("nop"))
+    assert short[1:96] == [refasm.HALT_WORD] * 95, "unused Player words are HALT"
+    with pytest.raises(refasm.AsmError, match="beyond word 63"):
+        refasm.Assembler(None, refasm.PLAYER).assemble("nop\n" * 64 + "x: nop\njmp x")
+    with pytest.raises(refasm.AsmError, match="no bounds table"):
+        refasm.Assembler(60e6, refasm.PLAYER).assemble(".bound 0, min, 100ns\nnop")
+    with pytest.raises(refasm.AsmError, match="holds 96"):
+        refasm.Assembler(None, refasm.PLAYER).assemble("nop\n" * 97)
+    with pytest.raises(refasm.AsmError, match="holds 64"):
+        refasm.Assembler(None, refasm.REFEREE).assemble("nop\n" * 65)
+    b = refasm.Assembler(None, refasm.PLAYER)
+    b.assemble("trig 0, rise\nwaits\njudge 0")
+    assert sum("on the Player" in n for n in b.notes) == 3, "referee instructions are reported"
+
+
+def test_model_player_semantics():
+    """The model's Player: WAITS times out (T = 1) at the same cycle a Referee WAITS with no
+    snapshot would, TSGET writes 0, TRIG / REL / JUDGE do nothing, S stays 0, the pc runs
+    63 -> 64 -> ... -> 95 -> 0, and its RUN does not clear edge_ts `missed`."""
+    head = "ldsr 0xAB\nldrc 5\ntsget X, 0, rise\ntrig 1, rise\nrel\njudge 0, raw\ntmon 20\nwaits\n"
+    traces = []
+    for e in (refasm.REFEREE, refasm.PLAYER):
+        a = refasm.Assembler(60e6, e)
+        img = a.image(a.assemble(head + "nop\n" * (a.words_max - 8)))  # straight line to the last word
+        md = Model()
+        g = refasm.global_image({})
+        for i, w in enumerate(g):
+            md.write_global(i, w)
+        for i, w in enumerate(img):
+            md.write_engine(i, w, e)
+        md.set_crc(0, refasm.crc16(g))
+        md.set_crc(1 + e, refasm.crc16(img))
+        md.run(e)
+        en, t = md.eng[e], []
+        for _ in range(400):  # 106 check cycles, then two passes through the program
+            md.step(0, 0)
+            t.append((en.pc, en.T, en.S, en.X))
+        traces.append((md, en, t))
+    (mr, r, tr), (mp, p, tp) = traces
+    n63 = [x[0] for x in tp].index(63)
+    assert [x[:2] for x in tr[:n63 + 1]] == [x[:2] for x in tp[:n63 + 1]], "same timing until the pc passes 63"
+    assert p.T == 1 and p.S == 0 and p.X == 0 and not p.fifo_v and mp.ref.stats[0][:3] == [0, 0, 0]
+    pcs = [x[0] for x in tp]
+    assert 64 in pcs and 95 in pcs and pcs[pcs.index(95) + 1] == 0, "Player: 63 -> 64 .. 95 -> 0"
+    assert all(x[0] < 64 for x in tr), "Referee: 63 -> 0"

@@ -156,3 +156,19 @@ def test_spi_frame():
 def test_cli_parses():
     with pytest.raises(SystemExit):  # --port is required; the subcommands exist
         host.main(["i2c-write", "50", "10", "a5"])
+
+
+def test_two_engine_packets():
+    """Engine numbers in the packets (src/host_port.v): W carries e in A[7]; r / C take
+    sel 1 + e; loading the global config halts both engines first; an engine-only load
+    halts only that engine and leaves the config alone."""
+    assert host.pkt_write_engine(5, 0x1234, e=1) == bytes([0x57, 0x85, 0x12, 0x34])
+    assert host.pkt_run(True, host.PLAYER) == bytes([0x52, 1, 1, 0])
+    img = [0] * 97
+    pk = host.load_packets(host.refasm.global_image(), img, e=1)
+    assert pk[:2] == [host.pkt_run(False, 0), host.pkt_run(False, 1)], "the config needs both halted"
+    assert pk[-1] == host.pkt_crc(2, host.refasm.crc16(img)), "sel 2 = engine 1"
+    pe = host.load_engine_packets(img, 1)
+    assert pe[0] == host.pkt_run(False, 1) and not any(p[0] == 0x47 for p in pe), "no global writes"
+    assert host.pin_config("2:od,3:od", 1) == {2: (2, 2), 3: (2, 2)}
+    assert host.mux_config("0:uio3,1:uio2") == [4, 3, 0, 0]
