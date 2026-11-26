@@ -31,8 +31,9 @@ protocol nobody planned for, is a new program, not a new chip (section 7).
 
 ## 2. What is on the chip
 
-**On `main` today** (one engine, ISA v0.3; hardened green at 8x4 tiles, 60 MHz, +2.7 ns of slack at
-the slow corner, 34.5% of the core; simulation only, no silicon or FPGA run yet):
+**The one-engine chip** (ISA v0.3; hardened green on 13 November at 8x4 tiles, 60 MHz, +2.7 ns of
+slack at the slow corner, 34.5% of the core; simulation only, no silicon or FPGA run yet; on `main`
+until 26 November, now the Referee half of the two-engine chip below):
 
 ```
  host PC / demo board ── UART ──> host port ──> engine ──> pins (uio, uo_out)
@@ -55,14 +56,16 @@ the slow corner, 34.5% of the core; simulation only, no silicon or FPGA run yet)
 - **Pin ownership and checked images.** Each image carries a CRC, and RUN refuses an image that
   fails it or claims a pin it does not own. No pin is driven before the first successful RUN.
 
-**Two engines, on a branch (17-18 November; pull request open, not merged).** One parameterized
+**Two engines (17-19 November; merged into `integration` and `main` on 26 November).** One parameterized
 engine module, built twice: the **Referee** (the engine above, 64 words, all judging hardware) and
 a lean **Player** (96 words, no snapshot, verdict block, bounds or stats), so the chip can speak a
 protocol and judge a bus at once. Locally: 17 of 17 chip tests, 39 unit and lockstep tests and the
 formal tasks pass. Hardening (section 12): the first run missed 60 MHz by 1.77 ns, the fix moved
-that to 0.19 ns on one endpoint, and the second fix (a registered readback address) meets 60 MHz
-with +1.80 ns at the slow corner, 54.5% of the core, in 1 h 44 min (run 44309280727). Its
-gate-level test failed, 12 of 17 (ledger rows 30 and 31); the fixes are in progress.
+that to 0.19 ns on one endpoint, and the second fix (a registered readback address) met 60 MHz
+(+1.80 ns) but its gate-level test failed, 12 of 17 (ledger rows 30 and 31). With both fixed, run
+44425384876 (19 November) is green throughout: +1.34 ns at the slow corner at 60 MHz, 54.4% of the
+core, a 1 h 43 min build, precheck, and the gate-level tests with every flip-flop starting at X and
+with them starting at 0, at 1 and at random.
 
 **An FPGA build** (merged into `integration` on 17 November, `fpga/`): the current one-engine chip,
 unchanged, at 60 MHz in a Zynq-7020 (ZedBoard first, PYNQ-Z2 from the same script), judging a real
@@ -141,7 +144,7 @@ model (section 4) and a reviewer's own check; they are not formally proved.
 | Formal, cycle level | engine properties (one cycle per instruction, deadlines, pins change only one cycle after `set` and only if owned, no image write while running, the snapshot equals the timestamp state of the right cycle); for two engines also the Player's configuration and per-engine "ran" | the timing contract firmware relies on |
 | Lockstep | the RTL against a cycle-accurate reference model on random programs, every cycle | two independent descriptions: the model is written from the spec, not the RTL |
 | Generated ISA | one YAML file generates the RTL constants, the assembler tables, the model's tables and the instruction table in the docs | nothing can drift apart |
-| Chip tests | cocotb tests through the pins (14 on `main`, 13 of them also on the gate-level netlist in CI; 17 on the two-engine branch, RTL), including an independent oracle that checks every verdict against the interval the test generated, with late-resolving samples | end to end |
+| Chip tests | cocotb tests through the pins (14 on the one-engine chip, 13 of them also on its gate-level netlist; 17 on the two-engine chip, all of them also on its gate-level netlist in CI except one timing-only test, with flip-flops starting at X, 0, 1 and random), including an independent oracle that checks every verdict against the interval the test generated, with late-resolving samples | end to end |
 | Firmware on the model | every protocol program against a device model written from the protocol, with negative controls (a bit time 3% off, the wrong clock phase) | a program counts only if an independent device accepts it |
 | Referee programs | random traffic with intervals drawn around every bound; an oracle that reads the waveform alone; fuzzing with glitchy waveforms; a slow-edge model in which the pads see each edge where their threshold is crossed | a verdict about the wrong pair of edges is the worst failure a referee can have |
 | Guard-band brute force | see below | the guard formulas must not share their assumptions with their test |
@@ -235,9 +238,10 @@ ISA v1.0 tag on 21 November). **Everything in this section is in the model, not 
   I2C referee then used 96 of 96, leaving no room for a firmware fix after the freeze): 128 if a
   local synthesis estimate of the full v1 projects a build under about 4 hours with at least +1 ns
   of slack, otherwise 112. The Player stays at 96. The RTL change needs another hardening run.
-- **In progress: a stateless I2C referee.** The current I2C referee (82 words, model only) keeps
-  one bit of protocol state. The next version is to read that from the snapshot with J too, so that
-  an ambiguous event skips its own verdict instead of poisoning those after it. Not finished.
+- **The stateless I2C referee (in the model; under independent review, not yet committed).** The
+  earlier referee (82 words) kept one bit of protocol state; the stateless one reads it from the
+  snapshot with J, so an ambiguous event skips its own verdict instead of poisoning those after it.
+  With the STOP fix, candidate M and the per-channel short-level threshold it is 102 words.
 - **A stated limit:** a firmware referee needs about 14 cycles between events, so it follows SPI
   only up to about 2.1 MHz SCK, the same at queue depths 1 and 2. Fast SPI judging is out of scope.
 
@@ -340,7 +344,7 @@ the generated programs must pass the same tests; rules that need state stay hand
 labelled as such. The time-boxed firmware proof is to target the generated template (sound for any
 channels and bound), not one hand-written program; a bounded proof is the honest fallback.
 
-**Planned (after the 7 December RTL freeze): 4-5 new referees written from datasheets as tables**,
+**Planned (after the 14 December RTL freeze): 4-5 new referees written from datasheets as tables**,
 on the frozen design: UART bit timing, 1-Wire, SMBus, WS2812 and CAN bit timing, with the hours and
 lines each took logged. That is the test of the thesis: rules written after the hardware was fixed.
 
@@ -382,9 +386,9 @@ corrected, and how, is part of the method.
 | 27 | The SDA event's early release relied on two one-cycle relations no spec text stated (`waitp` sees an edge in the cycle the timestamp unit reports it; an edge reported in cycle k sets W before a branch in cycle k + 1) | review 5 (shifting either by one cycle gives 16-20 wrong-pair PASS verdicts) | an RTL faithful to the written spec could be unsound | both relations written into the spec and the ISA tables; a lockstep / formal property in RTL v1 (in progress) |
 | 28 | Stale spec text that the RTL would be written from: the branch-on-W definition, the trigger text from v0.3, "W is final after BUS_W cycles" (false when the receiver window is longer), two different flop counts for W | review 5 | RTL built from an old definition | corrected before the v1.0 tag (in progress) |
 | 29 | Measurement 2's headline (96.3%, target 95%) combined two widened definitions: a band extension (a START / STOP whose own SCL fall is in the 300 ns band) and a new "u" category (gross violations within the verdict rule's own uncertainty); with the strict 300 ns band alone it is 89.8%. The slow bus's misses were wrongly explained by edge spacing; most sit inside bound 12's own guard band | review 5's recomputation | a target met by redefining the measurement | all three numbers reported with their definitions: 89.8% (strict band), 94.4% (with the band extension), 96.3% (also excluding "u"); "u" kept only if it is exactly the edges within the proved ordering window, to be confirmed by measurement; the slow-bus cause corrected in section 6 with the next model commit (in progress) |
-| 30 | A NAKed host command still returned a data byte read from image memory; a test passed only because earlier tests had written that memory | the first two-engine gate-level run (12 of 17 tests failed), then running each test alone | stale memory in host replies; a test suite that depended on its order | every NAK carries a defined data byte (spec diff 23); every chip test passes on its own (in progress) |
-| 31 | Gate-level X pessimism: one bit of the Referee's CRC register stayed X through reset (the synthesized reset path computes NOT(q AND NOT q): 1 in silicon, X in simulation), so the RUN check could not be shown at gate level | the same gate-level run, diagnosed in a local gate-level simulation (the first failing test, `no_pin_driven_before_first_run`, passes with flip-flops powering up 0 and with 1) | none in silicon, but a gate that could not show the RUN check | the register rewritten so its reset does not depend on its own output; the X-start gate-level run stays required, plus runs starting at 0, at 1 and at random values; any future case is an explicit reviewed per-flop waiver, never a relaxed gate (in progress) |
-| 32 | Planning mistakes in our own plan, caught by checking it against the code: the cost of a 128-word Referee was estimated at +25k µm² from 96 words; the RTL Referee has 64. Claude's first correction (about +50k) was also too low: a local synthesis (64 vs 80 words, every address still in range) gives about 1,290 µm² per word before hardening, about 1,580 after (each word has a write enable and two read ports), so +64 words is about +100k µm², 54.5% to about 63% of the core before the other v1 additions. Also, the rule-table front end was scheduled before RTL v1 | Claude's check of the plan against the code, then a synthesis measurement | an area overrun; hardware work squeezed against the 7 December freeze | a local synthesis estimate of the full v1 decides 112 or 128 words; RTL v1 before the front end (software keeps improving after the freeze) |
+| 30 | A NAKed host command still returned a data byte read from image memory; a test passed only because earlier tests had written that memory | the first two-engine gate-level run (12 of 17 tests failed), then running each test alone | stale memory in host replies; a test suite that depended on its order | every NAK's data byte is the command byte (spec diff 23; a refused RUN replies 15 52); every NAK in every chip test is checked; every chip test also runs on its own (17 single runs pass); the new checks fail on the old RTL and on the old netlist; hardening run 44425384876 green |
+| 31 | Gate-level X pessimism: one bit of the Referee's CRC register stayed X through reset (the synthesized reset path computes NOT(q AND NOT q): 1 in silicon, X in simulation), so the RUN check could not be shown at gate level | the same gate-level run, diagnosed in a local gate-level simulation (the first failing test, `no_pin_driven_before_first_run`, passes with flip-flops powering up 0 and with 1) | none in silicon, but a gate that could not show the RUN check | the CRC registers rewritten as one next-state expression each, the seed forced through its own term with the update nets kept as a synthesis cut point (cycle-identical: formal property 14, a mutant fails it); gate-level tests also run with flip-flops powering up at 0, at 1 and at random (two fixed seeds); the X-start run stays required; any future case needs an explicit, reviewed per-flop waiver, never a relaxed gate. Hardening run 44425384876: the X-start run and all four power-up runs pass |
+| 32 | Planning mistakes in our own plan, caught by checking it against the code: the cost of a 128-word Referee was estimated at +25k µm² from 96 words; the RTL Referee has 64. Claude's first correction (about +50k) was also too low: a local synthesis (64 vs 80 words, every address still in range) gives about 1,290 µm² per word before hardening, about 1,580 after (each word has a write enable and two read ports), so +64 words is about +100k µm², 54.5% to about 63% of the core before the other v1 additions. Also, the rule-table front end was scheduled before RTL v1 | Claude's check of the plan against the code, then a synthesis measurement | an area overrun; hardware work squeezed against the then-planned 7 December freeze (now 14 December) | a local synthesis estimate of the full v1 decides 112 or 128 words; RTL v1 before the front end (software keeps improving after the freeze) |
 
 ## 9. Independent review
 
@@ -444,9 +448,9 @@ is where the AI's part is stated.
 
 - No silicon and, so far, no FPGA or real-bus run. The FPGA build exists but has not been through
   Vivado or onto a board.
-- The two-engine chip meets 60 MHz (+1.80 ns at the slow corner, 54.5% of the area, run
-  44309280727), but its gate-level test failed (12 of 17): one real bug (ledger row 30) and one
-  gate-level X-pessimism case (row 31). Both fixes are in progress; PR #15 is not merged.
+- The two-engine chip is ISA v0.3: the ISA v1 work (section 5) is in the model, not yet in the RTL.
+  The two-engine build itself is green (+1.34 ns at 60 MHz, 54.4%, gate level included; run
+  44425384876).
 - **Soundness holds within the declared bus envelope only**: every edge completes, monotonically,
   within the declared rise / fall time, and every level reaches VIL / VIH. A runt or a bounce outside
   it can be misjudged with no flag (row 24); no digital pad can see a level stopping at 60% of the
@@ -487,19 +491,25 @@ is where the AI's part is stated.
 | 13 November | one engine hardened green at 8x4 and 60 MHz (+2.7 ns), with precheck and gate-level tests |
 | 17 November | FPGA build for ZedBoard / PYNQ-Z2 merged (not yet run on a board); two engines in RTL (pull request open); ISA v1 spec closure in the model |
 | 18 November | two-engine hardening: -1.77 ns, fixed to -0.19 ns (build 1 h 54 min, 55.2% of the core), then +1.80 ns (1 h 44 min, 54.5%) with the gate-level test red (rows 30, 31); the two reviews' holes fixed in the model; option A; queue depth 2; three measurements; the stateless I2C referee and its review (not yet committed); soundness claims narrowed to the declared bus envelope |
+| 19 November | gate-level fixes; two-engine hardening green throughout (+1.34 ns, 54.4%, 1 h 43 min; gate level with X / 0 / 1 / random start); in the model: the STOP fix, candidate M (idle-safe judging), the per-channel short-level threshold, B dropped, 112- / 128-word Referee (not yet reviewed or committed) |
+| 26 November | two engines merged into `integration` and `main`; RTL freeze moved once, to 14 December, with the scope frozen |
 
-Planned, in order: the gate-level fixes and a hardening rerun; the review fixes, candidate M and the
-per-channel short-level threshold in the model, then the commit of the ISA v1 model work; the RTL for
-ISA v1, soundness items first, in lockstep with the v1 model; the rule-table front end (software,
-after the hardware freeze if need be); the time-boxed firmware proof. Also planned:
+Planned, in order: the independent review of the ISA v1 model work, its fixes and the ISA v1.0 tag;
+the RTL for ISA v1, must-haves first (the soundness set, candidate M, the per-channel short-level
+threshold, the larger Referee with image format 4, 7-bit addresses), in lockstep with the v1 model,
+with hardening runs around 5, 10 (feature complete) and 13 December (release candidate) and the
+freeze on 14 December; a miss on 13 December ships the last green build's scope. After the freeze:
+a held-out round in which every drawn protocol gets both a speaking program and a referee, the
+rule-table front end, and the time-boxed firmware proof. Also planned:
 one command that reproduces every claim in the README and this write-up and ends PASSED or FAILED,
 and a mutation campaign on the verdict, snapshot, timestamp and poison logic.
 
 | Target date | Milestone |
 | --- | --- |
-| 21 November | ISA v1.0 tagged; later changes are numbered diffs under a change gate |
-| late November | first FPGA run judging a real I2C bus; two engines hardened green |
-| 7 December | RTL freeze (hardware changes until then only with measured evidence, full proofs, gate-level tests and a green hardening build) |
+| 21 November (missed; the tag now follows the independent review and its fixes) | ISA v1.0 tagged; later changes are numbered diffs under a change gate |
+| late November | two engines hardened green (done, 19 November); first FPGA run judging a real I2C bus (not yet) |
+| 5, 10, 13 December | hardening runs: first v1 build; feature complete; release candidate (a miss ships the last green build's scope) |
+| 14 December | RTL freeze (moved once from 7 December; hardware changes until then only with measured evidence, full proofs, gate-level tests and a green hardening build) |
 | 20 December | proofs closed, or named as bounded |
 | after the freeze | new referees written from datasheets as tables (section 7) |
 | January 2027 | final hardening and submission |
