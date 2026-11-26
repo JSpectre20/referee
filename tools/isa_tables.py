@@ -60,3 +60,11 @@ ENUMS = {'c': {'T': 0, 'nT': 1, 'C': 2, 'nC': 3, 'E': 4, 'nE': 5, 'S': 6, 'nS': 
 FLAG_KEYWORDS = ['msb', 'hi', 'raw', 'x16']
 ALIASES = {'jt': 'T', 'jnt': 'nT', 'jc': 'C', 'jnc': 'nC', 'je': 'E', 'jne': 'nE', 'js': 'S', 'jns': 'nS'}
 RESERVED_OPCODES = [24, 25, 26, 27]
+
+# engines in index order (e in host commands; owner code e + 1 in the global config)
+ENGINES = [
+    {'name': 'referee', 'index': 0, 'program_words': 64, 'bounds': 16, 'referee_hardware': True},
+    {'name': 'player', 'index': 1, 'program_words': 96, 'bounds': 0, 'referee_hardware': False},
+]
+# what the Player does with each referee instruction (isa.yaml `player:`)
+PLAYER_SEMANTICS = {'waits': 'S is never set: waits until NOW - TO >= 0, then T <- 1 (a pure timeout wait)', 'trig': 'no effect (no trigger)', 'rel': 'no effect (S is always 0)', 'tsget': 'r <- 0 (as before any snapshot: F 1, O 0, epoch 0; nothing reads the tags)', 'judge': 'no effect (no verdict block, stats or VERDICT FIFO; VERDICT_OVF stays 0)'}

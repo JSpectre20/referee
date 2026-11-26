@@ -18,8 +18,16 @@ Source syntax, one instruction per line, `;` or `#` starts a comment:
 `waitd` longer than 2047 cycles is split into consecutive WAITDs (exact: each
 one adds to the deadline); the assembler reports how many words that costs.
 
+Two engines (isa.yaml `engines`, docs/isa-timing.md 0b, diffs 17-19): engine 0, the
+Referee (64 program words + 16 bounds), and engine 1, the Player (96 program words, no
+bounds table, no referee hardware). Both images are 97 words. On the Player, `.bound` is
+an error, the referee instructions assemble (they have defined, inert effects) but are
+reported, and words 64..95 can only be reached by falling through from word 63: a
+jump / branch / loop target must be below 64 until ISA v1 widens the address field.
+
     python3 tools/refasm.py prog.s [--clock-hz 60e6]          words, one per line (hex)
     python3 tools/refasm.py prog.s --image                    the 97-word engine image + CRC
+    python3 tools/refasm.py prog.s --image --engine 1         ... for the Player
 """
 
 import argparse
@@ -33,9 +41,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import isa_tables as T  # noqa: E402
 
-PROGRAM_WORDS = 64
-BOUNDS = 16
-IMAGE_WORDS = PROGRAM_WORDS + 2 * BOUNDS + 1  # + claimed-pin mask
+ENGINES = T.ENGINES  # [referee, player], in engine-number order (generated from isa.yaml)
+REFEREE, PLAYER = 0, 1
+PROGRAM_WORDS = ENGINES[REFEREE]["program_words"]  # 64: the Referee's program
+BOUNDS = ENGINES[REFEREE]["bounds"]  # 16
+
+
+def image_words(e):
+    """Engine e's image: program + 2 words per bound + the claimed-pin mask."""
+    return ENGINES[e]["program_words"] + 2 * ENGINES[e]["bounds"] + 1
+
+
+IMAGE_WORDS = image_words(REFEREE)  # 97
+assert all(image_words(e) == IMAGE_WORDS for e in range(len(ENGINES))), "both images are 97 words"
+ADDR_REACH = 64  # the 6-bit address field `a`: jump targets 0..63 (ISA v1: 7 bits)
+REFEREE_ONLY = ("trig", "rel", "tsget", "judge", "waits")
 GLOBAL_WORDS = 8
 FRAC = 16  # bounds are in 1/16 cycle
 N_MAX = (1 << 11) - 1
@@ -88,10 +108,13 @@ def evaluate(expr, names):
 
 
 class Assembler:
-    def __init__(self, clock_hz=None):
+    def __init__(self, clock_hz=None, engine=REFEREE):
         self.clock = Fraction(str(clock_hz)) if clock_hz else None
+        self.engine = engine
+        self.words_max = ENGINES[engine]["program_words"]
+        self.has_bounds = ENGINES[engine]["bounds"] > 0
         self.names = {}
-        self.bounds = [(0, 0, 0)] * BOUNDS  # (n_lo, inexact, is_max)
+        self.bounds = [(0, 0, 0)] * BOUNDS  # (n_lo, inexact, is_max); Referee only
         self.notes = []  # reports: splits, rounding
 
     # -- values -------------------------------------------------------------
@@ -161,8 +184,9 @@ class Assembler:
                 pc += size
             except AsmError as e:
                 raise AsmError(f"line {lineno}: {e}") from None
-        if pc > PROGRAM_WORDS:
-            raise AsmError(f"program is {pc} words; an engine holds {PROGRAM_WORDS}")
+        if pc > self.words_max:
+            raise AsmError(f"program is {pc} words; engine {self.engine} ({ENGINES[self.engine]['name']}) "
+                           f"holds {self.words_max}")
         words = []
         for lineno, mnemonic, args, size in items:
             try:
@@ -181,6 +205,8 @@ class Assembler:
         elif name == ".clock_hz":
             self.clock = Fraction(str(float(rest)))
         elif name == ".bound":
+            if not self.has_bounds:
+                raise AsmError(".bound: the Player has no bounds table (and no JUDGE)")
             idx, kind, t = [a.strip() for a in rest.split(",")]
             idx = self.integer(idx, 0, BOUNDS - 1, "bound index")
             if kind not in ("min", "max"):
@@ -215,6 +241,8 @@ class Assembler:
             return self.encode("br", [T.ALIASES[mnemonic]] + args)
         if mnemonic not in T.INSTR:
             raise AsmError(f"unknown instruction {mnemonic!r}")
+        if not self.has_bounds and mnemonic in REFEREE_ONLY:
+            self.notes.append(f"{mnemonic} on the Player: {T.PLAYER_SEMANTICS[mnemonic]}")
         spec = T.INSTR[mnemonic]
         if mnemonic == "waitd":
             n = self.nearest(args[0], 0, 1 << 30, "waitd")
@@ -261,17 +289,27 @@ class Assembler:
             return 0  # filled in by encode (rounding, x16)
         if f == "imm":
             return self.integer(a, -128, 255, "immediate") & 0xFF
+        if f == "a":
+            v = self.integer(a, 0, self.words_max - 1, "address")
+            if v >= ADDR_REACH:
+                raise AsmError(f"{mnemonic} {a}: target {v} is beyond word {ADDR_REACH - 1}; the address field "
+                               f"reaches 0..{ADDR_REACH - 1} until ISA v1 (words {ADDR_REACH}.."
+                               f"{self.words_max - 1} run only by falling through from word {ADDR_REACH - 1})")
+            return v
         return self.integer(a, 0, (1 << width) - 1, f"operand {f}")
 
     # -- image --------------------------------------------------------------
 
     def image(self, words):
-        prog = list(words) + [HALT_WORD] * (PROGRAM_WORDS - len(words))
+        """Referee: program (64) + bounds (32) + claimed pins; Player: program (96) + claimed pins.
+        Unused program words are HALT."""
+        prog = list(words) + [HALT_WORD] * (self.words_max - len(words))
         bw = []
-        for n_lo, inexact, is_max in self.bounds:
-            bw += [(n_lo >> 4) & 0xFFFF, ((n_lo & 0xF) << 12) | (inexact << 11) | (is_max << 10)]
+        if self.has_bounds:
+            for n_lo, inexact, is_max in self.bounds:
+                bw += [(n_lo >> 4) & 0xFFFF, ((n_lo & 0xF) << 12) | (inexact << 11) | (is_max << 10)]
         img = prog + bw + [claimed_pins(words)]
-        assert len(img) == IMAGE_WORDS
+        assert len(img) == image_words(self.engine)
         return img
 
 
@@ -323,8 +361,9 @@ def crc16(words):
     return crc16_bytes(b"".join(bytes([(w >> 8) & 0xFF, w & 0xFF]) for w in words))
 
 
-def global_image(pins=None, mux=None, engines=1):
-    """pins: {pin: (owner 0/1/2, mode 0 input/1 push-pull/2 open-drain)}; mux: 4 sources."""
+def global_image(pins=None, mux=None, engines=2):
+    """pins: {pin: (owner 0 none / 1 engine 0 / 2 engine 1, mode 0 input / 1 push-pull /
+    2 open-drain)}; mux: 4 sources (0 = ui_in[4 + ch], 1..8 = uio_in[0..7])."""
     pins = pins or {}
     mux = mux or [0, 0, 0, 0]
     w = [0x5246, (3 << 8) | engines, 0, 0, 0, 0, 0, 0]
@@ -341,8 +380,10 @@ def main(argv=None):
     ap.add_argument("source")
     ap.add_argument("--clock-hz", type=float)
     ap.add_argument("--image", action="store_true", help="print the engine image and its CRC")
+    ap.add_argument("--engine", type=int, choices=range(len(ENGINES)), default=REFEREE,
+                    help="0 = the Referee (default), 1 = the Player")
     args = ap.parse_args(argv)
-    asm = Assembler(args.clock_hz)
+    asm = Assembler(args.clock_hz, args.engine)
     try:
         words = asm.assemble(Path(args.source).read_text())
     except AsmError as e:
@@ -354,7 +395,7 @@ def main(argv=None):
         print(f"crc {crc16(out):04x}")
     for n in asm.notes:
         print(f"; {n}", file=sys.stderr)
-    print(f"; {len(words)} of {PROGRAM_WORDS} words", file=sys.stderr)
+    print(f"; {len(words)} of {asm.words_max} words", file=sys.stderr)
 
 
 if __name__ == "__main__":

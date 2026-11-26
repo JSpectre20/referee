@@ -7,42 +7,55 @@
  *
  * Every command is a 4-byte packet  CMD A B C  and gets a reply that starts
  * STATUS DATA, where STATUS is ACK (0x06) or NAK (0x15). Only the drain
- * reply is longer. `e` is the engine number: v0 has engine 0 only, any other
- * e is NAK'd.
+ * reply is longer. `e` is the engine number: 0 = the Referee, 1 = the Player
+ * (docs/isa-timing.md 0b, diff 19). Any other e is NAK'd, and so is e = 1 for
+ * the Referee-only commands D, S, s, Z, L (the Player has no verdicts, stats
+ * or LOST). "Halted" for the global config means BOTH engines halted.
  *
  *   CMD        A        B        C       action                                 DATA
  *   'I' 0x49   -        -        -       identify                               0x52 ('R')
  *   'G' 0x47   addr     hi       lo      global config word addr <= {hi,lo}     addr
- *                                        (addr 0..7; NAK unless halted)
+ *                                        (addr 0..7; NAK unless both halted)
  *   'W' 0x57   e:addr   hi       lo      engine image word <= {hi,lo}           A
- *                                        (e = A[7], addr = A[6:0] 0..96; NAK unless halted)
- *   'r' 0x72   sel      addr     part    read a word: sel 0 global, 1 engine 0;  byte
- *                                        addr 0x80 = the CRC the last RUN check
- *                                        computed; part 0 low byte, 1 high byte
- *                                        (NAK unless halted)
- *   'C' 0x43   sel      hi       lo      expected CRC: sel 0 global, 1 engine 0  sel
- *                                        (NAK unless halted)
+ *                                        (e = A[7], addr = A[6:0] 0..96; NAK
+ *                                        unless engine e is halted)
+ *   'r' 0x72   sel      addr     part    read a word: sel 0 global (both halted), byte
+ *                                        sel 1 + e engine e (e halted). addr 0x80
+ *                                        = the CRC the engine's last RUN check
+ *                                        computed (global: 0x80 + e = the global
+ *                                        CRC engine e's last check computed);
+ *                                        part 0 low byte, 1 high byte
+ *   'C' 0x43   sel      hi       lo      expected CRC: sel 0 global (both       sel
+ *                                        halted), 1 + e engine e (e halted)
  *   'R' 0x52   e        op       -       op 1: RUN. The reply waits for the      op
  *                                        105-cycle image check: ACK only if both
  *                                        CRCs and the pin claims passed (NAK and
  *                                        CRC_FAIL otherwise). op 0: halt.
  *   'P' 0x50   e        byte     -       push byte into IN (NAK if full)        byte
  *   'p' 0x70   e        -        -       pop OUT (NAK if empty)                 the byte
- *   'D' 0x44   e        max      -       VERDICT drain: reply ACK, n, then      n
+ *   'D' 0x44   0        max      -       VERDICT drain: reply ACK, n, then      n
  *                                        n x {hi, lo} slots, n = min(max, level)
- *   'S' 0x53   e        slot     -       latch stats slot 0..3 (atomic)         slot
- *   's' 0x73   e        idx      part    read latched stats word idx 0..4        byte
+ *   'S' 0x53   0        slot     -       latch stats slot 0..3 (atomic)         slot
+ *   's' 0x73   0        idx      part    read latched stats word idx 0..4        byte
  *                                        (pass, viol, indet, min, max); part as 'r'
- *   'Z' 0x5A   e        slot     -       clear stats slot                       slot
- *   'L' 0x4C   e        op       -       LOST; op 1 also clears it              LOST
+ *   'Z' 0x5A   0        slot     -       clear stats slot                       slot
+ *   'L' 0x4C   0        op       -       LOST; op 1 also clears it              LOST
  *   'B' 0x42   div_hi   div_lo   -       UART bit period in cycles (>= 6),       div_lo
  *                                        applied after this reply has been sent
- *   'Q' 0x51   e        sel      -       sel 0: engine status, read-and-clear of the sticky bits:
+ *   'Q' 0x51   e        sel      -       sel 0: engine e's status, read-and-clear of its sticky bits:
  *                                          {running, S, CRC_FAIL, PIN_FAULT,
  *                                           IN_UNDERRUN, VERDICT_OVF, OUT_OVF, NI}
+ *                                          (Player: S and VERDICT_OVF are always 0)
  *                                        sel 1: port status {overrun, 0000000},
  *                                          read-and-clear
  *   other                                NAK                                    CMD
+ *
+ * The DATA column is the data byte of an ACK. A NAK's data byte is ALWAYS the
+ * command byte CMD, for every command (docs/isa-timing.md 0b, diff 23): never
+ * a word from an image, a FIFO, the stats or anything else the host was just
+ * refused. (Before 18 Nov a NAK'd 'r' still returned the addressed word: for
+ * an unwritten image word that is stale flip-flop contents in silicon and X in
+ * simulation; found by the first two-engine gate-level run.)
  *
  * Rules
  *   - Wait for the whole reply before sending the next packet. A packet that
@@ -53,11 +66,18 @@
  *     60 MHz). A UART framing error also throws the partial packet away.
  *   - Image and config writes are also refused inside engine_sys / engine
  *     unless halted (hardware write gates); the NAK here just tells the host.
- *   - Every strobe to engine_sys is a one-cycle pulse in the cycle the 4th
- *     byte arrives, with its address/data taken from that packet. A read and
- *     its clear ('Q', 'L') happen in that same cycle, so nothing is lost
- *     between them; a hardware set in that very cycle loses to the clear
- *     (docs/isa-timing.md 0b, diff 6).
+ *   - The packet is decoded, checked and answered in the cycle its 4th byte
+ *     arrives; its actions (writes, CRC writes, RUN / halt, IN push, OUT pop,
+ *     stats latch / clear) reach engine_sys ONE CYCLE LATER, as one-cycle
+ *     pulses from a pipeline register with their address / data / engine
+ *     (docs/isa-timing.md 0b, diff 21). Why: the decode that decides ACK /
+ *     NAK (which engine, is it halted, is its FIFO full) and the fan-out of
+ *     the strobes to ~500 flip-flops did not fit in one 16.7 ns cycle at the
+ *     slow corner once there were two engines (run 44150852691: -1.77 ns).
+ *     Packets are at least 40 cycles apart, so the host cannot tell.
+ *   - Reads and their clears ('Q' status, 'L' LOST) stay in the packet cycle:
+ *     a read and its clear happen together, so nothing is lost between them;
+ *     a hardware set in that very cycle loses to the clear (0b, diff 6).
  */
 
 `default_nettype none
@@ -86,7 +106,8 @@ module host_port #(
     output wire        h_gcrc_we,
     output wire [15:0] h_gcrc,
 
-    // engine_sys: engine 0
+    // engine_sys: the engine this command addresses, then its strobes and data
+    output wire        h_e,
     output wire        h_we,
     output wire [ 6:0] h_addr,
     output wire [15:0] h_wdata,
@@ -113,10 +134,10 @@ module host_port #(
     output wire        h_lost_clear,
     input  wire [ 7:0] lost,
     output wire        h_status_clear,
-    input  wire        halted,
-    input  wire        running,
-    input  wire        checking,
-    input  wire [15:0] crc_got_g,
+    input  wire [ 1:0] halted,     // per engine
+    input  wire [ 1:0] running,
+    input  wire [ 1:0] checking,
+    input  wire [15:0] crc_got_g,  // of engine h_e (as is everything below except running / checking / halted)
     input  wire [15:0] crc_got_e,
     input  wire [ 7:0] status,     // {checking, running, S, CRC_FAIL, PIN_FAULT, IN_UNDERRUN, VERDICT_OVF, OUT_OVF}
     input  wire        ni
@@ -148,6 +169,8 @@ module host_port #(
   reg overrun;
   reg baud_pend;  // a new bit period waits for the reply to finish
   reg [15:0] div_next;
+  reg r_e;  // the engine a RUN reply waits for
+  reg rw_skip;  // RUN reply: the cycle in which the strobe is still in the pipeline register
 
   // Start a byte whenever one is waiting and the transmitter is free. The
   // transmitter's busy rises the cycle after start, so the next byte simply
@@ -168,9 +191,26 @@ module host_port #(
   // Command decode (combinational, used in the cycle the 4th byte arrives)
   // ---------------------------------------------------------------------------
   wire [7:0] cmd = b0, a = b1, bb = b2, c = rx_data;
-  wire e_ok = (a == 8'd0);  // engine 0 only
+  // The engine the packet names. 'W' carries it in A[7]; 'r' and 'C' in sel
+  // (sel 1 + e; for 'r' sel 0, the global CRC address 0x80 + e); every other
+  // engine command in A. pe may be out of range: then the command is NAK'd.
+  reg [7:0] pe;
+  always @(*) begin
+    case (cmd)
+      C_W: pe = {7'd0, a[7]};
+      C_RD: pe = (a == 8'd0) ? {7'd0, bb == 8'h81} : a - 8'd1;
+      C_CRC: pe = (a == 8'd0) ? 8'd0 : a - 8'd1;
+      default: pe = a;
+    endcase
+  end
+  // (h_e, the engine select engine_sys sees, is assigned below with the pipeline register)
+  wire e_ok = (pe <= 8'd1);  // engine 0 (Referee) or 1 (Player)
+  wire ref_ok = (a == 8'd0);  // the Referee-only commands: engine 0
+  wire e_halted = halted[pe[0]];
+  wire all_halted = &halted;
   wire [3:0] drain_n = (bb < {4'd0, vf_count}) ? bb[3:0] : vf_count;  // min(max, FIFO level <= 8)
-  wire [15:0] rd_word = (a == 8'd0) ? ((bb == 8'h80) ? crc_got_g : h_grdata) : ((bb == 8'h80) ? crc_got_e : h_rdata);
+  // (crc_got_g / crc_got_e / h_rdata come from engine h_e)
+  wire [15:0] rd_word = (a == 8'd0) ? (bb[7] ? crc_got_g : h_grdata) : (bb[7] ? crc_got_e : h_rdata);
   wire [15:0] new_div = {a, bb};
 
   reg [7:0] st, dt;  // reply for this packet
@@ -181,47 +221,50 @@ module host_port #(
       C_ID: dt = ID;
       C_G: begin
         dt = a;
-        if (!halted || a > 8'd7) st = NAK;
+        if (!all_halted || a > 8'd7) st = NAK;
       end
       C_W: begin
         dt = a;
-        if (!halted || a[7] || a[6:0] > 7'd96) st = NAK;
+        if (!e_halted || a[6:0] > 7'd96) st = NAK;
       end
       C_RD: begin
         dt = c[0] ? rd_word[15:8] : rd_word[7:0];
-        if (!halted || a > 8'd1 || (bb != 8'h80 && (a == 8'd0 ? bb > 8'd7 : bb > 8'd96))) st = NAK;
+        if (a > 8'd2) st = NAK;
+        else if (a == 8'd0) begin  // global: words 0..7, computed CRCs 0x80 / 0x81
+          if (!all_halted || (bb > 8'd7 && bb != 8'h80 && bb != 8'h81)) st = NAK;
+        end else if (!e_halted || (bb > 8'd96 && bb != 8'h80)) st = NAK;
       end
       C_CRC: begin
         dt = a;
-        if (!halted || a > 8'd1) st = NAK;
+        if (a > 8'd2 || (a == 8'd0 ? !all_halted : !e_halted)) st = NAK;
       end
       C_RUN: begin
         dt = {7'd0, bb[0]};
-        if (!e_ok || (bb[0] && !halted)) st = NAK;
+        if (!e_ok || (bb[0] && !e_halted)) st = NAK;
       end
       C_PUSH: begin
         dt = bb;
         if (!e_ok || in_full) st = NAK;
       end
       C_POP: begin
-        dt = out_empty ? 8'h00 : out_data;  // never the stale storage of an empty FIFO
+        dt = out_data;  // (an empty FIFO is NAK'd: then dt = cmd below, never its stale storage)
         if (!e_ok || out_empty) st = NAK;
       end
       C_DRAIN: begin
         dt = {4'd0, drain_n};
-        if (!e_ok) st = NAK;
+        if (!ref_ok) st = NAK;
       end
       C_SLATCH, C_SCLR: begin
         dt = bb;
-        if (!e_ok || bb > 8'd3) st = NAK;
+        if (!ref_ok || bb > 8'd3) st = NAK;
       end
       C_SREAD: begin
         dt = c[0] ? stats_rdata[15:8] : stats_rdata[7:0];
-        if (!e_ok || bb > 8'd4) st = NAK;
+        if (!ref_ok || bb > 8'd4) st = NAK;
       end
       C_LOST: begin
         dt = lost;
-        if (!e_ok) st = NAK;
+        if (!ref_ok) st = NAK;
       end
       C_BAUD: begin
         dt = bb;
@@ -231,37 +274,85 @@ module host_port #(
         dt = bb[0] ? {overrun, 7'd0} : {status[6:0], ni};
         if (!e_ok || bb > 8'd1) st = NAK;
       end
-      default: begin
-        st = NAK;
-        dt = cmd;
-      end
+      default: st = NAK;
     endcase
+    // Every NAK carries the command byte as its data (0b, diff 23), so a
+    // refused command never returns what it was refused: e.g. a NAK'd 'r'
+    // must not return the addressed word (an unwritten image word is stale
+    // flip-flop contents), a NAK'd 'p' not the empty FIFO's storage.
+    if (st == NAK) dt = cmd;
   end
 
   wire exec = packet && !replying;  // a packet we will act on
   wire go = exec && (st == ACK);  // ... and carry out
 
-  // Strobes and their operands, straight from the packet (one-cycle pulses).
-  assign h_gwe = go && cmd == C_G;
-  assign h_gaddr = (cmd == C_RD) ? bb[2:0] : a[2:0];
-  assign h_gwdata = {bb, c};
-  assign h_gcrc_we = go && cmd == C_CRC && a == 8'd0;
-  assign h_gcrc = {bb, c};
-  assign h_we = go && cmd == C_W;
-  assign h_addr = a[6:0];
-  assign h_wdata = {bb, c};
+  // Actions, decoded in the packet cycle ...
+  wire d_gwe = go && cmd == C_G;
+  wire d_gcrc_we = go && cmd == C_CRC && a == 8'd0;  // (engine e: d_crc_we)
+  wire d_we = go && cmd == C_W;
+  wire d_crc_we = go && cmd == C_CRC && a != 8'd0;
+  wire d_run = go && cmd == C_RUN && bb[0];
+  wire d_halt = go && cmd == C_RUN && !bb[0];
+  wire d_in_push = go && cmd == C_PUSH;
+  wire d_out_pop = go && cmd == C_POP;
+  wire d_slatch = go && cmd == C_SLATCH;
+  wire d_sclr = go && cmd == C_SCLR;
+
+  // ... and carried out one cycle later from this pipeline register (0b, diff
+  // 21; see the Rules above). The strobes are registered every cycle, so each
+  // is a one-cycle pulse; the operands are captured with the packet. All the
+  // write data of every command is {B, C}, so one 16-bit register serves them.
+  reg q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr;
+  reg q_e;           // the engine the action is for
+  reg [2:0] q_gwaddr;  // global word address ('G')
+  reg [6:0] q_addr;    // engine image address ('W')
+  reg [15:0] q_wdata;  // {B, C}
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      {q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr} <= 10'd0;
+      q_e <= 1'b0;
+      q_gwaddr <= 3'd0;
+      q_addr <= 7'd0;
+      q_wdata <= 16'd0;
+    end else begin
+      {q_gwe, q_gcrc_we, q_we, q_crc_we, q_run, q_halt, q_in_push, q_out_pop, q_slatch, q_sclr} <=
+          {d_gwe, d_gcrc_we, d_we, d_crc_we, d_run, d_halt, d_in_push, d_out_pop, d_slatch, d_sclr};
+      if (exec) begin
+        q_e <= pe[0];
+        q_gwaddr <= a[2:0];
+        q_addr <= a[6:0];
+        q_wdata <= {bb, c};
+      end
+    end
+  end
+  // An action is going out this cycle. Then the engine select and the global
+  // address shared with the read side carry the action's registered values;
+  // in every other cycle (every packet cycle, where reads and their clears
+  // happen: a packet is at least 40 cycles after the previous one) they carry
+  // the packet's own fields, exactly as before.
+  wire q_act = q_gwe | q_gcrc_we | q_we | q_crc_we | q_run | q_halt | q_in_push | q_out_pop | q_slatch | q_sclr;
+  assign h_e = q_act ? q_e : pe[0];
+  assign h_gaddr = q_gwe ? q_gwaddr : bb[2:0];  // write address, or the 'r' read address
+  assign h_gwe = q_gwe;
+  assign h_gwdata = q_wdata;
+  assign h_gcrc_we = q_gcrc_we;
+  assign h_gcrc = q_wdata;
+  assign h_we = q_we;
+  assign h_addr = q_addr;
+  assign h_wdata = q_wdata;
   assign h_raddr = bb[6:0];
-  assign h_crc_we = go && cmd == C_CRC && a == 8'd1;
-  assign h_crc = {bb, c};
-  assign h_run = go && cmd == C_RUN && bb[0];
-  assign h_halt = go && cmd == C_RUN && !bb[0];
-  assign h_in_push = go && cmd == C_PUSH;
-  assign h_in_data = bb;
-  assign h_out_pop = go && cmd == C_POP;
-  assign h_stats_latch = go && cmd == C_SLATCH;
-  assign h_stats_clear = go && cmd == C_SCLR;
-  assign h_stats_slot = bb[1:0];
-  assign h_stats_idx = bb[2:0];
+  assign h_crc_we = q_crc_we;
+  assign h_crc = q_wdata;
+  assign h_run = q_run;
+  assign h_halt = q_halt;
+  assign h_in_push = q_in_push;
+  assign h_in_data = q_wdata[15:8];
+  assign h_out_pop = q_out_pop;
+  assign h_stats_latch = q_slatch;
+  assign h_stats_clear = q_sclr;
+  assign h_stats_slot = q_wdata[9:8];
+  assign h_stats_idx = bb[2:0];  // read side ('s'): packet cycle
+  // read-and-clear: in the packet cycle, together with the read (0b, diff 6)
   assign h_lost_clear = go && cmd == C_LOST && bb[0];
   assign h_status_clear = go && cmd == C_Q && !bb[0];
 
@@ -275,6 +366,8 @@ module host_port #(
       rstate <= R_IDLE;
       r_status <= 8'd0;
       r_data <= 8'd0;
+      r_e <= 1'b0;
+      rw_skip <= 1'b0;
       ridx <= 5'd0;
       rlen <= 5'd0;
       overrun <= 1'b0;
@@ -306,9 +399,12 @@ module host_port #(
         r_data   <= dt;
         ridx     <= 5'd0;
         rlen     <= (go && cmd == C_DRAIN) ? 5'd2 + {drain_n, 1'b0} : 5'd2;
-        // RUN: hold the reply until the image check is over (checking is
-        // high from the next cycle until the engine runs or refuses).
-        rstate   <= h_run ? R_RUNWAIT : R_SEND;
+        // RUN: hold the reply until the image check is over. The RUN strobe
+        // reaches the engine next cycle (pipeline register), so `checking` is
+        // high only from the cycle after that: skip one cycle before looking.
+        rstate   <= d_run ? R_RUNWAIT : R_SEND;
+        rw_skip  <= d_run;
+        r_e      <= pe[0];
         if (go && cmd == C_Q && bb[0]) overrun <= 1'b0;
         if (go && cmd == C_BAUD) begin
           baud_pend <= 1'b1;
@@ -316,8 +412,11 @@ module host_port #(
         end
       end
 
-      if (rstate == R_RUNWAIT && !checking) begin
-        r_status <= running ? ACK : NAK;
+      if (rstate == R_RUNWAIT && rw_skip) begin
+        rw_skip <= 1'b0;
+      end else if (rstate == R_RUNWAIT && !checking[r_e]) begin
+        r_status <= running[r_e] ? ACK : NAK;
+        if (!running[r_e]) r_data <= C_RUN;  // a refused RUN: NAK, 'R' (diff 23)
         rstate   <= R_SEND;
       end
 
@@ -335,7 +434,7 @@ module host_port #(
     end
   end
 
-  wire _unused = &{1'b0, status[7], c[7:1]};
+  wire _unused = &{1'b0, status[7], c[7:1], pe[7:1]};
 
 endmodule
 
