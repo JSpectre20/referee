@@ -8,6 +8,15 @@ at sub-cycle resolution:
 - **PASS** means the true interval really met it.
 - Anything the instrument can't decide is **INDETERMINATE**.
 
+**Scope.** "The true interval" here is the interval between the moments the chip's input pads
+switched. A protocol specification measures between fixed levels of each edge (I2C: 30% and 70%
+of the supply). The two agree only within a **declared bus envelope**: every edge completes,
+monotonically, within the declared rise / fall time, and every level reaches the specification's
+VIL / VIH. A runt pulse that never reaches VIH, or a bounce on a slow edge, is outside the envelope
+and can be misjudged with no flag: a digital pad cannot see a level that stops at 60% of the
+supply. This is an electrical assumption the user declares, like the skew and the guard band (ISA
+v1 `.bus`); it is listed in `docs/writeup.md` section 3 and ledger row 24.
+
 ## The rule
 
 m is the measured interval in cycles (signed, from two edge timestamps). N is the contract's
@@ -27,7 +36,8 @@ Proved by unbounded k-induction, for every input sequence that meets the samplin
 - minimum bound: VIOLATION => T < N, and PASS => T >= N
 - maximum bound: VIOLATION => T > N, and PASS => T <= N
 
-In other words, every verdict is **sound or flagged**. When a flag is set, the verdict is
+In other words, every verdict is **sound or flagged** (within the envelope above). When a flag is
+set, the verdict is
 INDETERMINATE, which claims nothing:
 
 - **`rise_stale` / `fall_stale`** (per pin, in `edge_ts`): the reference timestamp is missing

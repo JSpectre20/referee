@@ -57,6 +57,90 @@ jobs:
       - name: GL test
         uses: TinyTapeout/tt-gds-action/gl_test@ttihp27a
 
+  # The same gate-level tests with the flip-flops powering up at DEFINED values
+  # (test/README.md, "Gate-level runs"): all 0, all 1, and random per flop from
+  # fixed seeds. gl_test above (every flop starts at X, the PDK's models) stays
+  # the required gate; these must pass as well. The steps are the gl_test
+  # action's own (TinyTapeout/tt-gds-action gl_test@ttihp27a: the netlist from
+  # tt_submission, the PDK from its pdk.json, Icarus 13), with GL_POWERUP and
+  # GL_SEED added to the make call; the action takes no make arguments.
+  gl_test_powerup:
+    needs: gds
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { powerup: "0", seed: "" }
+          - { powerup: "1", seed: "" }
+          - { powerup: "rand", seed: "1" }
+          - { powerup: "rand", seed: "2026" }
+    name: gl_test (flops power up ${{ matrix.powerup }}${{ matrix.seed && format(', seed {0}', matrix.seed) || '' }})
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Download GDS artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tt_submission
+
+      - name: Set up environment variables
+        working-directory: tt_submission
+        shell: bash
+        run: |
+          cat << __EOF >> $GITHUB_ENV
+          PDK=$(jq -r '.PDK' pdk.json)
+          PDK_ROOT=/home/runner/pdk
+          PDK_SOURCE=$(jq -r '.PDK_SOURCE' pdk.json)
+          PDK_VERSION=$(jq -r '.PDK_VERSION' pdk.json)
+          __EOF
+
+      - name: Install ${{ env.PDK }} PDK
+        uses: TinyTapeout/ciel-action@v1
+        with:
+          pdk_name: ${{ env.PDK }}
+          pdk_version: ${{ env.PDK_VERSION }}
+          pdk_root: ${{ env.PDK_ROOT }}
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Python packages
+        shell: bash
+        run: pip install -r test/requirements.txt
+
+      - name: Install iverilog
+        shell: bash
+        run: |
+          wget https://github.com/TinyTapeout/iverilog/releases/download/v13.0/iverilog_13.0-1_amd64.deb
+          sudo apt-get update -y
+          sudo apt-get install -y ./iverilog_13.0-1_amd64.deb
+
+      - name: Run tests
+        shell: bash
+        run: |
+          cp tt_submission/*.v test/gate_level_netlist.v
+          cd test
+          rm -f tb.vcd tb.fst results.xml
+          make clean
+          GATES=yes make GL_POWERUP=${{ matrix.powerup }} ${{ matrix.seed && format('GL_SEED={0}', matrix.seed) || '' }}
+          # the seed (rand) is in the log; make succeeds even if tests fail: check results.xml
+          python -m cocotb_tools.check_results results.xml
+
+      - name: Upload Waveform and Test Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gatelevel_test_results_powerup_${{ matrix.powerup }}${{ matrix.seed }}
+          path: |
+            test/tb.fst
+            test/results.xml
+
   viewer:
     needs: gds
     runs-on: ubuntu-24.04

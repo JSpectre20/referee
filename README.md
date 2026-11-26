@@ -34,8 +34,9 @@ digital pins.
   explains the rule and its proof. The proof (SymbiYosys) puts the external edges on a grid
   of 4 and of 8 steps per clock cycle, lets a sample taken next to an edge resolve either
   way, and shows that for the interval kinds listed below, under the assumptions listed
-  below, a PASS or a VIOLATION is never wrong. With an uncertainty of one cycle instead of
-  two, the proof fails, and the counterexample is kept in [`docs/results/`](docs/results/).
+  below, a PASS or a VIOLATION is never wrong about the interval between the moments the pads
+  switched. With an uncertainty of one cycle instead of two, the proof fails, and the
+  counterexample is kept in [`docs/results/`](docs/results/).
 
 Timing rules are firmware too: a new rule is a few lines
 ([`firmware/engine/i2c_setup_referee.s`](firmware/engine/i2c_setup_referee.s) is 10 instructions).
@@ -47,6 +48,7 @@ Timing rules are firmware too: a new rule is a few lines
 | Measurement uncertainty | 2 clock cycles (33 ns at 60 MHz); fixed in hardware |
 | Longest interval that can be judged | 273 µs (16-bit timestamps); longer ones are flagged and answered CAN'T TELL |
 | Assumed, not checked by the chip | each level on a judged pin lasts at least 4 clock cycles; the judged pins have no skew or pad-delay difference between them; the chip runs at the clock the firmware was assembled for; a sample that goes metastable settles within one cycle |
+| The bus envelope (what "the true interval" means) | the proof is about the interval between the moments the chip's pads switched. Relating that to a specification's levels (I2C: 30% and 70% of the supply) holds only **within a declared bus envelope**: every edge completes, monotonically, within the declared rise / fall time, and every level reaches the specification's VIL / VIH. A runt that never reaches VIH, or a bounce, is outside the envelope and can be misjudged; no digital pad can see a level that sits at 60% of the supply. ISA v1 declares the edge times in `.bus` and derives the guard band from them; deriving the short-level flag's threshold from them per channel is in progress ([write-up, section 3](docs/writeup.md#3-what-a-verdict-means-and-what-is-proved)) |
 | Proved at sub-cycle resolution | (1) a rising edge on one pin to a rising edge on another, read through the snapshot the way firmware reads it; (2) a high pulse (rise to fall) on one pin, measured straight from the timestamp unit, which firmware cannot do today |
 | Not yet proved at sub-cycle resolution | every other interval firmware can judge: any interval with a falling edge, "the latest edge, whichever way", or two edges of one pin. The I2C setup-time referee in this repo uses "the latest edge", so its verdicts are not yet covered by the proof |
 | Evidence for the unproved cases | falling-edge timestamps have the same proved latency as rising ones (`formal/edge_ts.sby`); the snapshot's capture of falling edges and of which edge came last is proved at whole-cycle resolution (`formal/engine.sby`, task `snap`); `tsget`'s choice between them is checked in lockstep simulation against the reference model; a chip-level test checks every verdict of a "latest edge" referee against the interval the test generated |
@@ -64,16 +66,16 @@ start bit), so until the proof for falling edges is done they rest on the eviden
 not on the proof. Rules with intervals over 273 µs (a 1-Wire reset pulse, infrared remote
 codes) wait for long-interval timestamps.
 
-## Status (13 November 2026)
+## Status (26 November 2026)
 
 | Part | State |
 | --- | --- |
-| Engines | **One engine today.** Two are planned: a "Referee" (this engine) and a leaner "Player" that only emulates, so the chip can speak a protocol and judge a bus at the same time |
+| Engines | **Two, hardened green (19 November):** the "Referee" (the one-engine chip's engine, unchanged) and a leaner "Player" (96-word program, no judging hardware) that only emulates, so the chip can speak a protocol and judge a bus at the same time. A chip-level test runs the I2C controller on the Player and judges its bus on the Referee |
 | Firmware that runs today (in simulation) | UART transmit and receive; I2C controller (400 kHz, clock stretching); SPI controller, modes 0 to 3; an I2C setup-time referee |
 | Not there yet | I2C and SPI targets, parity and CRC (so no UART parity, CAN or USB yet), the full set of I2C timing rules, the per-bus guard band |
-| Tests | 14 chip-level tests through the pins (cocotb), including an independent oracle that checks every verdict against the interval it generated; 24 unit tests, including the engine RTL run in lockstep with a reference model (the model's tables and the RTL's are generated from the same ISA file). One of the 24 covers `seq`, an earlier sequencer that is no longer in the chip |
+| Tests | 17 chip-level tests through the pins (cocotb), including an independent oracle that checks every verdict against the interval it generated; 39 unit and lockstep tests, including the engine RTL run in lockstep with a reference model (the model's tables and the RTL's are generated from the same ISA file). One of the 39 covers `seq`, an earlier sequencer that is no longer in the chip |
 | Proofs | verdict soundness, edge timestamps, engine properties, UART; each has negative controls that must fail |
-| Hardening | One engine on 8x4 tiles, the competition's final size: hardening, the Tiny Tapeout precheck and the gate-level tests pass (13 November). 60 MHz is met at the slow corner with +2.7 ns (typical +7.8 ns), hold is clean, and the design uses 34.5% of the core (25,392 cells). The first 8x4 run missed the slow corner by 0.41 ns on one group of paths; an RTL change (instruction fetch got its own read path) fixed it |
+| Hardening | Two engines on 8x4 tiles, the competition's final size (run 44425384876, 19 November): hardening, the Tiny Tapeout precheck and the gate-level tests pass, the gate-level tests both with every flip-flop starting at X and with them starting at 0, at 1 and at random. 60 MHz is met at the slow corner with +1.34 ns (typical +6.9 ns), hold is clean, and the design uses 54.4% of the core. Three earlier runs missed (by 1.77 ns, 0.19 ns, then a gate-level failure); each cause and fix is in the [write-up's bug ledger](docs/writeup.md#8-bug-ledger), rows 15, 16, 30 and 31. The one-engine chip (13 November) had +2.7 ns at 34.5% |
 | Real hardware | none yet: no chip, no FPGA run, no bench measurement |
 
 ## Try it
@@ -86,7 +88,7 @@ Simulation needs Python 3.11 or newer, `make` and
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r test/requirements.txt
 
-cd test && make                                     # 14 chip-level tests, a few minutes
+cd test && make                                     # 17 chip-level tests, a few minutes
 pytest tools engine seq uart edge_ts -q             # unit and lockstep tests
 cd ../formal && sby -f engine.sby                   # engine properties, under a minute
 sby -j 4 -f verdict.sby                             # verdict soundness, about 30 minutes
@@ -129,12 +131,13 @@ python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
 
 ## Plan
 
-1. **Done (13 November):** the current design hardens at 8x4 and meets 60 MHz.
+1. **Done:** one engine hardens at 8x4 and meets 60 MHz (13 November); two engines too (19 November).
 2. **November:** size the next ISA by writing the firmware first, on the reference model:
    I2C and SPI targets, UART with parity, CAN, and the full I2C Fast-mode rule set. An
    instruction-set addition that fewer than two real programs use is dropped.
-3. **By early December:** two engines, parity and CRC, the per-bus guard band, the proof for
-   falling edges, then an RTL freeze.
+3. **By 14 December:** ISA v1 in the RTL (the soundness set, idle-safe judging, the per-channel
+   short-level threshold, a larger Referee), hardening runs around 5, 10 and 13 December, then the
+   RTL freeze on 14 December (moved once from 7 December).
 4. **After the freeze:** protocols and timing rules written against the frozen chip, to show
    what it can do that it was not designed for; a timing report on a real third-party I2C bus.
 5. **January 2027:** final hardening and submission.
