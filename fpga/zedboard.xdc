@@ -82,9 +82,22 @@ set_property -dict {PACKAGE_PIN H17 IOSTANDARD LVCMOS25} [get_ports {sw[6]}]
 set_property -dict {PACKAGE_PIN M15 IOSTANDARD LVCMOS25} [get_ports {sw[7]}]
 
 ## ---------------------------------------------------------------------------
+## PL oscillator, 100 MHz: the ILA's clock source only (fpga_top sys_clk).
+## Avnet board file part0_pins.xml:  name ="sys_clk" iostandard="LVCMOS33" loc="Y9";
+## board.xml: interface sys_clock, parameter frequency 100000000 ("System Clock, 100 MHz").
+## Master XDC: GCLK = Y9 in bank 13 (LVCMOS33, the bank-wide line).
+## No create_clock here: the Clocking Wizard IP (clk_ila_wiz) creates it on its input.
+## ---------------------------------------------------------------------------
+set_property -dict {PACKAGE_PIN Y9 IOSTANDARD LVCMOS33} [get_ports sys_clk]
+
+## ---------------------------------------------------------------------------
 ## Timing. clk60 is constrained by the PS7 and Clocking Wizard IPs. The board
 ## pins are asynchronous (I2C at <= 400 kHz, UART, switches, LEDs): no I/O
 ## timing applies, so they are excluded from timing analysis.
 ## ---------------------------------------------------------------------------
-set_false_path -from [get_ports {i2c_scl i2c_sda uio[*] sw[*] btn[*]}]
+set_false_path -from [get_ports {uio[*] sw[*] btn[*]}]
+## The I2C pads: false paths only into the chip's judge registers (and nothing is timed into
+## the PS's EMIO inputs). Their paths into the ILA's sampling flops are NOT false: fpga/ila.xdc
+## bounds them, because the ILA's uncertainty includes how differently SCL and SDA reach them.
+set_false_path -from [get_ports {i2c_scl i2c_sda}] -to [get_cells {scl_q_reg sda_q_reg}]
 set_false_path -to   [get_ports {i2c_scl i2c_sda uio[*] led[*]}]

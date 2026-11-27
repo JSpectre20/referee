@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build the Referee chip for a Zynq-7020 board: project, block design (PS7 +
-# Clocking Wizard), synthesis, implementation, bitstream and the XSA for Vitis.
+# Clocking Wizard), the ILA (its own Clocking Wizard on the board oscillator +
+# an ILA core), synthesis, implementation, bitstream and the XSA for Vitis.
 #
 #   vivado -mode batch -source fpga/build.tcl -tclargs zedboard
 #   vivado -mode batch -source fpga/build.tcl -tclargs pynq-z2
@@ -10,25 +11,43 @@
 # taken relative to this script). Output in fpga/build/<board>/:
 #   referee_<board>.xsa   hardware platform, bitstream included (for Vitis)
 #   referee_<board>.bit   bitstream
-#   timing_summary.rpt, utilization.rpt, and the Vivado project
+#   referee_<board>.ltx   the ILA's probes file (Vivado hardware manager, fpga/ila_capture.tcl)
+#   ila_info.txt          the ILA's clock, depth, probes and measured pad-to-sampling-flop delays
+#   timing_summary.rpt, utilization.rpt, clocks.rpt, and the Vivado project
 #
 # Targets Vivado 2020.2 .. 2024.2 (write_hw_platform, the .gen directory and
 # processing_system7 5.5 / clk_wiz 6.0 as found there). Board files are NOT
 # needed: every PS7 setting is written out below, with its source.
 #
-# Optional arguments: number of parallel jobs (default 4), then the chip clock
-# in MHz (default 60; only for the fallback in fpga/README.md, 'If 60 MHz does
-# not close'):  -tclargs zedboard 4 50
+# Optional arguments, in this order:
+#   jobs       parallel jobs (default 4)
+#   chip MHz   the chip clock (default 60; only for the fallback in fpga/README.md,
+#              'If 60 MHz does not close')
+#   ILA MHz    the ILA's sampling clock (default 240 = 4 x 60; 200 is the fallback
+#              in fpga/README.md, 'If the ILA does not close'; 0 builds without the ILA)
+#   ILA depth  samples (default 8192; a power of two, 1024 .. 65536: 72 bits x 131072 would
+#              need 288 RAMB36, more than the 7020's 140)
+# e.g.  -tclargs zedboard 4 60 200      -tclargs zedboard 4 60 0
 
 if {[llength $argv] < 1} {
-    error "usage: vivado -mode batch -source fpga/build.tcl -tclargs zedboard|pynq-z2 \[jobs\]"
+    error "usage: vivado -mode batch -source fpga/build.tcl -tclargs zedboard|pynq-z2 \[jobs \[chip_MHz \[ila_MHz \[ila_depth\]\]\]\]"
 }
 set board [string tolower [lindex $argv 0]]
 set jobs  [expr {[llength $argv] > 1 ? [lindex $argv 1] : 4}]
 set mhz   [expr {[llength $argv] > 2 ? [lindex $argv 2] : 60}]
+set ila_mhz   [expr {[llength $argv] > 3 ? [lindex $argv 3] : 240}]
+set ila_depth [expr {[llength $argv] > 4 ? [lindex $argv 4] : 8192}]
+if {$ila_mhz != 0 && ($ila_depth < 1024 || $ila_depth > 65536 || ($ila_depth & ($ila_depth - 1)) != 0)} {
+    error "ILA depth $ila_depth: must be a power of two from 1024 to 65536"
+}
 # The chip's power-up UART bit period must be round(clock / 115200): 521 at 60 MHz.
 set clks_per_bit [expr {int(round($mhz * 1e6 / 115200.0))}]
 puts "INFO: board $board, chip clock $mhz MHz, CLKS_PER_BIT $clks_per_bit"
+if {$ila_mhz != 0} {
+    puts "INFO: ILA at $ila_mhz MHz, $ila_depth samples"
+} else {
+    puts "INFO: no ILA (fpga/rtl/ila_none.v)"
+}
 
 set fpga_dir [file normalize [file dirname [info script]]]
 set repo_dir [file normalize [file join $fpga_dir ..]]
@@ -39,17 +58,21 @@ set out_dir  [file join $fpga_dir build $board]
 #   uart_emio: the PS UART that goes through EMIO to the chip (the other one is
 #              the USB-UART on MIO, the PC's console)
 #   generics:  fpga_top port widths, matching fpga/<board>.xdc
+#   sys_mhz:   the board's PL oscillator on sys_clk (the ILA's clock source):
+#              ZedBoard 100 MHz on Y9, PYNQ-Z2 125 MHz on H16 (sources in the XDCs)
 # =============================================================================
 switch -- $board {
     zedboard {
         set part      xc7z020clg484-1
         set uart_emio 0
         set generics  {N_LED=8 N_SW=8 N_BTN=5}
+        set sys_mhz   100.000
     }
     pynq-z2 {
         set part      xc7z020clg400-1
         set uart_emio 1
         set generics  {N_LED=6 N_SW=2 N_BTN=4}
+        set sys_mhz   125.000
     }
     default {
         error "unknown board '$board': use zedboard or pynq-z2"
@@ -351,6 +374,67 @@ if {$bd_hdl ne ""} {
 }
 
 # =============================================================================
+# The ILA (fpga/rtl/fpga_top.v, "The ILA"): two IPs instantiated in fpga_top
+# =============================================================================
+# clk_ila_wiz: an MMCM on the board oscillator (sys_clk), not on the PS's FCLK
+# and not shared with the chip's MMCM, so the ILA's time base is independent of
+# the chip's clock path and runs from configuration on. ila_bus: the ILA, 12
+# probes in the order of fpga_top's u_ila, capture control (storage
+# qualification) on, ila_ts data-only (no comparators: it is 40 bits wide and
+# never triggers anything).
+set ila_probe_widths {1 1 1 1 1 8 8 8 1 1 1 40}
+set ila_probe_names  {ila_scl ila_sda ila_scl_chip ila_sda_chip ila_uart_rx ila_uo_out
+                      ila_uio_in ila_uio_oe ila_rst_n ila_mark ila_chg ila_ts}
+if {$ila_mhz != 0} {
+    create_ip -name clk_wiz -vendor xilinx.com -library ip -module_name clk_ila_wiz
+    set ciw [get_ips clk_ila_wiz]
+    set_property -dict [list \
+        CONFIG.PRIMITIVE                  {MMCM} \
+        CONFIG.PRIM_IN_FREQ               [format %.3f $sys_mhz] \
+        CONFIG.PRIM_SOURCE                {Single_ended_clock_capable_pin} \
+        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ [format %.3f $ila_mhz] \
+        CONFIG.USE_RESET                  {false} \
+        CONFIG.USE_LOCKED                 {true} \
+    ] $ciw
+    set m [get_property CONFIG.MMCM_CLKFBOUT_MULT_F $ciw]
+    set d [get_property CONFIG.MMCM_DIVCLK_DIVIDE $ciw]
+    set o [get_property CONFIG.MMCM_CLKOUT0_DIVIDE_F $ciw]
+    set ila_f [expr {$sys_mhz * $m / ($d * $o)}]
+    puts "INFO: ILA MMCM M=$m D=$d O=$o -> clk_ila = $ila_f MHz (VCO [expr {$sys_mhz * $m / $d}] MHz)"
+    if {abs($ila_f - $ila_mhz) > 1e-6} { error "ILA MMCM output is $ila_f MHz, not $ila_mhz" }
+
+    create_ip -name ila -vendor xilinx.com -library ip -module_name ila_bus
+    set ila_ip [get_ips ila_bus]
+    set cfg [list \
+        CONFIG.C_NUM_OF_PROBES       [llength $ila_probe_widths] \
+        CONFIG.C_DATA_DEPTH          $ila_depth \
+        CONFIG.C_EN_STRG_QUAL        {1} \
+        CONFIG.C_ADV_TRIGGER         {false} \
+        CONFIG.C_INPUT_PIPE_STAGES   {1} \
+        CONFIG.C_TRIGIN_EN           {false} \
+        CONFIG.C_TRIGOUT_EN          {false} \
+        CONFIG.ALL_PROBE_SAME_MU     {true} \
+        CONFIG.ALL_PROBE_SAME_MU_CNT {2} \
+    ]
+    for {set i 0} {$i < [llength $ila_probe_widths]} {incr i} {
+        lappend cfg CONFIG.C_PROBE${i}_WIDTH [lindex $ila_probe_widths $i]
+    }
+    # ila_ts (probe 11): data only (C_PROBE<n>_TYPE 1)
+    lappend cfg CONFIG.C_PROBE11_TYPE {1}
+    set_property -dict $cfg $ila_ip
+    foreach {key want} [list C_NUM_OF_PROBES [llength $ila_probe_widths] C_DATA_DEPTH $ila_depth \
+                            C_EN_STRG_QUAL 1 C_PROBE11_WIDTH 40 C_PROBE5_WIDTH 8 C_PROBE11_TYPE 1] {
+        set got [get_property CONFIG.$key $ila_ip]
+        if {$got ne $want} { error "ILA $key is '$got', expected '$want'" }
+    }
+    generate_target all [get_files clk_ila_wiz.xci]
+    generate_target all [get_files ila_bus.xci]
+    add_files -fileset constrs_1 -norecurse [file join $fpga_dir ila.xdc]
+} else {
+    add_files -norecurse [file join $fpga_dir rtl ila_none.v]
+}
+
+# =============================================================================
 # Top, generics, synthesis, implementation, bitstream
 # =============================================================================
 set_property top fpga_top [current_fileset]
@@ -377,14 +461,90 @@ set wns [get_property SLACK [get_timing_paths -delay_type max -max_paths 1]]
 set whs [get_property SLACK [get_timing_paths -delay_type min -max_paths 1]]
 puts "INFO: worst setup slack $wns ns, worst hold slack $whs ns"
 
+# Slack per clock domain: the chip's (clk60) and the ILA's (clk_ila, with the
+# debug hub on it). A miss in only one of them means different things.
+proc clock_slack {pin type} {
+    if {[catch {
+        set c [get_clocks -of_objects [get_pins $pin]]
+        set s [get_property SLACK [get_timing_paths -delay_type $type -max_paths 1 -to $c]]
+    }]} { return "?" }
+    return $s
+}
+set chip_wns [clock_slack u_ps/clk60 max]
+set chip_whs [clock_slack u_ps/clk60 min]
+puts "INFO: clk60 (chip): setup slack $chip_wns ns, hold slack $chip_whs ns"
+if {$ila_mhz != 0} {
+    set ila_wns [clock_slack u_ila_clk/clk_out1 max]
+    set ila_whs [clock_slack u_ila_clk/clk_out1 min]
+    puts "INFO: clk_ila (ILA, $ila_mhz MHz): setup slack $ila_wns ns, hold slack $ila_whs ns"
+}
+
 set impl_dir [get_property DIRECTORY [get_runs impl_1]]
 file copy -force [file join $impl_dir fpga_top.bit] [file join $out_dir referee_$board.bit]
 write_hw_platform -fixed -include_bit -force [file join $out_dir referee_$board.xsa]
 
+if {$ila_mhz != 0} {
+    write_debug_probes -force [file join $out_dir referee_$board.ltx]
+    # The ILA's own uncertainty includes how differently the pads reach their
+    # sampling flops (ila_s1, bit 0 = SCL, bit 1 = SDA). fpga/ila.xdc bounds both
+    # paths (set_max_delay -datapath_only 3 ns); the routed values are written
+    # here, and skew_ns in each run's run.json must be at least this skew_ns.
+    proc pad_delay {port bit type} {
+        if {[catch {
+            set p [get_timing_paths -delay_type $type -max_paths 1 \
+                       -from [get_ports $port] -to [get_pins "ila_s1_reg\[$bit\]/D"]]
+            set d [get_property DATAPATH_DELAY $p]
+        }] || $d eq ""} { return "?" }
+        return $d
+    }
+    set fh [open [file join $out_dir ila_info.txt] w]
+    puts $fh "board $board"
+    puts $fh "ila_clock_hz [expr {int(round($ila_mhz * 1e6))}]"
+    puts $fh "ila_depth $ila_depth"
+    puts $fh "chip_clock_hz [expr {int(round($mhz * 1e6))}]"
+    puts $fh "probes [join $ila_probe_names { }]"
+    puts $fh "probe_widths [join $ila_probe_widths { }]"
+    set delays {}
+    foreach {port bit} {i2c_scl 0 i2c_sda 1} {
+        foreach type {min max} {
+            set v [pad_delay $port $bit $type]
+            puts $fh "pad_to_flop_${type}_ns $port $v"
+            dict set delays $port $type $v
+        }
+    }
+    set sk "?"
+    catch {
+        set a [expr {[dict get $delays i2c_scl max] - [dict get $delays i2c_sda min]}]
+        set b [expr {[dict get $delays i2c_sda max] - [dict get $delays i2c_scl min]}]
+        set sk [format %.3f [expr {max(abs($a), abs($b))}]]
+    }
+    puts $fh "skew_ns $sk"
+    puts $fh "ila_setup_slack_ns $ila_wns"
+    puts $fh "build_args [join $argv { }]"
+    set sha "?"
+    catch {set sha [lindex [exec sha256sum [file join $out_dir referee_$board.bit]] 0]}
+    puts $fh "bitstream_sha256 $sha"
+    close $fh
+    puts "INFO: ILA: probes file referee_$board.ltx; pad-to-sampling-flop skew $sk ns (ila_info.txt)"
+    if {$sk eq "?"} {
+        error "the SCL / SDA pad-to-sampling-flop delays could not be read: the ILA's skew is unbounded,\
+               tools/ila_check.py will refuse runs of this bitstream (see fpga/README.md, 'The ILA')"
+    }
+    if {$sk > 3.0} {
+        error "SCL / SDA pad-to-sampling-flop skew $sk ns exceeds 3 ns: check fpga/ila.xdc took effect"
+    }
+}
+
 if {$wns eq "" || $whs eq "" || $wns < 0 || $whs < 0} {
-    puts "CRITICAL WARNING: TIMING NOT MET at $mhz MHz (setup $wns ns, hold $whs ns)."
-    puts "CRITICAL WARNING: do not trust verdicts from this bitstream; see fpga/README.md, 'If 60 MHz does not close'."
+    if {$ila_mhz != 0 && $chip_wns ne "?" && $chip_whs ne "?" && $chip_wns >= 0 && $chip_whs >= 0} {
+        puts "CRITICAL WARNING: TIMING NOT MET in the ILA's clock domain at $ila_mhz MHz (setup $ila_wns ns, hold $ila_whs ns);"
+        puts "CRITICAL WARNING: the chip's clk60 domain is met. Do not trust the ILA capture of this bitstream;"
+        puts "CRITICAL WARNING: see fpga/README.md, 'If the ILA does not close' (rebuild with 200 MHz)."
+    } else {
+        puts "CRITICAL WARNING: TIMING NOT MET at $mhz MHz (setup $wns ns, hold $whs ns)."
+        puts "CRITICAL WARNING: do not trust verdicts from this bitstream; see fpga/README.md, 'If 60 MHz does not close'."
+    }
 } else {
-    puts "INFO: timing met at $mhz MHz."
+    puts "INFO: timing met at $mhz MHz[expr {$ila_mhz != 0 ? " (chip) and $ila_mhz MHz (ILA)" : ""}]."
 }
 puts "INFO: done: [file join $out_dir referee_$board.xsa]"

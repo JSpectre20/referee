@@ -63,8 +63,22 @@ set_property -dict {PACKAGE_PIN M20 IOSTANDARD LVCMOS33} [get_ports {sw[0]}]
 set_property -dict {PACKAGE_PIN M19 IOSTANDARD LVCMOS33} [get_ports {sw[1]}]
 
 ## ---------------------------------------------------------------------------
+## PL oscillator, 125 MHz: the ILA's clock source only (fpga_top sys_clk).
+## TUL board file part0_pins.xml:  name ="sys_clk" iostandard="LVCMOS33" loc="H16";
+## board.xml: interface sys_clock, parameter frequency 125000000. (The PYNQ base.xdc has no
+## PL clock pin: the base overlay clocks the PL from the PS.)
+##   https://raw.githubusercontent.com/Xilinx/XilinxBoardStore/2022.2/boards/TUL/pynq-z2/A.0/part0_pins.xml
+## No create_clock here: the Clocking Wizard IP (clk_ila_wiz) creates it on its input.
+## ---------------------------------------------------------------------------
+set_property -dict {PACKAGE_PIN H16 IOSTANDARD LVCMOS33} [get_ports sys_clk]
+
+## ---------------------------------------------------------------------------
 ## Timing: clk60 comes from the PS7 / Clocking Wizard IP constraints; the board
 ## pins are asynchronous and excluded from timing analysis.
 ## ---------------------------------------------------------------------------
-set_false_path -from [get_ports {i2c_scl i2c_sda uio[*] sw[*] btn[*]}]
+set_false_path -from [get_ports {uio[*] sw[*] btn[*]}]
+## The I2C pads: false paths only into the chip's judge registers (and nothing is timed into
+## the PS's EMIO inputs). Their paths into the ILA's sampling flops are NOT false: fpga/ila.xdc
+## bounds them, because the ILA's uncertainty includes how differently SCL and SDA reach them.
+set_false_path -from [get_ports {i2c_scl i2c_sda}] -to [get_cells {scl_q_reg sda_q_reg}]
 set_false_path -to   [get_ports {i2c_scl i2c_sda uio[*] led[*]}]

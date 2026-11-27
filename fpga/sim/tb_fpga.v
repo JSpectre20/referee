@@ -17,6 +17,12 @@
 //   5. stats 0: pass + violation + indeterminate == SCL rises on the pad since
 //      RUN; violations >= 7 (the bad byte), and none on the clean transfers.
 //   6. drain: the VIOLATIONs come out of the verdict FIFO.
+//   7. The ILA path: fpga/sim/ila_model.v stores every change of the probes
+//      (as the real ILA does with fpga/ila_capture.tcl's capture control) from
+//      RUN on into fpga/sim/out/ila_run/ila.csv, and this testbench writes the
+//      chip's side (stats 0, the drained slots, status) to
+//      fpga/sim/out/ila_run/verdicts.jsonl; fpga/sim/run.sh then runs
+//      tools/ila_check.py on the two, as on a board run.
 `timescale 1ns / 1ps
 `default_nettype none
 
@@ -30,6 +36,8 @@ module tb_fpga;
   pullup (uio[4]); pullup (uio[5]); pullup (uio[6]); pullup (uio[7]);
   reg [7:0] sw = 8'h00;
   reg [4:0] btn = 5'h00;
+  reg sys_clk = 1'b0;  // the board oscillator (100 MHz); ila_model.v makes its own ILA clock
+  always #5 sys_clk = ~sys_clk;
 
   // PS-only pins: left floating (inout), as the model ignores them.
   wire [14:0] DDR_addr; wire [2:0] DDR_ba; wire [3:0] DDR_dm, DDR_dqs_n, DDR_dqs_p;
@@ -46,7 +54,8 @@ module tb_fpga;
       .FIXED_IO_ddr_vrn(FIXED_IO_ddr_vrn), .FIXED_IO_ddr_vrp(FIXED_IO_ddr_vrp),
       .FIXED_IO_mio(FIXED_IO_mio), .FIXED_IO_ps_clk(FIXED_IO_ps_clk),
       .FIXED_IO_ps_porb(FIXED_IO_ps_porb), .FIXED_IO_ps_srstb(FIXED_IO_ps_srstb),
-      .i2c_scl(i2c_scl), .i2c_sda(i2c_sda), .uio(uio), .sw(sw), .btn(btn), .led(led)
+      .sys_clk(sys_clk), .i2c_scl(i2c_scl), .i2c_sda(i2c_sda), .uio(uio), .sw(sw), .btn(btn),
+      .led(led)
   );
 
   // Optional waveform: +vcd
@@ -144,8 +153,9 @@ module tb_fpga;
   // ---------------------------------------------------------------- the test
   integer i, rises0, n, fd;
   integer e0_scl, e0_sda, e0_jscl, e0_jsda;
-  reg [15:0] npass, nviol, nind;
-  integer viol_drained;
+  reg [15:0] npass, nviol, nind, smin, smax;
+  reg [15:0] slot;
+  integer viol_drained, vf;
   initial begin
     #500_000_000;
     $display("FAIL: global timeout");
@@ -180,6 +190,8 @@ module tb_fpga;
     $display("loaded and running at t = %0t ns", $time);
     rises0 = scl_rises;
     e0_scl = scl_edges; e0_sda = sda_edges; e0_jscl = j_scl_edges; e0_jsda = j_sda_edges;
+    dut.u_ila.arm;                   // 7: the ILA from RUN on, like the board run's steps
+    dut.u_ps.gpio_out[15] = 1'b1;    // the PS mark, as fpga/sw/main.c during traffic
 
     // 3: traffic. 400 kHz
     dut.u_ps.t_low = 1300.0; dut.u_ps.t_high = 1200.0; dut.u_ps.t_su = 600.0;
@@ -201,6 +213,7 @@ module tb_fpga;
     dut.u_ps.m_write_byte(8'h30, 600.0, nack);
     dut.u_ps.m_write_byte(8'h55, 40.0, nack);
     dut.u_ps.m_stop;
+    dut.u_ps.gpio_out[15] = 1'b0;
     #20000;
 
     // 4: the judge channels followed the pads
@@ -215,6 +228,8 @@ module tb_fpga;
     stat16(8'd0, npass);
     stat16(8'd1, nviol);
     stat16(8'd2, nind);
+    stat16(8'd3, smin);
+    stat16(8'd4, smax);
     $display("stats 0: pass %0d viol %0d indet %0d; SCL rises since RUN %0d",
              npass, nviol, nind, scl_rises - rises0);
     check(npass + nviol + nind == scl_rises - rises0, "one verdict per SCL rise");
@@ -231,6 +246,22 @@ module tb_fpga;
         viol_drained = viol_drained + 1;
     $display("drain: %0d slots, %0d VIOLATION headers", n, viol_drained);
     check(r0 == 8'h06 && viol_drained >= 7, "VIOLATIONs drained");
+
+    // 7: the chip's side of the ILA check (tools/ila_check.py record format)
+    vf = $fopen("fpga/sim/out/ila_run/verdicts.jsonl", "w");
+    $fwrite(vf, "{\"type\": \"stats\", \"slot\": 0, \"pass\": %0d, \"viol\": %0d, \"indet\": %0d, \"min\": %0d, \"max\": %0d}\n",
+            npass, nviol, nind, smin, smax);
+    $fwrite(vf, "{\"type\": \"drain\", \"slots\": [");
+    for (i = 0; i < n; i = i + 1) begin
+      slot = {dut.u_ps.rx_buf[(dut.u_ps.rx_n - 2 * n + 2 * i) % 1024],
+              dut.u_ps.rx_buf[(dut.u_ps.rx_n - 2 * n + 2 * i + 1) % 1024]};
+      $fwrite(vf, "%0s%0d", i ? ", " : "", slot);
+    end
+    $fwrite(vf, "]}\n");
+    transact(32'h51000000, r0, r1); check(r0 == 8'h06, "status ACK");
+    $fwrite(vf, "{\"type\": \"status\", \"data\": %0d}\n", r1);
+    $fclose(vf);
+    dut.u_ila.stop;
 
     $display("LEDs %b (7..0)", led);
     if (errors == 0) $display("PASS: all checks");

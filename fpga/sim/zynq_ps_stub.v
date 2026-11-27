@@ -53,7 +53,7 @@ module zynq_ps (
   assign ps_rst_n = IIC_1_scl_i;
   assign {IIC_0_scl_o, IIC_0_scl_t, IIC_0_sda_o, IIC_0_sda_t} = {4{IIC_1_sda_i}};
   assign {IIC_1_scl_o, IIC_1_scl_t, IIC_1_sda_o, IIC_1_sda_t} = {4{UART_EMIO_rxd ^ IIC_0_scl_i}};
-  assign UART_EMIO_txd = toggle;
+  assign UART_EMIO_txd = FIXED_IO_ps_porb;  // not the clock net: fpga_top samples it as data (ILA)
   assign GPIO_0_tri_o = GPIO_0_tri_i;
   assign GPIO_0_tri_t = ~GPIO_0_tri_i;
 endmodule
