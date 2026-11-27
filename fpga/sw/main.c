@@ -31,6 +31,8 @@
  *    BTN2 (ZedBoard BTNL) one write / read-back cycle (with SW0 off): a known
  *         number of SCL rises, so `stats 0` can be checked by hand
  *    LEDs driven from here: traffic on, 400 kHz, ok (last check passed), error
+ *    EMIO GPIO 15: the ILA's mark, high from the start of a write / read-back
+ *         cycle to its end (an ILA trigger: fpga/ila_capture.tcl -trigger mark)
  *
  * Everything is polled in one loop; nothing blocks for longer than one
  * register access, so the bridge keeps up (a 64-byte UART FIFO lasts 5.5 ms at
@@ -80,6 +82,7 @@
 #define IN_FAST      EMIO(1)   /* SW1 */
 #define IN_CLEAR     EMIO(9)   /* BTN1 */
 #define IN_SHOT      EMIO(10)  /* BTN2 */
+#define OUT_MARK     EMIO(15)  /* ILA mark: a traffic cycle is running */
 #define OUT_TRAFFIC  EMIO(16)
 #define OUT_FAST     EMIO(17)
 #define OUT_OK       EMIO(18)
@@ -309,6 +312,7 @@ static void traffic_poll(int enabled)
     case T_IDLE:
         if (!(enabled || shot) || t - t_since < GAP_MS) return;
         shot = 0;
+        XGpioPs_WritePin(&gpio, OUT_MARK, 1);               /* ILA mark: cycle starts */
         wbuf[0] = (u8)(cycle * XFER_BYTES);                 /* pointer */
         for (int i = 0; i < XFER_BYTES; i++) wbuf[1 + i] = (u8)(cycle * 7u + i * 0x35u);
         master_start_write(wbuf, 1 + XFER_BYTES, 0);
@@ -333,6 +337,7 @@ static void traffic_poll(int enabled)
             master_recover();
             led_err = 1;
             led_ok = 0;
+            XGpioPs_WritePin(&gpio, OUT_MARK, 0);
             t_state = T_IDLE;
             t_since = t;
             return;
@@ -351,6 +356,7 @@ static void traffic_poll(int enabled)
             led_ok = good;
             if (!good) led_err = 1;
             cycle++;
+            XGpioPs_WritePin(&gpio, OUT_MARK, 0);           /* ILA mark: cycle done */
             t_state = T_IDLE;
         }
         t_since = t;
@@ -376,7 +382,7 @@ int main(void)
 
     XGpioPs_Config *gc = gpio_cfg();
     if (!gc || XGpioPs_CfgInitialize(&gpio, gc, gc->BaseAddr) != XST_SUCCESS) return XST_FAILURE;
-    const u32 outs[] = {OUT_TRAFFIC, OUT_FAST, OUT_OK, OUT_ERR};
+    const u32 outs[] = {OUT_MARK, OUT_TRAFFIC, OUT_FAST, OUT_OK, OUT_ERR};
     for (unsigned i = 0; i < sizeof outs / sizeof outs[0]; i++) {
         XGpioPs_SetDirectionPin(&gpio, outs[i], 1);
         XGpioPs_SetOutputEnablePin(&gpio, outs[i], 1);

@@ -12,6 +12,7 @@ the command-line tool, so the two can't drift apart.
     python3 tools/referee_host.py --port /dev/ttyUSB0 status
     python3 tools/referee_host.py --port /dev/ttyUSB0 drain
     python3 tools/referee_host.py --port /dev/ttyUSB0 stats 0
+    python3 tools/referee_host.py --port /dev/ttyUSB0 stats-clear 0       # RUN does not clear stats
     python3 tools/referee_host.py --port /dev/ttyUSB0 halt
     python3 tools/referee_host.py --port /dev/ttyUSB0 --engine 1 status       # the Player
 
@@ -406,6 +407,8 @@ def main(argv=None):
     sub.add_parser("drain")
     st = sub.add_parser("stats")
     st.add_argument("slot", type=int)
+    sc = sub.add_parser("stats-clear", help="clear one stats slot (RUN and load do not)")
+    sc.add_argument("slot", type=int)
     ld = sub.add_parser("load", help="assemble firmware, load it with a pin config, optionally run")
     ld.add_argument("source")
     ld.add_argument("--pin", default="", help="owned output pins, e.g. 0:pp,1:od")
@@ -460,7 +463,11 @@ def main(argv=None):
         elif args.cmd == "stats":
             ref.must(pkt_stats_latch(args.slot))
             names = ["pass", "viol", "indet", "min", "max"]
-            print({n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)})
+            print({"slot": args.slot,
+                   **{n: ref.must(pkt_stats_read(i, 1)) << 8 | ref.must(pkt_stats_read(i, 0)) for i, n in enumerate(names)}})
+        elif args.cmd == "stats-clear":
+            ref.must(pkt_stats_clear(args.slot))  # the Referee's stats, as `stats`
+            print(f"stats slot {args.slot} cleared")
         elif args.cmd == "load2":
             img0, n0 = assemble(Path(args.referee_source).read_text(), engine=REFEREE)
             img1, n1 = assemble(Path(args.player_source).read_text(), engine=PLAYER)
@@ -486,6 +493,7 @@ def main(argv=None):
                 ok, _, _ = ref.transact(pkt_run(True, e))
                 if not ok:
                     raise HostError(f"RUN refused: {decode_status(ref.must(pkt_status(e=e)))}")
+            notes = notes + [f"image crc16 {refasm.crc16(img):04x}"]
             print("\n".join(notes) + ("\nloaded, running" if args.run else "\nloaded"))
     except (HostError, refasm.AsmError) as e:
         sys.exit(str(e))

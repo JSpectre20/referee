@@ -9,6 +9,12 @@
  *   PYNQ-Z2  (xc7z020clg400-1)  : fpga/pynq-z2.xdc    N_LED 6, N_SW 2, N_BTN 4
  *   (fpga/build.tcl sets the generics per board.)
  *
+ * It also instantiates two IPs that fpga/build.tcl creates for the ILA (see
+ * "The ILA" below): clk_ila_wiz (an MMCM on the board's own oscillator) and
+ * ila_bus (the Integrated Logic Analyzer). Without the ILA
+ * (build.tcl ... 0 as the ILA clock), fpga/rtl/ila_none.v supplies empty
+ * modules of the same names and the capture logic is optimised away.
+ *
  * This module is the Vivado top. It instantiates the block design `zynq_ps`
  * (made by fpga/build.tcl: PS7 + Clocking Wizard), whose ports are:
  *   clk60        60.000 MHz from the MMCM (FCLK_CLK0 100 MHz in)
@@ -52,6 +58,26 @@
  * low for 8 more cycles of clk60 after all three are fine (asynchronous
  * assert, synchronous release). The chip then synchronises it again itself.
  *
+ * The ILA (independent reference of the judged pins)
+ *   clk_ila (240 MHz by default, 4 x the chip clock) comes from the board's
+ *   PL oscillator (sys_clk: ZedBoard 100 MHz, PYNQ-Z2 125 MHz) through its own
+ *   MMCM: not from the PS, not from the chip's MMCM, so the ILA's time base
+ *   shares nothing with the chip's clock path, and it runs from configuration
+ *   on (the debug hub needs a free-running clock; FCLK only starts after
+ *   ps7_init). Every probed signal passes two ASYNC_REG flops in clk_ila; the
+ *   first one is the sampling point. The raw pads are probed (IOBUF O, before
+ *   the chip's IOB register and synchronisers), and next to them the chip's own
+ *   judge-channel inputs, the host UART both ways, the engine pins and their
+ *   enables, the chip reset and a mark bit from the PS (EMIO GPIO 15, high
+ *   during each traffic cycle of fpga/sw/main.c).
+ *   ila_ts is a free-running 40-bit sample counter (76 minutes at 240 MHz).
+ *   ila_chg is 1 in every sample where any probed signal differs from the
+ *   sample before, and once every 2^18 samples (1.09 ms, a heartbeat), so with
+ *   the ILA's capture control set to "ila_chg == 1" (fpga/ila_capture.tcl) the
+ *   buffer holds every edge with its exact sample number, idle time costs
+ *   almost nothing, and an idle bus still fills the buffer (about 9 s for 8192
+ *   samples) so a capture always completes. tools/ila_check.py reads it.
+ *
  * LEDs (led[k] for k < N_LED)
  *   0 heartbeat, about 1 Hz, from clk60 (off while the chip is in reset)
  *   1 traffic on               (PS GPIO, set by fpga/sw/main.c)
@@ -66,6 +92,7 @@
  * EMIO GPIO map (PS pin number = 54 + bit)
  *   bits 0..7   in : switches (sw[0..N_SW-1], the rest 0)
  *   bits 8..12  in : buttons  (btn[0..N_BTN-1], the rest 0)
+ *   bit  15     out: ILA mark (fpga/sw/main.c: high during a traffic cycle)
  *   bits 16..19 out: LED requests: 16 traffic on, 17 400 kHz, 18 ok, 19 error
  */
 
@@ -105,6 +132,7 @@ module fpga_top #(
     inout  wire        FIXED_IO_ps_srstb,
 
     // ---- board pins (fpga/<board>.xdc) ----
+    input  wire             sys_clk,  // the board's PL oscillator (ILA clock source only)
     inout  wire             i2c_scl,  // Pmod JA pin 3, open drain, PULLUP
     inout  wire             i2c_sda,  // Pmod JA pin 4, open drain, PULLUP
     inout  wire [      7:0] uio,      // Pmod JB pins 1-4, 7-10 = uio[0..7]
@@ -252,7 +280,64 @@ module fpga_top #(
     scl_act <= !scl_q ? {ACT_BITS{1'b1}} : scl_act - (|scl_act);
     tx_act  <= !uo_out[4] ? {ACT_BITS{1'b1}} : tx_act - (|tx_act);
   end
+
+  // ===========================================================================
+  // The ILA: capture logic in clk_ila (see the header)
+  // ===========================================================================
+  wire clk_ila, ila_locked;
+  clk_ila_wiz u_ila_clk (.clk_in1(sys_clk), .clk_out1(clk_ila), .locked(ila_locked));
+
+  localparam integer ILA_W = 31;
+  wire [ILA_W-1:0] ila_raw = {gpio_o[15],   // 30     mark (PS)
+                              chip_rst_n,   // 29     chip reset (clk60)
+                              uio_oe,       // 28:21  engine pin enables (clk60)
+                              uio_in,       // 20:13  engine pins 0..7, pads
+                              uo_out,       // 12:5   engine pins 8..14, uo_out[4] = UART TX (clk60)
+                              ps_uart_txd,  // 4      host UART -> chip (ui_in[3])
+                              sda_q,        // 3      the chip's judge channel 0 (IOB register, clk60)
+                              scl_q,        // 2      the chip's judge channel 1
+                              sda_pad,      // 1      SDA pad, raw
+                              scl_pad};     // 0      SCL pad, raw
+  (* ASYNC_REG = "TRUE" *) reg [ILA_W-1:0] ila_s1 = {ILA_W{1'b0}};
+  (* ASYNC_REG = "TRUE" *) reg [ILA_W-1:0] ila_s2 = {ILA_W{1'b0}};
+  reg [     39:0] ila_cnt = 40'd0;
+  // The probes: one register each, so every probe (and its CSV column) has a
+  // stable name, and all of them, ila_chg and ila_ts change in the same cycle.
+  // ila_chg compares ila_s2 with the probes themselves (= ila_s2 one cycle
+  // earlier): no third copy that synthesis could merge with the probes and
+  // rename them after.
+  reg ila_scl = 1'b0, ila_sda = 1'b0, ila_scl_chip = 1'b0, ila_sda_chip = 1'b0;
+  reg ila_uart_rx = 1'b0, ila_rst_n = 1'b0, ila_mark = 1'b0, ila_chg = 1'b0;
+  reg [ 7:0] ila_uo_out = 8'd0, ila_uio_in = 8'd0, ila_uio_oe = 8'd0;
+  reg [39:0] ila_ts = 40'd0;
+  wire [ILA_W-1:0] ila_probes = {ila_mark, ila_rst_n, ila_uio_oe, ila_uio_in, ila_uo_out,
+                                 ila_uart_rx, ila_sda_chip, ila_scl_chip, ila_sda, ila_scl};
+  always @(posedge clk_ila) begin
+    ila_s1  <= ila_raw;
+    ila_s2  <= ila_s1;
+    ila_cnt <= ila_cnt + 40'd1;
+    {ila_mark, ila_rst_n, ila_uio_oe, ila_uio_in, ila_uo_out, ila_uart_rx,
+     ila_sda_chip, ila_scl_chip, ila_sda, ila_scl} <= ila_s2;
+    ila_chg <= (ila_s2 != ila_probes) || (ila_cnt[17:0] == 18'd0);
+    ila_ts  <= ila_cnt;
+  end
   /* verilator lint_on PROCASSINIT */
+
+  ila_bus u_ila (
+      .clk    (clk_ila),
+      .probe0 (ila_scl),       // SCL pad
+      .probe1 (ila_sda),       // SDA pad
+      .probe2 (ila_scl_chip),  // chip ui_in[5]
+      .probe3 (ila_sda_chip),  // chip ui_in[4]
+      .probe4 (ila_uart_rx),   // chip ui_in[3], host UART RX
+      .probe5 (ila_uo_out),    // chip uo_out[7:0] (bit 4 = host UART TX)
+      .probe6 (ila_uio_in),    // engine pins 0..7 (pads)
+      .probe7 (ila_uio_oe),    // their output enables
+      .probe8 (ila_rst_n),     // chip rst_n
+      .probe9 (ila_mark),      // PS mark (EMIO GPIO 15)
+      .probe10(ila_chg),       // capture qualifier: something changed (or heartbeat)
+      .probe11(ila_ts)         // sample number, data only
+  );
 
   wire [7:0] status = {uo_out[0],               // 7 engine pin 8
                        gpio_o[17],              // 6 400 kHz
@@ -266,7 +351,9 @@ module fpga_top #(
 
   // Unused on purpose: the PS GPIO output enables (LEDs follow gpio_o), the
   // engine outputs not brought out, and the top bits of status on PYNQ-Z2.
-  wire _unused = &{1'b0, gpio_t, gpio_o[15:0], uo_out[7:5], uo_out[3:1], status};
+  // (ila_locked: the capture logic needs no reset; the ILA itself is only
+  // armed from the hardware manager, long after the MMCM has locked.)
+  wire _unused = &{1'b0, gpio_t, gpio_o[14:0], uo_out[7:5], uo_out[3:1], status, ila_locked};
 
 endmodule
 

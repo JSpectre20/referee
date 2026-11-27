@@ -1,2 +1,5 @@
 build/
 sim/out/
+# Recorded board runs are committed (fpga/runs/README.md), although the top-level
+# .gitignore ignores every "runs" folder; their ila.vcd stays ignored (*.vcd).
+!runs/
